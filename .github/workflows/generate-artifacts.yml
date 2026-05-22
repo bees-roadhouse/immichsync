@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: artifacts-${{ github.ref }}
@@ -80,10 +81,26 @@ jobs:
           } > SBOM.md
           rm metadata.json
 
-      - name: Commit artifacts if changed
-        uses: stefanzweifel/git-auto-commit-action@v5
+      # Open a PR instead of pushing directly. The org-level Default Branch
+      # Protection ruleset requires PRs to the default branch, so the previous
+      # git-auto-commit-action push was rejected (GH006). Tracked in issue #14.
+      - name: Open PR with regenerated artifacts
+        uses: peter-evans/create-pull-request@v6
         with:
-          commit_message: "chore: regenerate SBOM and STRUCTURE [skip ci]"
-          file_pattern: "SBOM.md STRUCTURE.md"
-          commit_user_name: "github-actions[bot]"
-          commit_user_email: "41898282+github-actions[bot]@users.noreply.github.com"
+          branch: chore/regenerate-artifacts
+          base: ${{ github.ref_name }}
+          delete-branch: true
+          add-paths: |
+            SBOM.md
+            STRUCTURE.md
+          commit-message: "chore: regenerate SBOM and STRUCTURE"
+          committer: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+          author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+          title: "chore: regenerate SBOM and STRUCTURE"
+          body: |
+            Auto-generated regeneration of `SBOM.md` and `STRUCTURE.md` from commit ${{ github.sha }}.
+
+            Triggered by: `${{ github.event_name }}` on `${{ github.ref_name }}`.
+          labels: |
+            type:enhancement
+            category:improvement
