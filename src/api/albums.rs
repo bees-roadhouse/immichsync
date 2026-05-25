@@ -112,12 +112,7 @@ impl ImmichClient {
         let body = AddAssetsRequest { ids: asset_ids };
         let url = self.url(&format!("/api/albums/{album_id}/assets"));
 
-        let response = self
-            .client
-            .put(&url)
-            .json(&body)
-            .send()
-            .await?;
+        let response = self.client.put(&url).json(&body).send().await?;
 
         if !response.status().is_success() {
             return Err(Self::map_status_error(response).await);
@@ -150,11 +145,7 @@ impl ImmichClient {
     pub async fn get_albums(&self) -> Result<Vec<Album>, ApiError> {
         debug!("fetching album list");
 
-        let response = self
-            .client
-            .get(self.url("/api/albums"))
-            .send()
-            .await?;
+        let response = self.client.get(self.url("/api/albums")).send().await?;
 
         if !response.status().is_success() {
             return Err(Self::map_status_error(response).await);

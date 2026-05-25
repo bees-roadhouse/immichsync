@@ -224,9 +224,12 @@ impl TrayApp {
         let view_log_item = MenuItem::with_id(ID_VIEW_LOG, "View Upload Log", true, None);
         let view_trash_item = MenuItem::with_id(ID_VIEW_TRASH, "View Trash", true, None);
         let about_item = MenuItem::with_id(ID_ABOUT, "About ImmichSync", true, None);
-        let check_updates_item = MenuItem::with_id(ID_CHECK_UPDATES, "Check for Updates", true, None);
-        let update_available_item = MenuItem::with_id(ID_UPDATE_AVAILABLE, "Update Available!", false, None);
-        let restart_to_update_item = MenuItem::with_id(ID_RESTART_TO_UPDATE, "Restart to Update", false, None);
+        let check_updates_item =
+            MenuItem::with_id(ID_CHECK_UPDATES, "Check for Updates", true, None);
+        let update_available_item =
+            MenuItem::with_id(ID_UPDATE_AVAILABLE, "Update Available!", false, None);
+        let restart_to_update_item =
+            MenuItem::with_id(ID_RESTART_TO_UPDATE, "Restart to Update", false, None);
         let quit_item = MenuItem::with_id(ID_QUIT, "Quit", true, None);
 
         // ---- Assemble context menu ----
@@ -398,7 +401,8 @@ impl TrayApp {
     pub fn set_update_available(&mut self, version: Option<&str>) {
         match version {
             Some(v) => {
-                self.update_available_item.set_text(&format!("Update Available (v{v})!"));
+                self.update_available_item
+                    .set_text(&format!("Update Available (v{v})!"));
                 self.update_available_item.set_enabled(true);
             }
             None => {
@@ -415,7 +419,8 @@ impl TrayApp {
     pub fn set_restart_to_update(&mut self, version: Option<&str>) {
         match version {
             Some(v) => {
-                self.restart_to_update_item.set_text(&format!("Restart to Update (v{v})"));
+                self.restart_to_update_item
+                    .set_text(&format!("Restart to Update (v{v})"));
                 self.restart_to_update_item.set_enabled(true);
                 // Hide the "Update Available" item since the download is done.
                 self.update_available_item.set_text("Update Available!");

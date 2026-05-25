@@ -5,17 +5,16 @@
 // DBT_DEVICEREMOVECOMPLETE and forwards typed DeviceEvent values through
 // a tokio channel.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetMessageW, PostMessageW,
-    RegisterClassW, HWND_MESSAGE, MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_QUIT,
-    WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetMessageW, PostMessageW, RegisterClassW,
+    HWND_MESSAGE, MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_QUIT, WNDCLASSW,
 };
 
 /// Events emitted by the device monitor.
@@ -156,9 +155,7 @@ fn run_device_monitor_loop(
         *cell.borrow_mut() = Some(event_tx);
     });
 
-    let class_name_wide: Vec<u16> = "ImmichSyncDevMon\0"
-        .encode_utf16()
-        .collect();
+    let class_name_wide: Vec<u16> = "ImmichSyncDevMon\0".encode_utf16().collect();
 
     let wc = WNDCLASSW {
         lpfnWndProc: Some(device_wnd_proc),

@@ -69,9 +69,9 @@ jobs:
         env:
           CARGO_TARGET_DIR: target
 
-      - name: Format check (informational)
-        # Not gating yet — see issue tracker for a planned `cargo fmt` sweep.
-        continue-on-error: true
+      - name: Format check
+        # Gating after the v0.2.0 cargo fmt sweep (issue #8).
+        # Run `cargo fmt --all` locally before opening a PR; CI fails otherwise.
         run: cargo fmt --all -- --check
 
       # Skip artifact upload on PRs targeting release (development → release).

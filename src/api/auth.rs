@@ -47,11 +47,7 @@ impl ImmichClient {
     pub async fn validate_api_key(&self) -> Result<UserInfo, ApiError> {
         debug!("validating API key via /api/users/me");
 
-        let response = self
-            .client
-            .get(self.url("/api/users/me"))
-            .send()
-            .await?;
+        let response = self.client.get(self.url("/api/users/me")).send().await?;
 
         if !response.status().is_success() {
             return Err(Self::map_status_error(response).await);

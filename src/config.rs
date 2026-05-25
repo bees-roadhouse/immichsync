@@ -287,11 +287,10 @@ impl Config {
             source,
         })?;
 
-        let mut config: Self =
-            toml::from_str(&contents).map_err(|source| ConfigError::Parse {
-                path: path.clone(),
-                source,
-            })?;
+        let mut config: Self = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+            path: path.clone(),
+            source,
+        })?;
 
         // Decrypt API key if it was stored encrypted.
         if crate::platform::encryption::is_encrypted(&config.server.api_key) {

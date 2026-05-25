@@ -150,8 +150,8 @@ impl App {
         }
 
         // Create system tray (must be on main thread).
-        let (tray, tray_rx) = TrayApp::new()
-            .map_err(|e| anyhow::anyhow!("Failed to create tray: {}", e))?;
+        let (tray, tray_rx) =
+            TrayApp::new().map_err(|e| anyhow::anyhow!("Failed to create tray: {}", e))?;
         self.tray = Some(tray);
         self.tray_rx = Some(tray_rx);
 
@@ -159,12 +159,8 @@ impl App {
         if let Some(ref client) = self.client {
             let uploader: Arc<dyn AssetUploader> = Arc::new(client.clone());
             let store: Arc<dyn QueueStore> = self.db.clone();
-            let mut pipeline = UploadPipeline::new(
-                store,
-                &self.config.server,
-                &self.config.upload,
-                uploader,
-            );
+            let mut pipeline =
+                UploadPipeline::new(store, &self.config.server, &self.config.upload, uploader);
 
             // Pipeline spawns tokio tasks — enter the runtime context.
             let _guard = self.runtime.enter();
@@ -187,9 +183,7 @@ impl App {
         } else {
             info!("No server configured; pipeline not started");
             if let Some(ref mut tray) = self.tray {
-                tray.update_state(TrayState::Error(
-                    "Server not configured".to_string(),
-                ));
+                tray.update_state(TrayState::Error("Server not configured".to_string()));
             }
         }
 
@@ -324,23 +318,22 @@ impl App {
             if folders.is_empty() {
                 drop(db);
                 // First run: add the user's Pictures folder as a default.
-                if let Ok(pictures) =
-                    crate::platform::known_folders::get_pictures_folder()
-                {
+                if let Ok(pictures) = crate::platform::known_folders::get_pictures_folder() {
                     if pictures.exists() {
                         info!(path = %pictures.display(), "Adding default Pictures folder");
                         let db = self.db.inner().lock().unwrap();
-                        if let Ok(id) = db.add_folder(
-                            &pictures.display().to_string(),
-                            Some("Pictures"),
-                            true,
-                        ) {
+                        if let Ok(id) =
+                            db.add_folder(&pictures.display().to_string(), Some("Pictures"), true)
+                        {
                             let filter = FileFilter::new();
                             let canon = std::fs::canonicalize(&pictures)
                                 .unwrap_or_else(|_| pictures.clone());
-                            if let Err(e) =
-                                engine.add_folder(pictures, filter, false, self.runtime.handle().clone())
-                            {
+                            if let Err(e) = engine.add_folder(
+                                pictures,
+                                filter,
+                                false,
+                                self.runtime.handle().clone(),
+                            ) {
                                 warn!("Failed to add Pictures watcher: {}", e);
                             } else {
                                 path_to_folder_id.insert(canon, id);
@@ -358,12 +351,11 @@ impl App {
                         warn!(path = %folder.path, "Watch folder missing, skipping");
                         continue;
                     }
-                    let is_network =
-                        folder.watch_mode == crate::db::WatchMode::Poll;
+                    let is_network = folder.watch_mode == crate::db::WatchMode::Poll;
                     let filter = FileFilter::new();
-                    let canon = std::fs::canonicalize(&path)
-                        .unwrap_or_else(|_| path.clone());
-                    if let Err(e) = engine.add_folder(path, filter, is_network, self.runtime.handle().clone())
+                    let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                    if let Err(e) =
+                        engine.add_folder(path, filter, is_network, self.runtime.handle().clone())
                     {
                         warn!(path = %folder.path, error = %e, "Failed to add watcher");
                     } else {
@@ -382,7 +374,10 @@ impl App {
             let concurrency = self.config.upload.concurrency as usize;
             let folder_map = Arc::new(path_to_folder_id);
 
-            info!("Spawning watch→pipeline bridge task (concurrency={})", concurrency);
+            info!(
+                "Spawning watch→pipeline bridge task (concurrency={})",
+                concurrency
+            );
             let bridge_store = store.clone();
             let bridge_map = folder_map.clone();
             self.runtime.spawn(async move {
@@ -561,7 +556,8 @@ impl App {
 
                     // Detect Syncing → Idle transition for notification.
                     if self.was_syncing && !is_syncing && stats.completed > 0 {
-                        self.notifications.notify_upload_complete(stats.completed as u32);
+                        self.notifications
+                            .notify_upload_complete(stats.completed as u32);
                     }
                     self.was_syncing = is_syncing;
                 }
@@ -691,8 +687,12 @@ impl App {
                 let info_clone = info.clone();
                 self.runtime.spawn_blocking(move || {
                     match updater::download_and_apply(&info_clone) {
-                        Ok(()) => { let _ = tx.send(Ok(info_clone.new_version)); }
-                        Err(e) => { let _ = tx.send(Err(e.to_string())); }
+                        Ok(()) => {
+                            let _ = tx.send(Ok(info_clone.new_version));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e.to_string()));
+                        }
                     }
                 });
 
@@ -709,7 +709,11 @@ impl App {
 
     /// Poll the background download channel for completion.
     fn poll_update_download(&mut self) {
-        let result = match self.update_download_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        let result = match self
+            .update_download_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
             Some(r) => r,
             None => return,
         };
@@ -739,7 +743,8 @@ impl App {
                     }
                 }
 
-                self.notifications.notify_error(&format!("Update download failed: {e}"));
+                self.notifications
+                    .notify_error(&format!("Update download failed: {e}"));
             }
         }
     }
@@ -954,13 +959,7 @@ async fn initial_scan(
 
     match result {
         Ok((scanned, enqueued, skipped, errors)) => {
-            info!(
-                scanned,
-                enqueued,
-                skipped,
-                errors,
-                "Initial scan: complete"
-            );
+            info!(scanned, enqueued, skipped, errors, "Initial scan: complete");
         }
         Err(e) => {
             warn!(error = %e, "Initial scan task panicked");

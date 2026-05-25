@@ -126,9 +126,10 @@ impl FileFilter {
     /// - Custom include globs are configured and none of them match the path
     pub fn should_include(&self, path: &Path) -> bool {
         // Skip anything inside the trash directory.
-        if path.components().any(|c| {
-            c.as_os_str() == crate::upload::worker::TRASH_DIR_NAME
-        }) {
+        if path
+            .components()
+            .any(|c| c.as_os_str() == crate::upload::worker::TRASH_DIR_NAME)
+        {
             debug!("Excluding (inside trash directory): {:?}", path);
             return false;
         }
@@ -298,8 +299,7 @@ mod tests {
 
     #[test]
     fn test_custom_exclude_pattern() {
-        let filter =
-            FileFilter::new().with_exclude_patterns(vec!["**/thumbnails/**".to_string()]);
+        let filter = FileFilter::new().with_exclude_patterns(vec!["**/thumbnails/**".to_string()]);
         let dir = tempfile::tempdir().unwrap();
         let thumb_dir = dir.path().join("thumbnails");
         std::fs::create_dir(&thumb_dir).unwrap();

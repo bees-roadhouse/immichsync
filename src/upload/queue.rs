@@ -46,19 +46,10 @@ pub trait QueueStore: Send + Sync {
     fn dequeue_pending(&self, limit: usize) -> anyhow::Result<Vec<QueueEntry>>;
 
     /// Update the status (and optional error message) of a queue entry.
-    fn update_status(
-        &self,
-        id: i64,
-        status: &str,
-        error: Option<&str>,
-    ) -> anyhow::Result<()>;
+    fn update_status(&self, id: i64, status: &str, error: Option<&str>) -> anyhow::Result<()>;
 
     /// Mark a queue entry as completed and record the resulting asset ID.
-    fn mark_completed(
-        &self,
-        id: i64,
-        asset_id: Option<&str>,
-    ) -> anyhow::Result<()>;
+    fn mark_completed(&self, id: i64, asset_id: Option<&str>) -> anyhow::Result<()>;
 
     /// Return `true` if a file with this SHA-1 hash has already been
     /// successfully uploaded (exists in `uploaded_files`).
@@ -259,12 +250,7 @@ mod tests {
                 .collect())
         }
 
-        fn update_status(
-            &self,
-            id: i64,
-            status: &str,
-            error: Option<&str>,
-        ) -> anyhow::Result<()> {
+        fn update_status(&self, id: i64, status: &str, error: Option<&str>) -> anyhow::Result<()> {
             let mut entries = self.entries.lock().unwrap();
             if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
                 e.status = status.to_string();
@@ -273,11 +259,7 @@ mod tests {
             Ok(())
         }
 
-        fn mark_completed(
-            &self,
-            id: i64,
-            _asset_id: Option<&str>,
-        ) -> anyhow::Result<()> {
+        fn mark_completed(&self, id: i64, _asset_id: Option<&str>) -> anyhow::Result<()> {
             let mut entries = self.entries.lock().unwrap();
             if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
                 e.status = "completed".to_string();
@@ -287,12 +269,7 @@ mod tests {
         }
 
         fn is_file_uploaded(&self, hash: &str) -> anyhow::Result<bool> {
-            Ok(*self
-                .uploaded
-                .lock()
-                .unwrap()
-                .get(hash)
-                .unwrap_or(&false))
+            Ok(*self.uploaded.lock().unwrap().get(hash).unwrap_or(&false))
         }
 
         fn record_upload(
@@ -385,8 +362,7 @@ mod tests {
     fn process_file_missing_path_returns_error() {
         let store = Arc::new(MockStore::default());
         let queue = UploadQueue::new(store, 2);
-        let result =
-            queue.process_file(PathBuf::from("/nonexistent/photo.jpg"), None);
+        let result = queue.process_file(PathBuf::from("/nonexistent/photo.jpg"), None);
         assert!(result.is_err());
     }
 }

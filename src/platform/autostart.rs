@@ -13,8 +13,8 @@
 use thiserror::Error;
 use windows::core::PCWSTR;
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-    HKEY_CURRENT_USER, HKEY, KEY_READ, KEY_WRITE, REG_SZ,
+    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
+    HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_SZ,
 };
 
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0";
@@ -83,8 +83,8 @@ pub fn is_autostart_enabled() -> Result<bool, AutostartError> {
     let _ = unsafe { RegCloseKey(hkey) };
 
     match query_result.0 {
-        0 => Ok(true),                  // ERROR_SUCCESS — value exists
-        2 => Ok(false),                 // ERROR_FILE_NOT_FOUND — value absent
+        0 => Ok(true),  // ERROR_SUCCESS — value exists
+        2 => Ok(false), // ERROR_FILE_NOT_FOUND — value absent
         e => Err(AutostartError::RegistryQuery(e as u32)),
     }
 }
@@ -115,8 +115,9 @@ pub fn set_autostart(enabled: bool) -> Result<(), AutostartError> {
     let result = if enabled {
         // Always point autostart at the installed exe path so the registry
         // value is stable regardless of where the app was originally launched.
-        let exe = crate::platform::install::installed_exe_path()
-            .map_err(|e| AutostartError::ExePath(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let exe = crate::platform::install::installed_exe_path().map_err(|e| {
+            AutostartError::ExePath(std::io::Error::new(std::io::ErrorKind::Other, e))
+        })?;
         let exe_str = exe.to_str().ok_or(AutostartError::ExePathEncoding)?;
 
         // Encode as a null-terminated wide string for REG_SZ.
@@ -146,13 +147,11 @@ pub fn set_autostart(enabled: bool) -> Result<(), AutostartError> {
     } else {
         tracing::info!("disabling autostart");
 
-        let r = unsafe {
-            RegDeleteValueW(hkey, PCWSTR(value_wide.as_ptr()))
-        };
+        let r = unsafe { RegDeleteValueW(hkey, PCWSTR(value_wide.as_ptr())) };
 
         match r.0 {
-            0 => Ok(()),    // ERROR_SUCCESS
-            2 => Ok(()),    // ERROR_FILE_NOT_FOUND — already absent, that's fine
+            0 => Ok(()), // ERROR_SUCCESS
+            2 => Ok(()), // ERROR_FILE_NOT_FOUND — already absent, that's fine
             e => Err(AutostartError::RegistryDelete(e as u32)),
         }
     };

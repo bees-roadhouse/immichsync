@@ -43,7 +43,9 @@ pub fn get_pictures_folder() -> Result<PathBuf, KnownFolderError> {
     // Convert the PWSTR to a Rust PathBuf before freeing.
     let path = unsafe {
         // PWSTR::to_string() walks the null-terminated wide string.
-        let s = path_ptr.to_string().map_err(|_| KnownFolderError::InvalidPath)?;
+        let s = path_ptr
+            .to_string()
+            .map_err(|_| KnownFolderError::InvalidPath)?;
         PathBuf::from(s)
     };
 

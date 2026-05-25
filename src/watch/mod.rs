@@ -134,13 +134,8 @@ impl WatchEngine {
         let tx = self.event_tx.clone();
 
         let watcher: ActiveWatcher = if is_network {
-            let nw = NetworkWatcher::new(
-                path.clone(),
-                filter,
-                tx,
-                DEFAULT_POLL_INTERVAL,
-                rt_handle,
-            );
+            let nw =
+                NetworkWatcher::new(path.clone(), filter, tx, DEFAULT_POLL_INTERVAL, rt_handle);
             nw.start().map_err(|e| WatchError::StartFailed {
                 path: path.clone(),
                 source: e,
@@ -275,7 +270,12 @@ mod tests {
         let handle = test_rt_handle();
 
         engine
-            .add_folder(dir.path().to_path_buf(), FileFilter::new(), false, handle.clone())
+            .add_folder(
+                dir.path().to_path_buf(),
+                FileFilter::new(),
+                false,
+                handle.clone(),
+            )
             .expect("add_folder should succeed");
 
         assert_eq!(engine.watcher_count(), 1);
@@ -296,7 +296,12 @@ mod tests {
         let handle = test_rt_handle();
 
         engine
-            .add_folder(dir.path().to_path_buf(), FileFilter::new(), false, handle.clone())
+            .add_folder(
+                dir.path().to_path_buf(),
+                FileFilter::new(),
+                false,
+                handle.clone(),
+            )
             .expect("first add should succeed");
 
         let result = engine.add_folder(dir.path().to_path_buf(), FileFilter::new(), false, handle);
@@ -325,7 +330,12 @@ mod tests {
         let handle = test_rt_handle();
 
         engine
-            .add_folder(dir1.path().to_path_buf(), FileFilter::new(), false, handle.clone())
+            .add_folder(
+                dir1.path().to_path_buf(),
+                FileFilter::new(),
+                false,
+                handle.clone(),
+            )
             .unwrap();
         engine
             .add_folder(dir2.path().to_path_buf(), FileFilter::new(), false, handle)

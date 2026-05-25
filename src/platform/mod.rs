@@ -25,7 +25,10 @@ pub const APP_USER_MODEL_ID: &str = "BeesRoadhouse.ImmichSync";
 pub use autostart::{is_autostart_enabled, set_autostart, AutostartError};
 pub use drives::{has_dcim_folder, list_drives, DriveInfo, DriveType};
 pub use encryption::{decrypt_api_key, encrypt_api_key, is_encrypted, EncryptionError};
-pub use install::{install_exe, installed_exe_path, is_running_installed, migrate_legacy_data, relaunch_installed, running_version};
+pub use install::{
+    install_exe, installed_exe_path, is_running_installed, migrate_legacy_data, relaunch_installed,
+    running_version,
+};
 pub use known_folders::{get_pictures_folder, KnownFolderError};
 pub use shortcuts::{create_desktop_shortcut, create_start_menu_shortcut, ShortcutError};
 pub use single_instance::{SingleInstance, SingleInstanceError};

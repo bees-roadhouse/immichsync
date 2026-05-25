@@ -47,8 +47,8 @@ impl SingleInstance {
         // for the duration of the call.
         let handle = unsafe {
             CreateMutexW(
-                None,  // default security attributes
-                true,  // we request initial ownership
+                None, // default security attributes
+                true, // we request initial ownership
                 PCWSTR(name_wide.as_ptr()),
             )
         };

@@ -403,9 +403,7 @@ impl Database {
             )
             .optional()?;
 
-        Ok(version
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(0))
+        Ok(version.and_then(|v| v.parse::<u32>().ok()).unwrap_or(0))
     }
 
     fn set_schema_version(&self, version: u32) -> Result<(), DbError> {
@@ -462,10 +460,8 @@ impl Database {
 
     /// Remove a watched folder by id.
     pub fn remove_folder(&self, id: i64) -> Result<(), DbError> {
-        self.conn.execute(
-            "DELETE FROM watched_folders WHERE id = ?1",
-            params![id],
-        )?;
+        self.conn
+            .execute("DELETE FROM watched_folders WHERE id = ?1", params![id])?;
         Ok(())
     }
 
@@ -709,7 +705,13 @@ impl Database {
                  completed_at = ?4,
                  retry_count = retry_count + ?5
              WHERE id = ?1",
-            params![id, status.as_str(), error_msg, completed_at, retry_increment],
+            params![
+                id,
+                status.as_str(),
+                error_msg,
+                completed_at,
+                retry_increment
+            ],
         )?;
         Ok(())
     }
@@ -889,7 +891,10 @@ impl crate::upload::queue::QueueStore for DbStore {
         Ok(id)
     }
 
-    fn dequeue_pending(&self, limit: usize) -> anyhow::Result<Vec<crate::upload::queue::QueueEntry>> {
+    fn dequeue_pending(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::upload::queue::QueueEntry>> {
         let db = self.db.lock().unwrap();
         let entries = db.dequeue_pending(limit as i64)?;
         Ok(entries
@@ -915,23 +920,14 @@ impl crate::upload::queue::QueueStore for DbStore {
             .collect())
     }
 
-    fn update_status(
-        &self,
-        id: i64,
-        status: &str,
-        error: Option<&str>,
-    ) -> anyhow::Result<()> {
+    fn update_status(&self, id: i64, status: &str, error: Option<&str>) -> anyhow::Result<()> {
         let db = self.db.lock().unwrap();
         let qs = QueueStatus::from_str(status);
         db.update_queue_status(id, &qs, error)?;
         Ok(())
     }
 
-    fn mark_completed(
-        &self,
-        id: i64,
-        _asset_id: Option<&str>,
-    ) -> anyhow::Result<()> {
+    fn mark_completed(&self, id: i64, _asset_id: Option<&str>) -> anyhow::Result<()> {
         let db = self.db.lock().unwrap();
         db.update_queue_status(id, &QueueStatus::Completed, None)?;
         Ok(())
@@ -1020,7 +1016,9 @@ mod tests {
     #[test]
     fn add_and_get_folder() {
         let db = open_test_db();
-        let id = db.add_folder("/some/path", Some("My Photos"), false).unwrap();
+        let id = db
+            .add_folder("/some/path", Some("My Photos"), false)
+            .unwrap();
         assert!(id > 0);
 
         let folders = db.get_folders().unwrap();
@@ -1128,9 +1126,7 @@ mod tests {
     #[test]
     fn update_queue_status_to_completed() {
         let db = open_test_db();
-        let id = db
-            .enqueue("/photos/c.jpg", None, None, None)
-            .unwrap();
+        let id = db.enqueue("/photos/c.jpg", None, None, None).unwrap();
 
         db.update_queue_status(id, &QueueStatus::Uploading, None)
             .unwrap();
@@ -1189,8 +1185,10 @@ mod tests {
         let id2 = db.enqueue("/photos/h.jpg", None, None, None).unwrap();
 
         // Simulate a crash: mark both as uploading.
-        db.update_queue_status(id1, &QueueStatus::Uploading, None).unwrap();
-        db.update_queue_status(id2, &QueueStatus::Uploading, None).unwrap();
+        db.update_queue_status(id1, &QueueStatus::Uploading, None)
+            .unwrap();
+        db.update_queue_status(id2, &QueueStatus::Uploading, None)
+            .unwrap();
 
         let stats = db.get_queue_stats().unwrap();
         assert_eq!(stats.uploading, 2);
@@ -1211,8 +1209,10 @@ mod tests {
         let id = db.enqueue("/photos/retry.jpg", None, None, None).unwrap();
 
         // Simulate: dequeued and failed, then set back to pending for retry.
-        db.update_queue_status(id, &QueueStatus::Uploading, None).unwrap();
-        db.update_queue_status(id, &QueueStatus::Pending, Some("timeout")).unwrap();
+        db.update_queue_status(id, &QueueStatus::Uploading, None)
+            .unwrap();
+        db.update_queue_status(id, &QueueStatus::Pending, Some("timeout"))
+            .unwrap();
 
         // Check that retry_count was incremented.
         let entries = db.get_recent_queue_entries(10).unwrap();

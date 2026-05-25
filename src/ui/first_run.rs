@@ -119,14 +119,12 @@ impl eframe::App for WizardAppWrapper {
 
 impl WizardApp {
     fn update_wizard(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.step {
-                WizardStep::Welcome => self.show_welcome(ui, ctx),
-                WizardStep::ServerConfig => self.show_server_config(ui, ctx),
-                WizardStep::FolderSetup => self.show_folder_setup(ui, ctx),
-                WizardStep::Autostart => self.show_autostart(ui, ctx),
-                WizardStep::Done => self.show_done(ui, ctx),
-            }
+        egui::CentralPanel::default().show(ctx, |ui| match self.step {
+            WizardStep::Welcome => self.show_welcome(ui, ctx),
+            WizardStep::ServerConfig => self.show_server_config(ui, ctx),
+            WizardStep::FolderSetup => self.show_folder_setup(ui, ctx),
+            WizardStep::Autostart => self.show_autostart(ui, ctx),
+            WizardStep::Done => self.show_done(ui, ctx),
         });
     }
 
@@ -196,8 +194,7 @@ impl WizardApp {
             if ui.button("Back").clicked() {
                 self.step = WizardStep::Welcome;
             }
-            let can_proceed =
-                !self.server_url.is_empty() && !self.api_key.is_empty();
+            let can_proceed = !self.server_url.is_empty() && !self.api_key.is_empty();
             ui.add_enabled_ui(can_proceed, |ui| {
                 if ui.button("Next").clicked() {
                     self.config.server.url = self.server_url.clone();
@@ -300,9 +297,7 @@ impl WizardApp {
                 // Add the watch folder to the database.
                 if !self.watch_folder.is_empty() {
                     if let Ok(db) = crate::db::Database::open() {
-                        if let Err(e) =
-                            db.add_folder(&self.watch_folder, None, false)
-                        {
+                        if let Err(e) = db.add_folder(&self.watch_folder, None, false) {
                             tracing::warn!(error = %e, "Failed to add wizard folder");
                         }
                     }
@@ -331,8 +326,7 @@ impl WizardApp {
                             self.test_status = "Connected!".to_string();
                         }
                         Ok(false) => {
-                            self.test_status =
-                                "Server responded but not ready".to_string();
+                            self.test_status = "Server responded but not ready".to_string();
                         }
                         Err(e) => {
                             self.test_status = format!("Failed: {e}");

@@ -41,11 +41,7 @@ impl ImmichClient {
     pub async fn ping(&self) -> Result<bool, ApiError> {
         debug!("pinging Immich server");
 
-        let response = self
-            .client
-            .get(self.url("/api/server/ping"))
-            .send()
-            .await?;
+        let response = self.client.get(self.url("/api/server/ping")).send().await?;
 
         if !response.status().is_success() {
             return Err(Self::map_status_error(response).await);

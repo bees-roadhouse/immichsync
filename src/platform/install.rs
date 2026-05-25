@@ -21,10 +21,16 @@ pub enum InstallError {
     CurrentExe(std::io::Error),
 
     #[error("failed to copy exe to `{dest}`: {source}")]
-    Copy { dest: PathBuf, source: std::io::Error },
+    Copy {
+        dest: PathBuf,
+        source: std::io::Error,
+    },
 
     #[error("failed to create directory `{path}`: {source}")]
-    CreateDir { path: PathBuf, source: std::io::Error },
+    CreateDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -103,10 +109,8 @@ fn version_file_path() -> Result<PathBuf, InstallError> {
 /// Write the current binary's version to `version.txt` in the install dir.
 fn write_version_file() -> Result<(), InstallError> {
     let path = version_file_path()?;
-    std::fs::write(&path, running_version()).map_err(|source| InstallError::Copy {
-        dest: path,
-        source,
-    })?;
+    std::fs::write(&path, running_version())
+        .map_err(|source| InstallError::Copy { dest: path, source })?;
     Ok(())
 }
 
