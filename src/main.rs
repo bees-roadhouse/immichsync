@@ -129,7 +129,7 @@ fn main() -> anyhow::Result<()> {
                 info!("Portable mode enabled, skipping install");
             } else {
                 let installed_exe = platform::installed_exe_path().ok();
-                let installed_exists = installed_exe.as_ref().map_or(false, |p| p.exists());
+                let installed_exists = installed_exe.as_ref().is_some_and(|p| p.exists());
                 debug_log(&format!(
                     "installed_exe={:?}, exists={installed_exists}",
                     installed_exe

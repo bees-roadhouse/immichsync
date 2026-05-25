@@ -21,24 +21,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use thiserror::Error;
 use tokio::sync::Notify;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use crate::upload::metadata;
 use crate::upload::queue::{QueueEntry, QueueStore};
-
-// ─── Errors ──────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Error)]
-pub enum WorkerError {
-    #[error("Worker failed to dequeue pending items: {0}")]
-    Dequeue(anyhow::Error),
-
-    #[error("Worker failed to update queue status: {0}")]
-    StatusUpdate(anyhow::Error),
-}
 
 // ─── Uploader trait ──────────────────────────────────────────────────────────
 
@@ -66,7 +54,10 @@ pub struct BulkCheckItem {
 /// The server's response for one item in a bulk-duplicate-check.
 #[derive(Debug, Clone)]
 pub struct BulkCheckResult {
-    /// The `deviceAssetId` echoed back.
+    /// The `deviceAssetId` echoed back. Production correlates results
+    /// positionally with its request, so the field is never read in either
+    /// build mode; it is kept on the struct to round-trip the API shape.
+    #[allow(dead_code)]
     pub id: String,
 
     /// Whether the asset already exists on the server.
@@ -687,7 +678,7 @@ pub fn cleanup_trash(folders: &[crate::db::WatchedFolder], retention_days: u32) 
         walk_and_delete(&trash_root, now, max_age, &mut dirs_to_check);
 
         // Remove empty directories (deepest first).
-        dirs_to_check.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+        dirs_to_check.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
         for dir in dirs_to_check {
             if let Ok(mut entries) = std::fs::read_dir(&dir) {
                 if entries.next().is_none() {

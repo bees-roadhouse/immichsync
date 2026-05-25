@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use notify::{RecursiveMode, Watcher};
+use notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -22,7 +22,10 @@ pub const PROBE_FILENAME: &str = ".immichsync_watchcheck";
 pub enum WatchEvent {
     /// File has been confirmed fully written and is ready for upload.
     FileReady(PathBuf),
-    /// File was removed from disk (reserved for future use, e.g. mirrored deletes).
+    /// File was removed from disk (reserved for future use, e.g. mirrored
+    /// deletes). Never emitted by any current watcher but already handled in
+    /// `app.rs` so the path is ready when mirrored-delete support lands.
+    #[allow(dead_code)]
     FileRemoved(PathBuf),
     /// A non-fatal error occurred inside the watcher.
     Error(String),
@@ -183,11 +186,6 @@ impl FolderWatcher {
                 info!("Folder watcher stopped: {:?}", self.path);
             }
         }
-    }
-
-    /// Return the path being watched.
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     /// Cheap clone for probing — all inner state is already `Arc`-backed.

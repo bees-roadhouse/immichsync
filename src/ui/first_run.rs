@@ -13,21 +13,6 @@ use eframe::egui;
 
 use crate::config::Config;
 
-/// First-run wizard state.
-pub struct FirstRun;
-
-impl FirstRun {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for FirstRun {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Run the first-run wizard. Blocks the calling thread.
 ///
 /// Returns `Some(Config)` with user's settings if completed, `None` if cancelled.

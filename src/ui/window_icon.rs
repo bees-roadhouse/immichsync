@@ -21,9 +21,3 @@ pub fn brand_icon_data() -> egui::IconData {
         height: h,
     }
 }
-
-/// Apply the brand icon to a `ViewportBuilder`. Use it at the end of any
-/// `ViewportBuilder::default().with_*()` chain inside `eframe::NativeOptions`.
-pub fn with_brand_icon(vb: egui::ViewportBuilder) -> egui::ViewportBuilder {
-    vb.with_icon(brand_icon_data())
-}

@@ -73,8 +73,6 @@ impl BulkCheckResult {
 #[serde(rename_all = "camelCase")]
 struct AssetUploadResponse {
     id: String,
-    #[serde(default)]
-    duplicate_asset_id: Option<String>,
 }
 
 /// Raw JSON returned by `POST /api/assets/bulk-upload-check`.

@@ -23,6 +23,11 @@ use tracing::{debug, info};
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
+// `toml::de::Error` and `toml::ser::Error` are large structs (>100 bytes
+// each) which would push every `Result<_, ConfigError>` over clippy's
+// `result_large_err` threshold and force every transitive caller to also
+// suppress or box. Boxing the toml errors here keeps the enum compact and
+// the lint happy for the whole call chain.
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("Could not determine application data directory")]
@@ -43,11 +48,11 @@ pub enum ConfigError {
     #[error("Failed to parse config file `{path}`: {source}")]
     Parse {
         path: PathBuf,
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
 
     #[error("Failed to serialize config: {0}")]
-    Serialize(#[from] toml::ser::Error),
+    Serialize(Box<toml::ser::Error>),
 
     #[error("Failed to write config file `{path}`: {source}")]
     WriteFile {
@@ -60,6 +65,12 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+}
+
+impl From<toml::ser::Error> for ConfigError {
+    fn from(e: toml::ser::Error) -> Self {
+        ConfigError::Serialize(Box::new(e))
+    }
 }
 
 // ─── Sub-structs ─────────────────────────────────────────────────────────────
@@ -244,7 +255,7 @@ impl Default for AdvancedConfig {
 /// Top-level application configuration.
 ///
 /// Stored at `%APPDATA%\bees-roadhouse\immichsync\config.toml` (roaming).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub server: ServerConfig,
@@ -252,18 +263,6 @@ pub struct Config {
     pub devices: DevicesConfig,
     pub ui: UiConfig,
     pub advanced: AdvancedConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            upload: UploadConfig::default(),
-            devices: DevicesConfig::default(),
-            ui: UiConfig::default(),
-            advanced: AdvancedConfig::default(),
-        }
-    }
 }
 
 impl Config {
@@ -354,7 +353,7 @@ impl Config {
 
         let mut config: Self = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
             path: path.clone(),
-            source,
+            source: Box::new(source),
         })?;
 
         // Decrypt API key if it was stored encrypted.

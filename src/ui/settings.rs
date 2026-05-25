@@ -19,23 +19,6 @@ use crate::config::Config;
 use crate::db::{AlbumMode, Database, PostUpload, WatchMode, WatchedFolder};
 use crate::watch::filter::{parse_patterns_json, patterns_to_json};
 
-/// Settings window state.
-///
-/// Kept for backward compatibility — other modules hold `Option<Settings>`.
-pub struct Settings;
-
-impl Settings {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Open the settings window (blocking the calling thread).
 ///
 /// Safe to call from any thread — uses `with_any_thread(true)` so eframe can
@@ -233,10 +216,8 @@ impl eframe::App for SettingsApp {
         egui::TopBottomPanel::bottom("button_bar").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    if self.save_config() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
+                if ui.button("Save").clicked() && self.save_config() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 if ui.button("Cancel").clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);

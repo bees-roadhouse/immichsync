@@ -34,20 +34,6 @@ impl Notifications {
         self.show_toast("Upload Complete", &body);
     }
 
-    /// Show a notification when a new version is available.
-    pub fn notify_update_available(&self, info: &crate::updater::UpdateInfo) {
-        if !self.enabled {
-            return;
-        }
-
-        let body = format!(
-            "Version {} is available (you have {}). Check the tray menu to update.",
-            info.new_version, info.current_version
-        );
-
-        self.show_toast("Update Available", &body);
-    }
-
     /// Show an error notification.
     pub fn notify_error(&self, msg: &str) {
         if !self.enabled {
@@ -75,15 +61,6 @@ impl Notifications {
             .show()
         {
             warn!(error = %e, "Failed to show toast notification");
-        }
-    }
-}
-
-impl Default for Notifications {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            notify_on_complete: true,
         }
     }
 }

@@ -426,7 +426,7 @@ pub fn build_uninstall_registry_values(
         display_icon: format!("\"{exe_str}\",0"),
         install_location: install_str,
         install_date: install_date.format("%Y%m%d").to_string(),
-        estimated_size_kb: ((exe_size_bytes + 1023) / 1024) as u32,
+        estimated_size_kb: exe_size_bytes.div_ceil(1024) as u32,
         url_info_about: "https://github.com/bees-roadhouse/immichsync".to_string(),
         help_link: "https://github.com/bees-roadhouse/immichsync/issues".to_string(),
         no_modify: 1,
@@ -474,10 +474,10 @@ pub fn write_uninstall_registry() -> Result<UninstallRegistryValues, InstallErro
         )
     };
     if result.is_err() {
-        return Err(InstallError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("RegCreateKeyExW failed: 0x{:08x}", result.0),
-        )));
+        return Err(InstallError::Io(std::io::Error::other(format!(
+            "RegCreateKeyExW failed: 0x{:08x}",
+            result.0
+        ))));
     }
 
     // Closure to write a single REG_SZ value (UTF-16, null-terminated).
@@ -498,10 +498,10 @@ pub fn write_uninstall_registry() -> Result<UninstallRegistryValues, InstallErro
             )
         };
         if r.is_err() {
-            return Err(InstallError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("RegSetValueExW({name}) failed: 0x{:08x}", r.0),
-            )));
+            return Err(InstallError::Io(std::io::Error::other(format!(
+                "RegSetValueExW({name}) failed: 0x{:08x}",
+                r.0
+            ))));
         }
         Ok(())
     };
@@ -512,10 +512,10 @@ pub fn write_uninstall_registry() -> Result<UninstallRegistryValues, InstallErro
         let r =
             unsafe { RegSetValueExW(hkey, PCWSTR(name_wide.as_ptr()), 0, REG_DWORD, Some(&bytes)) };
         if r.is_err() {
-            return Err(InstallError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("RegSetValueExW({name}) failed: 0x{:08x}", r.0),
-            )));
+            return Err(InstallError::Io(std::io::Error::other(format!(
+                "RegSetValueExW({name}) failed: 0x{:08x}",
+                r.0
+            ))));
         }
         Ok(())
     };
@@ -567,10 +567,9 @@ pub fn delete_uninstall_registry() -> Result<(), InstallError> {
             debug!("Uninstall registry block was already absent");
             Ok(())
         }
-        e => Err(InstallError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("RegDeleteTreeW failed: 0x{e:08x}"),
-        ))),
+        e => Err(InstallError::Io(std::io::Error::other(format!(
+            "RegDeleteTreeW failed: 0x{e:08x}"
+        )))),
     }
 }
 
