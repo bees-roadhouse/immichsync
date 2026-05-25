@@ -11,6 +11,7 @@ pub mod known_folders;
 pub mod shortcuts;
 pub mod shutdown;
 pub mod single_instance;
+pub mod uninstall;
 
 /// Application User Model ID for toast notifications and Start Menu shortcuts.
 ///
@@ -26,8 +27,8 @@ pub use autostart::{is_autostart_enabled, set_autostart, AutostartError};
 pub use drives::{has_dcim_folder, list_drives, DriveInfo, DriveType};
 pub use encryption::{decrypt_api_key, encrypt_api_key, is_encrypted, EncryptionError};
 pub use install::{
-    install_exe, installed_exe_path, is_running_installed, migrate_legacy_data, relaunch_installed,
-    running_version,
+    install_exe, installed_exe_path, is_running_installed, migrate_legacy_data,
+    migrate_to_split_layout, relaunch_installed, running_version,
 };
 pub use known_folders::{get_pictures_folder, KnownFolderError};
 pub use shortcuts::{create_desktop_shortcut, create_start_menu_shortcut, ShortcutError};

@@ -1,8 +1,11 @@
 //! SQLite state database for ImmichSync.
 //!
-//! Opens (or creates) `%APPDATA%\bees-roadhouse\immichsync\state.db`, enables
-//! WAL mode, and runs schema migrations on every startup.  All queue state
-//! transitions are wrapped in transactions.
+//! Opens (or creates) `%LOCALAPPDATA%\bees-roadhouse\immichsync\state.db`,
+//! enables WAL mode, and runs schema migrations on every startup. All queue
+//! state transitions are wrapped in transactions.
+//!
+//! This file is intentionally in `%LOCALAPPDATA%` ... watched folder set,
+//! upload progress, and dedup history are machine-local, not roaming.
 
 use std::path::PathBuf;
 
@@ -264,7 +267,7 @@ impl Database {
     /// Open (or create) the state database, enable WAL mode, and run any
     /// pending schema migrations.
     pub fn open() -> Result<Self, DbError> {
-        let dir = Config::data_dir()?;
+        let dir = Config::local_data_dir()?;
         let path = dir.join("state.db");
 
         let conn = Connection::open(&path).map_err(|source| DbError::Open {

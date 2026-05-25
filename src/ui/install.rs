@@ -30,7 +30,7 @@ pub enum InstallResult {
 ///
 /// Used when invoked via `--window install` or `--window install-update`.
 pub fn run_install_dialog_subprocess(is_update: bool, old_version: Option<String>) {
-    let install_dir = Config::data_dir()
+    let install_dir = Config::install_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "(unknown)".to_string());
 
@@ -214,6 +214,13 @@ impl InstallApp {
             if let Err(e) = config.save() {
                 warn!(error = %e, "Failed to save config from install dialog");
             }
+        }
+
+        // Register in Apps & Features (HKCU Uninstall block) so the user
+        // can remove via Settings → Apps and `winget uninstall` works.
+        // Idempotent ... updates rewrite the values with the new version.
+        if let Err(e) = crate::platform::install::write_uninstall_registry() {
+            warn!(error = %e, "Failed to write Uninstall registry block");
         }
 
         // Relaunch from installed path directly (the parent process was
