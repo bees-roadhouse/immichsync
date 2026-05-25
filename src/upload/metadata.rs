@@ -66,21 +66,19 @@ pub fn extract_metadata(path: &Path) -> Result<FileMetadata, MetadataError> {
     }
 
     // Fall back to filesystem timestamps.
-    let fs_meta =
-        fs::metadata(path).map_err(|source| MetadataError::FsMetadata {
-            path: path.display().to_string(),
-            source,
-        })?;
+    let fs_meta = fs::metadata(path).map_err(|source| MetadataError::FsMetadata {
+        path: path.display().to_string(),
+        source,
+    })?;
 
-    let modified_at = system_time_to_utc(fs_meta.modified().ok())
-        .ok_or_else(|| MetadataError::NoTimestamp {
+    let modified_at =
+        system_time_to_utc(fs_meta.modified().ok()).ok_or_else(|| MetadataError::NoTimestamp {
             path: path.display().to_string(),
         })?;
 
     // `created()` is not available on all platforms (e.g. some Linux
     // filesystems), so fall back to `modified` when it's absent.
-    let created_at = system_time_to_utc(fs_meta.created().ok())
-        .unwrap_or(modified_at);
+    let created_at = system_time_to_utc(fs_meta.created().ok()).unwrap_or(modified_at);
 
     debug!(
         path = %path.display(),
@@ -104,9 +102,7 @@ fn try_exif_datetime(path: &Path) -> Option<DateTime<Utc>> {
     let file = fs::File::open(path).ok()?;
     let mut reader = BufReader::new(&file);
 
-    let exif = ExifReader::new()
-        .read_from_container(&mut reader)
-        .ok()?;
+    let exif = ExifReader::new().read_from_container(&mut reader).ok()?;
 
     // Prefer DateTimeOriginal (when shutter was pressed) over DateTime
     // (which may reflect when the file was last edited).
@@ -141,33 +137,29 @@ fn parse_exif_datetime(s: &str) -> Option<DateTime<Utc>> {
         })
         .collect();
 
-    let naive =
-        NaiveDateTime::parse_from_str(&normalised, "%Y-%m-%d %H:%M:%S")
-            .map_err(|e| {
-                warn!(
-                    raw = s,
-                    normalised = %normalised,
-                    error = %e,
-                    "Failed to parse EXIF datetime"
-                );
-            })
-            .ok()?;
+    let naive = NaiveDateTime::parse_from_str(&normalised, "%Y-%m-%d %H:%M:%S")
+        .map_err(|e| {
+            warn!(
+                raw = s,
+                normalised = %normalised,
+                error = %e,
+                "Failed to parse EXIF datetime"
+            );
+        })
+        .ok()?;
 
     Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
 }
 
 /// Read just the filesystem `mtime` for a path.
 fn fs_modified(path: &Path) -> Result<DateTime<Utc>, MetadataError> {
-    let meta =
-        fs::metadata(path).map_err(|source| MetadataError::FsMetadata {
-            path: path.display().to_string(),
-            source,
-        })?;
+    let meta = fs::metadata(path).map_err(|source| MetadataError::FsMetadata {
+        path: path.display().to_string(),
+        source,
+    })?;
 
-    system_time_to_utc(meta.modified().ok()).ok_or_else(|| {
-        MetadataError::NoTimestamp {
-            path: path.display().to_string(),
-        }
+    system_time_to_utc(meta.modified().ok()).ok_or_else(|| MetadataError::NoTimestamp {
+        path: path.display().to_string(),
     })
 }
 
@@ -177,11 +169,8 @@ fn system_time_to_utc(t: Option<SystemTime>) -> Option<DateTime<Utc>> {
         st.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| {
             // `chrono::DateTime::from_timestamp` is the non-deprecated form
             // for chrono >= 0.4.27 and returns Option<DateTime<Utc>>.
-            chrono::DateTime::from_timestamp(
-                d.as_secs() as i64,
-                d.subsec_nanos(),
-            )
-            .unwrap_or_else(Utc::now)
+            chrono::DateTime::from_timestamp(d.as_secs() as i64, d.subsec_nanos())
+                .unwrap_or_else(Utc::now)
         })
     })
 }
@@ -201,8 +190,7 @@ mod tests {
         tmp.flush().unwrap();
         let meta = extract_metadata(tmp.path()).unwrap();
         // Both timestamps should be reasonable (after year 2000).
-        let epoch_2000 =
-            chrono::DateTime::from_timestamp(946_684_800, 0).unwrap();
+        let epoch_2000 = chrono::DateTime::from_timestamp(946_684_800, 0).unwrap();
         assert!(meta.created_at > epoch_2000);
         assert!(meta.modified_at > epoch_2000);
     }
@@ -216,7 +204,10 @@ mod tests {
     #[test]
     fn parse_exif_datetime_valid() {
         let dt = parse_exif_datetime("2023:06:15 14:30:00").unwrap();
-        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2023-06-15 14:30:00");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2023-06-15 14:30:00"
+        );
     }
 
     #[test]

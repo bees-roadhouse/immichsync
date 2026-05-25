@@ -21,7 +21,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, PROPERTYKEY};
 use windows::Win32::UI::Shell::{
-    IShellLinkW, SHGetKnownFolderPath, FOLDERID_Desktop, FOLDERID_Programs, KNOWN_FOLDER_FLAG,
+    FOLDERID_Desktop, FOLDERID_Programs, IShellLinkW, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG,
 };
 
 // CLSID_ShellLink: {00021401-0000-0000-C000-000000000046}
@@ -148,9 +148,7 @@ fn create_shortcut(
         }
 
         // Set AppUserModelID so toast notifications can find us.
-        let prop_store: IPropertyStore = shell_link
-            .cast()
-            .map_err(ShortcutError::SetAppId)?;
+        let prop_store: IPropertyStore = shell_link.cast().map_err(ShortcutError::SetAppId)?;
 
         let aumid = PROPVARIANT::from(super::APP_USER_MODEL_ID);
         prop_store
@@ -159,9 +157,8 @@ fn create_shortcut(
         prop_store.Commit().map_err(ShortcutError::SetAppId)?;
 
         // Save the .lnk file via IPersistFile.
-        let persist_file: IPersistFile = shell_link
-            .cast()
-            .map_err(ShortcutError::QueryPersistFile)?;
+        let persist_file: IPersistFile =
+            shell_link.cast().map_err(ShortcutError::QueryPersistFile)?;
 
         let lnk_wide: Vec<u16> = lnk_path
             .as_os_str()

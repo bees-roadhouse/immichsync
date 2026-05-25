@@ -64,11 +64,7 @@ pub fn run_install_dialog_subprocess(is_update: bool, old_version: Option<String
     };
 
     info!("Opening install dialog (is_update={is_update})");
-    match eframe::run_native(
-        title,
-        options,
-        Box::new(|_cc| Ok(Box::new(app))),
-    ) {
+    match eframe::run_native(title, options, Box::new(|_cc| Ok(Box::new(app)))) {
         Ok(()) => {}
         Err(e) => {
             tracing::error!(error = %e, "eframe::run_native failed for install dialog");
@@ -275,7 +271,8 @@ fn kill_running_instances() {
 /// This works because Windows allows renaming a running exe (just not overwriting).
 fn install_exe_rename_dance() -> Result<(), String> {
     let current = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let dest = crate::platform::installed_exe_path().map_err(|e| format!("installed_exe_path: {e}"))?;
+    let dest =
+        crate::platform::installed_exe_path().map_err(|e| format!("installed_exe_path: {e}"))?;
     let old = dest.with_extension("exe.old");
 
     // Remove leftover .old if it exists.

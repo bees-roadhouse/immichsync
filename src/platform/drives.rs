@@ -8,9 +8,7 @@
 
 use std::path::PathBuf;
 use windows::core::PCWSTR;
-use windows::Win32::Storage::FileSystem::{
-    GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
-};
+use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW};
 
 /// High-level drive type, mapped from Win32 DRIVE_* constants.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,9 +34,7 @@ pub struct DriveInfo {
 /// Encode a null-terminated ASCII/UTF-16 drive-root string, e.g. `"C:\\\0"`.
 fn drive_root_wide(letter: char) -> Vec<u16> {
     let s = format!("{}:\\", letter);
-    s.encode_utf16()
-        .chain(std::iter::once(0u16))
-        .collect()
+    s.encode_utf16().chain(std::iter::once(0u16)).collect()
 }
 
 /// Enumerate all logical drives currently visible to the OS.
@@ -67,10 +63,10 @@ pub fn list_drives() -> Vec<DriveInfo> {
         // Determine drive type.
         let raw_type = unsafe { GetDriveTypeW(root_pcwstr) };
         let drive_type = match raw_type {
-            3 => DriveType::Fixed,      // DRIVE_FIXED
-            2 => DriveType::Removable,  // DRIVE_REMOVABLE
-            4 => DriveType::Network,    // DRIVE_REMOTE
-            5 => DriveType::CdRom,      // DRIVE_CDROM
+            3 => DriveType::Fixed,     // DRIVE_FIXED
+            2 => DriveType::Removable, // DRIVE_REMOVABLE
+            4 => DriveType::Network,   // DRIVE_REMOTE
+            5 => DriveType::CdRom,     // DRIVE_CDROM
             _ => DriveType::Unknown,
         };
 
@@ -81,10 +77,10 @@ pub fn list_drives() -> Vec<DriveInfo> {
             GetVolumeInformationW(
                 root_pcwstr,
                 Some(label_buf.as_mut_slice()),
-                None,       // volume serial number
-                None,       // max component length
-                None,       // filesystem flags
-                None,       // filesystem name
+                None, // volume serial number
+                None, // max component length
+                None, // filesystem flags
+                None, // filesystem name
             )
             .is_ok()
         };
@@ -104,12 +100,7 @@ pub fn list_drives() -> Vec<DriveInfo> {
             None
         };
 
-        tracing::debug!(
-            "drive {}: type={:?} label={:?}",
-            letter,
-            drive_type,
-            label
-        );
+        tracing::debug!("drive {}: type={:?} label={:?}", letter, drive_type, label);
 
         drives.push(DriveInfo {
             letter,

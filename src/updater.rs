@@ -118,7 +118,10 @@ async fn check_inner(repo: &str) -> Result<UpdateCheckResult, UpdateError> {
         .await?;
 
     // Parse version from tag (strip leading 'v' if present).
-    let tag = release.tag_name.strip_prefix('v').unwrap_or(&release.tag_name);
+    let tag = release
+        .tag_name
+        .strip_prefix('v')
+        .unwrap_or(&release.tag_name);
     let remote_ver = semver::Version::parse(tag)
         .map_err(|_| UpdateError::InvalidVersion(release.tag_name.clone()))?;
 
@@ -162,10 +165,7 @@ async fn check_inner(repo: &str) -> Result<UpdateCheckResult, UpdateError> {
 ///
 /// `progress_fn` is called with `(bytes_downloaded, total_bytes)`.
 /// Returns the path to the downloaded file.
-pub fn download_update_blocking<F>(
-    url: &str,
-    progress_fn: F,
-) -> Result<PathBuf, UpdateError>
+pub fn download_update_blocking<F>(url: &str, progress_fn: F) -> Result<PathBuf, UpdateError>
 where
     F: Fn(u64, u64),
 {
@@ -178,8 +178,12 @@ where
         .build()
         .map_err(UpdateError::Network)?;
 
-    let mut response = client.get(url).send().map_err(UpdateError::Network)?
-        .error_for_status().map_err(UpdateError::Network)?;
+    let mut response = client
+        .get(url)
+        .send()
+        .map_err(UpdateError::Network)?
+        .error_for_status()
+        .map_err(UpdateError::Network)?;
 
     let total = response.content_length().unwrap_or(0);
 
@@ -237,7 +241,8 @@ pub fn apply_update(new_exe_path: &std::path::Path, new_version: &str) -> Result
     std::fs::rename(new_exe_path, &current_exe).map_err(UpdateError::File)?;
 
     // Step 3: Write version.txt next to the exe.
-    let version_file = current_exe.parent()
+    let version_file = current_exe
+        .parent()
         .map(|p| p.join("version.txt"))
         .unwrap_or_else(|| PathBuf::from("version.txt"));
     let _ = std::fs::write(&version_file, new_version);

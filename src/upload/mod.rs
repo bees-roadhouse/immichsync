@@ -88,8 +88,7 @@ impl UploadPipeline {
 
         let (pause_tx, _pause_rx) = watch::channel(false);
 
-        let queue =
-            UploadQueue::new(store.clone(), upload.concurrency as usize);
+        let queue = UploadQueue::new(store.clone(), upload.concurrency as usize);
         let worker = Arc::new(UploadWorker::new(worker_config));
 
         Self {
@@ -248,12 +247,7 @@ mod tests {
                 .collect())
         }
 
-        fn update_status(
-            &self,
-            id: i64,
-            status: &str,
-            error: Option<&str>,
-        ) -> anyhow::Result<()> {
+        fn update_status(&self, id: i64, status: &str, error: Option<&str>) -> anyhow::Result<()> {
             let mut entries = self.entries.lock().unwrap();
             if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
                 e.status = status.to_string();
@@ -262,11 +256,7 @@ mod tests {
             Ok(())
         }
 
-        fn mark_completed(
-            &self,
-            id: i64,
-            _asset_id: Option<&str>,
-        ) -> anyhow::Result<()> {
+        fn mark_completed(&self, id: i64, _asset_id: Option<&str>) -> anyhow::Result<()> {
             let mut entries = self.entries.lock().unwrap();
             if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
                 e.status = "completed".to_string();
@@ -349,12 +339,7 @@ mod tests {
         let uploader: Arc<dyn AssetUploader> = Arc::new(InstantUploader);
         let server = ServerConfig::default();
         let upload = UploadConfig::default();
-        let pipeline = UploadPipeline::new(
-            store.clone(),
-            &server,
-            &upload,
-            uploader,
-        );
+        let pipeline = UploadPipeline::new(store.clone(), &server, &upload, uploader);
         (pipeline, store)
     }
 

@@ -180,13 +180,11 @@ impl eframe::App for SettingsApp {
         });
 
         // Tab content.
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.active_tab {
-                Tab::Connection => self.show_connection_tab(ui),
-                Tab::WatchFolders => self.show_watch_folders_tab(ui),
-                Tab::Upload => self.show_upload_tab(ui),
-                Tab::Advanced => self.show_advanced_tab(ui),
-            }
+        egui::CentralPanel::default().show(ctx, |ui| match self.active_tab {
+            Tab::Connection => self.show_connection_tab(ui),
+            Tab::WatchFolders => self.show_watch_folders_tab(ui),
+            Tab::Upload => self.show_upload_tab(ui),
+            Tab::Advanced => self.show_advanced_tab(ui),
         });
 
         // Process deferred folder removal (avoid borrow conflict).
@@ -286,11 +284,7 @@ impl SettingsApp {
                                 .width(120.0)
                                 .selected_text(&selected)
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut selected,
-                                        "none".to_string(),
-                                        "None",
-                                    );
+                                    ui.selectable_value(&mut selected, "none".to_string(), "None");
                                     ui.selectable_value(
                                         &mut selected,
                                         "folder".to_string(),
@@ -317,10 +311,7 @@ impl SettingsApp {
                             if folder.album_mode == AlbumMode::Fixed {
                                 let name = folder.album_name.get_or_insert_with(String::new);
                                 ui.label("Name:");
-                                ui.add_sized(
-                                    [120.0, 18.0],
-                                    egui::TextEdit::singleline(name),
-                                );
+                                ui.add_sized([120.0, 18.0], egui::TextEdit::singleline(name));
                             }
                         });
 
@@ -443,11 +434,7 @@ impl SettingsApp {
                     .selected_text(&self.log_level)
                     .show_ui(ui, |ui| {
                         for level in &["trace", "debug", "info", "warn", "error"] {
-                            ui.selectable_value(
-                                &mut self.log_level,
-                                level.to_string(),
-                                *level,
-                            );
+                            ui.selectable_value(&mut self.log_level, level.to_string(), *level);
                         }
                     });
                 ui.end_row();
@@ -466,7 +453,10 @@ impl SettingsApp {
         ui.checkbox(&mut self.autostart, "Start with Windows");
         ui.checkbox(&mut self.minimize_to_tray, "Minimize to system tray");
         ui.checkbox(&mut self.show_notifications, "Show notifications");
-        ui.checkbox(&mut self.check_for_updates, "Automatically check for updates");
+        ui.checkbox(
+            &mut self.check_for_updates,
+            "Automatically check for updates",
+        );
         ui.add_enabled_ui(self.check_for_updates, |ui| {
             ui.indent("update_indent", |ui| {
                 ui.horizontal(|ui| {
@@ -510,8 +500,7 @@ impl SettingsApp {
                             self.test_status = "Connected!".to_string();
                         }
                         Ok(false) => {
-                            self.test_status =
-                                "Server responded but not ready".to_string();
+                            self.test_status = "Server responded but not ready".to_string();
                         }
                         Err(e) => {
                             self.test_status = format!("Failed: {e}");
@@ -646,7 +635,12 @@ impl SettingsApp {
                 }
 
                 // Apply trash/delete to already-uploaded files if the user checked the box.
-                if self.apply_existing.get(&folder.id).copied().unwrap_or(false) {
+                if self
+                    .apply_existing
+                    .get(&folder.id)
+                    .copied()
+                    .unwrap_or(false)
+                {
                     self.apply_post_upload_to_existing(&db, folder);
                 }
             }

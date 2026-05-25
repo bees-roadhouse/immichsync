@@ -115,9 +115,7 @@ impl ImmichClient {
 
     /// Map an HTTP status code to the appropriate `ApiError` variant, using the
     /// response body (if readable) as the detail message.
-    pub(crate) async fn map_status_error(
-        response: reqwest::Response,
-    ) -> ApiError {
+    pub(crate) async fn map_status_error(response: reqwest::Response) -> ApiError {
         let status = response.status();
         let body = response
             .text()

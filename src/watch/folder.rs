@@ -179,8 +179,7 @@ pub(crate) async fn write_complete_and_send(path: PathBuf, tx: mpsc::Sender<Watc
         if start.elapsed() >= MAX_WRITE_WAIT {
             warn!(
                 "Write-completion timeout for {:?} after {:?}",
-                path,
-                MAX_WRITE_WAIT
+                path, MAX_WRITE_WAIT
             );
             let _ = tx
                 .send(WatchEvent::Error(format!(
