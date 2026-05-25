@@ -203,7 +203,16 @@ pub struct AdvancedConfig {
     pub update_check_interval_hours: u32,
 
     /// GitHub repository to check for updates (format: `owner/repo`).
+    /// Public repos only. Anything else (URL, SSH ref, hostname) is rejected
+    /// at load time and the update check is disabled for the session.
     pub update_repo: String,
+
+    /// Update channel. One of:
+    ///   - `"latest"`     ... track the latest published release (default)
+    ///   - `"prerelease"` ... track latest including prereleases
+    ///   - `"none"`       ... disable update checks entirely
+    ///   - `"vX.Y.Z"`     ... pin to a specific tag, never offer newer
+    pub update_channel: String,
 }
 
 impl Default for AdvancedConfig {
@@ -214,7 +223,8 @@ impl Default for AdvancedConfig {
             write_settle_ms: 2000,
             check_for_updates: true,
             update_check_interval_hours: 24,
-            update_repo: "gumbees/immichsync".to_string(),
+            update_repo: "bees-roadhouse/immichsync".to_string(),
+            update_channel: "latest".to_string(),
         }
     }
 }
@@ -379,6 +389,8 @@ mod tests {
         assert_eq!(cfg.advanced.log_level, "info");
         assert_eq!(cfg.advanced.poll_interval_secs, 30);
         assert_eq!(cfg.advanced.write_settle_ms, 2000);
+        assert_eq!(cfg.advanced.update_repo, "bees-roadhouse/immichsync");
+        assert_eq!(cfg.advanced.update_channel, "latest");
     }
 
     #[test]
