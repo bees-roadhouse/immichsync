@@ -325,6 +325,7 @@ impl App {
                         if let Ok(id) =
                             db.add_folder(&pictures.display().to_string(), Some("Pictures"), true)
                         {
+                            // Default Pictures folder has no per-folder patterns.
                             let filter = FileFilter::new();
                             let canon = std::fs::canonicalize(&pictures)
                                 .unwrap_or_else(|_| pictures.clone());
@@ -352,7 +353,13 @@ impl App {
                         continue;
                     }
                     let is_network = folder.watch_mode == crate::db::WatchMode::Poll;
-                    let filter = FileFilter::new();
+                    let includes =
+                        crate::watch::filter::parse_patterns_json(folder.include_patterns.as_deref());
+                    let excludes =
+                        crate::watch::filter::parse_patterns_json(folder.exclude_patterns.as_deref());
+                    let filter = FileFilter::new()
+                        .with_include_patterns(includes)
+                        .with_exclude_patterns(excludes);
                     let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
                     if let Err(e) =
                         engine.add_folder(path, filter, is_network, self.runtime.handle().clone())

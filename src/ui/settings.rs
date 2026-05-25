@@ -17,6 +17,7 @@ use tracing::info;
 
 use crate::config::Config;
 use crate::db::{AlbumMode, Database, PostUpload, WatchMode, WatchedFolder};
+use crate::watch::filter::{parse_patterns_json, patterns_to_json};
 
 /// Settings window state.
 ///
@@ -58,6 +59,15 @@ pub fn show_settings(config: Config, result_tx: Option<Sender<Config>>) {
     // Load watched folders from database for the Watch Folders tab.
     let folders = load_folders();
 
+    // Hydrate per-folder editable pattern text (one glob per line) from the
+    // JSON-encoded DB columns.
+    let mut include_text: HashMap<i64, String> = HashMap::new();
+    let mut exclude_text: HashMap<i64, String> = HashMap::new();
+    for f in &folders {
+        include_text.insert(f.id, patterns_text_from_json(f.include_patterns.as_deref()));
+        exclude_text.insert(f.id, patterns_text_from_json(f.exclude_patterns.as_deref()));
+    }
+
     let app = SettingsApp {
         // Connection tab
         server_url: config.server.url.clone(),
@@ -87,6 +97,8 @@ pub fn show_settings(config: Config, result_tx: Option<Sender<Config>>) {
         folders,
         folder_to_remove: None,
         apply_existing: HashMap::new(),
+        include_text,
+        exclude_text,
 
         // State
         active_tab: Tab::Connection,
@@ -145,6 +157,10 @@ struct SettingsApp {
     folder_to_remove: Option<i64>,
     /// Transient per-folder checkbox: apply trash/delete to already-uploaded files on Save.
     apply_existing: HashMap<i64, bool>,
+    /// Transient per-folder include-patterns text buffer (one glob per line).
+    include_text: HashMap<i64, String>,
+    /// Transient per-folder exclude-patterns text buffer (one glob per line).
+    exclude_text: HashMap<i64, String>,
 
     // State
     active_tab: Tab,
@@ -355,6 +371,27 @@ impl SettingsApp {
                             // Reset if user switches back to Keep.
                             self.apply_existing.remove(&folder.id);
                         }
+
+                        // Per-folder include/exclude glob patterns. One pattern per line.
+                        // Empty buffers leave the filter at default (extension-only).
+                        ui.add_space(4.0);
+                        ui.label("Include patterns (one glob per line, blank = no restriction):");
+                        let include_buf = self.include_text.entry(folder.id).or_default();
+                        ui.add(
+                            egui::TextEdit::multiline(include_buf)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("e.g. **/raw/** or *.cr3"),
+                        );
+
+                        ui.label("Exclude patterns (one glob per line):");
+                        let exclude_buf = self.exclude_text.entry(folder.id).or_default();
+                        ui.add(
+                            egui::TextEdit::multiline(exclude_buf)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("e.g. **/thumbnails/**"),
+                        );
                     });
                     ui.add_space(2.0);
                 }
@@ -614,11 +651,27 @@ impl SettingsApp {
             }
         }
         self.folders.retain(|f| f.id != id);
+        self.include_text.remove(&id);
+        self.exclude_text.remove(&id);
+        self.apply_existing.remove(&id);
     }
 
     fn save_folders(&self) {
         if let Ok(db) = open_db() {
             for folder in &self.folders {
+                // Convert per-folder line-separated text buffers into JSON
+                // arrays before persisting. Empty buffers store NULL.
+                let include_json = self
+                    .include_text
+                    .get(&folder.id)
+                    .map(|s| patterns_text_to_json(s))
+                    .unwrap_or(None);
+                let exclude_json = self
+                    .exclude_text
+                    .get(&folder.id)
+                    .map(|s| patterns_text_to_json(s))
+                    .unwrap_or(None);
+
                 if let Err(e) = db.update_folder(
                     folder.id,
                     folder.label.as_deref(),
@@ -627,8 +680,8 @@ impl SettingsApp {
                     folder.poll_interval_secs,
                     &folder.album_mode,
                     folder.album_name.as_deref(),
-                    folder.include_patterns.as_deref(),
-                    folder.exclude_patterns.as_deref(),
+                    include_json.as_deref(),
+                    exclude_json.as_deref(),
                     &folder.post_upload,
                 ) {
                     tracing::warn!(id = folder.id, error = %e, "Failed to update folder");
@@ -718,5 +771,59 @@ fn load_folders() -> Vec<WatchedFolder> {
             tracing::warn!(error = %e, "Failed to load folders for settings");
             Vec::new()
         }
+    }
+}
+
+/// Convert a JSON-encoded array of patterns (from `watched_folders`) into
+/// editable one-glob-per-line text for the multiline UI buffer.
+fn patterns_text_from_json(raw: Option<&str>) -> String {
+    parse_patterns_json(raw).join("\n")
+}
+
+/// Convert a one-glob-per-line text buffer into a JSON array string for DB
+/// storage. Returns `None` if the buffer is empty (so the column stores NULL).
+fn patterns_text_to_json(text: &str) -> Option<String> {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    patterns_to_json(&lines)
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_text_yields_none_json() {
+        assert!(patterns_text_to_json("").is_none());
+        assert!(patterns_text_to_json("   \n\n  \n").is_none());
+    }
+
+    #[test]
+    fn lines_become_json_array() {
+        let json = patterns_text_to_json("*.jpg\n**/raw/**").unwrap();
+        // Order preserved; whitespace trimmed.
+        let parsed: Vec<String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, vec!["*.jpg".to_string(), "**/raw/**".to_string()]);
+    }
+
+    #[test]
+    fn roundtrip_text_to_json_to_text() {
+        let original = "*.jpg\n**/raw/**\n  ";
+        let json = patterns_text_to_json(original).unwrap();
+        let back = patterns_text_from_json(Some(&json));
+        // Blank line is dropped; whitespace trimmed.
+        assert_eq!(back, "*.jpg\n**/raw/**");
+    }
+
+    #[test]
+    fn json_to_text_handles_none_and_malformed() {
+        assert_eq!(patterns_text_from_json(None), "");
+        // Malformed JSON yields empty text rather than panicking.
+        assert_eq!(patterns_text_from_json(Some("not json")), "");
     }
 }
