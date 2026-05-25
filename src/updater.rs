@@ -278,8 +278,7 @@ async fn check_inner(repo: &str, channel: &Channel) -> Result<UpdateCheckResult,
         }
         Channel::Latest | Channel::Tag(_) => {
             let resp = client.get(&url).send().await?;
-            if matches!(channel, Channel::Tag(_))
-                && resp.status() == reqwest::StatusCode::NOT_FOUND
+            if matches!(channel, Channel::Tag(_)) && resp.status() == reqwest::StatusCode::NOT_FOUND
             {
                 return Err(UpdateError::NoRelease);
             }
