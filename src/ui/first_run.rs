@@ -36,7 +36,8 @@ pub fn run_first_run_wizard() -> Option<Config> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([480.0, 360.0])
             .with_title("ImmichSync — Setup")
-            .with_resizable(false),
+            .with_resizable(false)
+            .with_icon(crate::ui::window_icon::brand_icon_data()),
         ..Default::default()
     };
 

@@ -52,7 +52,8 @@ pub fn show_settings(config: Config, result_tx: Option<Sender<Config>>) {
         })),
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([520.0, 420.0])
-            .with_title("ImmichSync Settings"),
+            .with_title("ImmichSync Settings")
+            .with_icon(crate::ui::window_icon::brand_icon_data()),
         ..Default::default()
     };
 

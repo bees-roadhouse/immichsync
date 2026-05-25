@@ -106,6 +106,16 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 [dev-dependencies]
 tempfile = "3"
 
+# Build-time icon pipeline:
+# - Read assets/icon-source.webp via `image`
+# - Generate a multi-resolution .ico via `ico`
+# - Embed the .ico as the EXE resource icon via `winresource`
+# All three are build-only; nothing at runtime depends on them.
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["webp", "png"] }
+ico = "0.4"
+winresource = "0.1"
+
 [profile.release]
 strip = true
 lto = true

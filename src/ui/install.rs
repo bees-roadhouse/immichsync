@@ -45,7 +45,8 @@ pub fn run_install_dialog_subprocess(is_update: bool, old_version: Option<String
             .with_inner_size([420.0, 300.0])
             .with_title(title)
             .with_resizable(false)
-            .with_always_on_top(),
+            .with_always_on_top()
+            .with_icon(crate::ui::window_icon::brand_icon_data()),
         ..Default::default()
     };
 
