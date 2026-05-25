@@ -392,6 +392,16 @@ impl SettingsApp {
                                 .desired_width(f32::INFINITY)
                                 .hint_text("e.g. **/thumbnails/**"),
                         );
+
+                        // Skip cloud-storage placeholder files (OneDrive Files
+                        // On-Demand, iCloud, SeaDrive, Google Drive, etc.).
+                        // Default ON ... reading a placeholder triggers a
+                        // cloud download as a side effect, which can re-pull
+                        // an entire offloaded library on first scan.
+                        ui.checkbox(
+                            &mut folder.ignore_online_files,
+                            "Skip cloud-only files (placeholders, not materialized locally)",
+                        );
                     });
                     ui.add_space(2.0);
                 }
@@ -630,6 +640,7 @@ impl SettingsApp {
                             include_patterns: None,
                             exclude_patterns: None,
                             post_upload: PostUpload::Keep,
+                            ignore_online_files: true,
                             auto_added: false,
                             created_at: String::new(),
                             updated_at: String::new(),
@@ -683,6 +694,7 @@ impl SettingsApp {
                     include_json.as_deref(),
                     exclude_json.as_deref(),
                     &folder.post_upload,
+                    folder.ignore_online_files,
                 ) {
                     tracing::warn!(id = folder.id, error = %e, "Failed to update folder");
                 }

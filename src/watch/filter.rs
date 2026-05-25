@@ -1,4 +1,4 @@
-// File filtering (extensions, globs, size)
+// File filtering (extensions, globs, size, cloud-placeholder attributes)
 
 use glob::Pattern;
 use std::collections::HashSet;
@@ -8,14 +8,36 @@ use tracing::debug;
 /// Default minimum file size in bytes (1 KB)
 const DEFAULT_MIN_SIZE: u64 = 1024;
 
+/// Windows file attribute bits that mark a file as a cloud-storage placeholder.
+///
+/// Any file with one or more of these bits set is "online" — its content lives
+/// in the cloud and any read triggers a download. OneDrive Files On-Demand,
+/// iCloud Drive for Windows, Google Drive for Desktop, Dropbox Smart Sync,
+/// Box Drive, SeaDrive, etc. all set one or more of these.
+///
+/// See: <https://learn.microsoft.com/en-us/windows/win32/fileio/file-attribute-constants>
+#[cfg(windows)]
+pub(crate) const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
+#[cfg(windows)]
+pub(crate) const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
+#[cfg(windows)]
+pub(crate) const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+
+/// Bitmask of all "cloud-placeholder" attributes. A non-zero AND with a file's
+/// raw attribute DWORD means the file content is not materialized locally.
+#[cfg(windows)]
+pub(crate) const CLOUD_PLACEHOLDER_MASK: u32 =
+    FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+
 /// File filter that determines whether a given path should be watched and queued.
 ///
 /// Filtering is applied in this order:
 /// 1. Exclusion name list (exact filename matches like Thumbs.db)
 /// 2. Extension allowlist (image + video extensions by default)
 /// 3. Minimum file size
-/// 4. Custom exclude glob patterns (per-folder overrides)
-/// 5. Custom include glob patterns (if any are set, path must match at least one)
+/// 4. Cloud-placeholder check (Windows recall attributes) when enabled
+/// 5. Custom exclude glob patterns (per-folder overrides)
+/// 6. Custom include glob patterns (if any are set, path must match at least one)
 #[derive(Debug, Clone)]
 pub struct FileFilter {
     /// Allowed file extensions (lowercase, without leading dot)
@@ -28,6 +50,11 @@ pub struct FileFilter {
     include_patterns: Vec<Pattern>,
     /// Custom glob patterns for exclusion (file is dropped if it matches any)
     exclude_patterns: Vec<Pattern>,
+    /// When `true`, files marked with Windows cloud-placeholder attributes
+    /// (OneDrive Files On-Demand, iCloud, Google Drive, SeaDrive, etc.) are
+    /// dropped before any read. Default `true` — opening a placeholder
+    /// triggers a cloud download as a side effect.
+    ignore_online_files: bool,
 }
 
 impl FileFilter {
@@ -68,7 +95,16 @@ impl FileFilter {
             min_size: DEFAULT_MIN_SIZE,
             include_patterns: Vec::new(),
             exclude_patterns: Vec::new(),
+            ignore_online_files: true,
         }
+    }
+
+    /// Override whether files with Windows cloud-placeholder attributes are
+    /// skipped. Default is `true`. Set to `false` to upload placeholders too
+    /// (the file read will trigger a cloud download for each file).
+    pub fn with_ignore_online_files(mut self, ignore: bool) -> Self {
+        self.ignore_online_files = ignore;
+        self
     }
 
     /// Add custom glob include patterns.
@@ -162,7 +198,9 @@ impl FileFilter {
             return false;
         }
 
-        // Minimum size
+        // Metadata: enforces the minimum-size threshold and (on Windows) the
+        // cloud-placeholder check. We do both off the same stat call so we
+        // pay one syscall, not two.
         match std::fs::metadata(path) {
             Ok(meta) => {
                 if meta.len() < self.min_size {
@@ -170,6 +208,16 @@ impl FileFilter {
                         "Excluding (too small: {} < {} bytes): {:?}",
                         meta.len(),
                         self.min_size,
+                        path
+                    );
+                    return false;
+                }
+
+                #[cfg(windows)]
+                if self.ignore_online_files && is_online_file(&meta) {
+                    debug!(
+                        "Excluding (cloud-placeholder / online file, attrs=0x{:x}): {:?}",
+                        std::os::windows::fs::MetadataExt::file_attributes(&meta),
                         path
                     );
                     return false;
@@ -252,6 +300,26 @@ pub fn patterns_to_json(patterns: &[String]) -> Option<String> {
         return None;
     }
     serde_json::to_string(&cleaned).ok()
+}
+
+/// Return `true` when `meta` indicates a Windows cloud-storage placeholder
+/// (OneDrive Files On-Demand, iCloud Drive, Google Drive, Dropbox, SeaDrive,
+/// Box Drive, etc.). Reads only the cached attribute DWORD — no extra
+/// syscalls and no contents read.
+///
+/// This is the worker's last-line check before SHA-1 hashing: even with the
+/// filter layer in place, a file's attributes can change between filter time
+/// and hash time (offload happens in the background).
+#[cfg(windows)]
+pub fn is_online_file(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    (meta.file_attributes() & CLOUD_PLACEHOLDER_MASK) != 0
+}
+
+/// Stub for non-Windows targets: nothing is ever an online file.
+#[cfg(not(windows))]
+pub fn is_online_file(_meta: &std::fs::Metadata) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -456,5 +524,92 @@ mod tests {
         // so the filter falls back to the "no include patterns configured" path.
         let f = make_temp_file_with_size("jpg", 2048);
         assert!(filter.should_include(f.path()));
+    }
+
+    // ── Cloud-placeholder / online-file handling ────────────────────────────
+
+    /// Mark a file with FILE_ATTRIBUTE_OFFLINE so `should_include` treats it
+    /// like a cloud placeholder. SeaDrive / OneDrive set this in production;
+    /// for tests we set it manually via `SetFileAttributesW`.
+    ///
+    /// Returns true on success, false if the OS rejected the attribute (some
+    /// filesystems clear it on the next sync — fine for unit testing where
+    /// we never sync).
+    #[cfg(windows)]
+    fn mark_offline(path: &Path) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            // Preserve existing attributes (notably ARCHIVE) and add OFFLINE.
+            let current = windows::Win32::Storage::FileSystem::GetFileAttributesW(
+                windows::core::PCWSTR(wide.as_ptr()),
+            );
+            let combined = current | super::FILE_ATTRIBUTE_OFFLINE;
+            windows::Win32::Storage::FileSystem::SetFileAttributesW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(combined),
+            )
+            .is_ok()
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_online_file_skipped_by_default() {
+        let f = make_temp_file_with_size("jpg", 4096);
+        assert!(mark_offline(f.path()), "Failed to mark file offline");
+
+        let filter = FileFilter::new();
+        assert!(
+            !filter.should_include(f.path()),
+            "Default filter should skip cloud-placeholder files"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_online_file_included_when_disabled() {
+        let f = make_temp_file_with_size("jpg", 4096);
+        assert!(mark_offline(f.path()), "Failed to mark file offline");
+
+        let filter = FileFilter::new().with_ignore_online_files(false);
+        assert!(
+            filter.should_include(f.path()),
+            "Filter with ignore_online_files=false should include placeholders"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_normal_file_passes_with_ignore_on() {
+        let f = make_temp_file_with_size("jpg", 4096);
+        // Don't mark it offline — it's a real local file.
+        let filter = FileFilter::new();
+        assert!(
+            filter.should_include(f.path()),
+            "Filter with default ignore_online_files=true should still include local files"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_is_online_file_helper() {
+        let f = make_temp_file_with_size("jpg", 4096);
+        let meta = std::fs::metadata(f.path()).unwrap();
+        assert!(
+            !super::is_online_file(&meta),
+            "Plain temp file should not be marked online"
+        );
+
+        assert!(mark_offline(f.path()));
+        let meta = std::fs::metadata(f.path()).unwrap();
+        assert!(
+            super::is_online_file(&meta),
+            "File flagged FILE_ATTRIBUTE_OFFLINE should be detected as online"
+        );
     }
 }

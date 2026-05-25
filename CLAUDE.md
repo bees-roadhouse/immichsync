@@ -143,10 +143,11 @@ Auth: `x-api-key` header on all requests.
 
 ## Duplicate Prevention
 
-Three layers:
-1. **Local DB check** — query `uploaded_files` by SHA-1 hash before uploading
-2. **Server bulk check** — `POST /api/assets/bulk-upload-check` with checksums
-3. **Server-side dedup** — Immich rejects duplicates on upload (last resort, wastes bandwidth)
+Four layers:
+1. **Fast-path (path+size+mtime)** — composite index lookup on `uploaded_files`; skips without ever opening the file. Critical for cloud-storage placeholders (OneDrive Files On-Demand, iCloud, SeaDrive, etc.) where opening a file triggers a re-download. See ARCHITECTURE.md → Cloud-Storage Interaction.
+2. **Content hash (SHA-1)** — fall through to SHA-1, lookup by `uploaded_files.file_hash`. Catches renamed/touched-but-identical files.
+3. **Server bulk check** — `POST /api/assets/bulk-upload-check` with checksums (retry-only).
+4. **Server-side dedup** — Immich rejects duplicates on upload (last resort, wastes bandwidth).
 
 ## Data Locations
 

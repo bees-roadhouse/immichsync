@@ -197,6 +197,10 @@ pub struct WatchedFolder {
     pub exclude_patterns: Option<String>,
     /// What to do with files after successful upload.
     pub post_upload: PostUpload,
+    /// When `true`, the watcher skips Windows cloud-storage placeholder files
+    /// (OneDrive Files On-Demand, iCloud Drive, etc.) so reading them doesn't
+    /// trigger a re-download. Default `true` (column default in v3).
+    pub ignore_online_files: bool,
     /// `true` if the folder was added automatically (e.g. removable device).
     pub auto_added: bool,
     pub created_at: String,
@@ -211,6 +215,11 @@ pub struct UploadedFile {
     /// SHA-1 hex digest — matches Immich's internal checksum field.
     pub file_hash: String,
     pub file_size: i64,
+    /// File modification time in seconds since the Unix epoch (signed because
+    /// pre-1970 mtimes are possible on some filesystems). Used by the
+    /// fast-path dedup index to skip re-hashing unchanged files. `0` for
+    /// rows uploaded before the v3 migration.
+    pub file_mtime: i64,
     /// Immich-assigned asset UUID returned after upload.
     pub immich_asset_id: Option<String>,
     /// `"{path_hash}-{filename}"` device-scoped asset identifier.
@@ -316,6 +325,12 @@ impl Database {
             info!("Applied schema migration v2");
         }
 
+        if current_version < 3 {
+            self.migrate_v3()?;
+            self.set_schema_version(3)?;
+            info!("Applied schema migration v3");
+        }
+
         Ok(())
     }
 
@@ -393,6 +408,31 @@ impl Database {
             })
     }
 
+    /// v3: cloud-placeholder ignore toggle on `watched_folders` + path/size/mtime
+    /// fast-path dedup index on `uploaded_files`.
+    ///
+    /// Two coupled changes for issue #26: the toggle lets watchers skip
+    /// online files at event-emit time, and the (path, size, mtime) composite
+    /// index lets the worker dedup a file without ever opening it for SHA-1
+    /// (which would trigger a cloud download as a side effect).
+    fn migrate_v3(&self) -> Result<(), DbError> {
+        self.conn
+            .execute_batch(
+                "ALTER TABLE watched_folders
+                    ADD COLUMN ignore_online_files INTEGER NOT NULL DEFAULT 1;
+
+                 ALTER TABLE uploaded_files
+                    ADD COLUMN file_mtime INTEGER NOT NULL DEFAULT 0;
+
+                 CREATE INDEX IF NOT EXISTS idx_uploaded_path_size_mtime
+                    ON uploaded_files(file_path, file_size, file_mtime);",
+            )
+            .map_err(|e| DbError::Migration {
+                version: 3,
+                source: e,
+            })
+    }
+
     fn get_schema_version(&self) -> Result<u32, DbError> {
         let version: Option<String> = self
             .conn
@@ -441,6 +481,11 @@ impl Database {
     // ── watched_folders ──────────────────────────────────────────────────────
 
     /// Add a new watched folder. Returns the new row's `id`.
+    ///
+    /// `ignore_online_files` defaults to `TRUE` (the v3 column default), which
+    /// keeps the watcher from re-downloading cloud-placeholder files on every
+    /// scan. Toggle it off per-folder in Settings if the user wants to upload
+    /// placeholders too.
     pub fn add_folder(
         &self,
         path: &str,
@@ -451,8 +496,9 @@ impl Database {
         self.conn.execute(
             "INSERT INTO watched_folders
                 (path, label, enabled, watch_mode, poll_interval_secs,
-                 album_mode, post_upload, auto_added, created_at, updated_at)
-             VALUES (?1, ?2, TRUE, 'native', 30, 'none', 'keep', ?3, ?4, ?4)",
+                 album_mode, post_upload, ignore_online_files,
+                 auto_added, created_at, updated_at)
+             VALUES (?1, ?2, TRUE, 'native', 30, 'none', 'keep', 1, ?3, ?4, ?4)",
             params![path, label, auto_added, now],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -470,7 +516,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, path, label, enabled, watch_mode, poll_interval_secs,
                     album_mode, album_name, include_patterns, exclude_patterns,
-                    post_upload, auto_added, created_at, updated_at
+                    post_upload, ignore_online_files, auto_added, created_at, updated_at
              FROM watched_folders
              ORDER BY id",
         )?;
@@ -486,7 +532,7 @@ impl Database {
             .query_row(
                 "SELECT id, path, label, enabled, watch_mode, poll_interval_secs,
                         album_mode, album_name, include_patterns, exclude_patterns,
-                        post_upload, auto_added, created_at, updated_at
+                        post_upload, ignore_online_files, auto_added, created_at, updated_at
                  FROM watched_folders
                  WHERE path = ?1",
                 params![path],
@@ -497,6 +543,7 @@ impl Database {
     }
 
     /// Update mutable fields of a watched folder.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_folder(
         &self,
         id: i64,
@@ -509,6 +556,7 @@ impl Database {
         include_patterns: Option<&str>,
         exclude_patterns: Option<&str>,
         post_upload: &PostUpload,
+        ignore_online_files: bool,
     ) -> Result<(), DbError> {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
@@ -522,7 +570,8 @@ impl Database {
                  include_patterns = ?8,
                  exclude_patterns = ?9,
                  post_upload = ?10,
-                 updated_at = ?11
+                 ignore_online_files = ?11,
+                 updated_at = ?12
              WHERE id = ?1",
             params![
                 id,
@@ -535,6 +584,7 @@ impl Database {
                 include_patterns,
                 exclude_patterns,
                 post_upload.as_str(),
+                ignore_online_files,
                 now,
             ],
         )?;
@@ -555,11 +605,19 @@ impl Database {
     }
 
     /// Record a successfully uploaded file.
+    ///
+    /// `file_mtime` is the file's modification time in seconds since the Unix
+    /// epoch. Stored on the row so subsequent runs can use the fast-path
+    /// (path, size, mtime) index in [`is_file_uploaded_fast_path`] to skip
+    /// re-hashing — critical for cloud-placeholder files where opening the
+    /// file for SHA-1 would trigger a re-download.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_upload(
         &self,
         file_path: &str,
         file_hash: &str,
         file_size: i64,
+        file_mtime: i64,
         immich_asset_id: Option<&str>,
         device_asset_id: &str,
         server_url: &str,
@@ -567,13 +625,14 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
             "INSERT INTO uploaded_files
-                (file_path, file_hash, file_size, immich_asset_id,
+                (file_path, file_hash, file_size, file_mtime, immich_asset_id,
                  device_asset_id, uploaded_at, server_url)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 file_path,
                 file_hash,
                 file_size,
+                file_mtime,
                 immich_asset_id,
                 device_asset_id,
                 now,
@@ -581,6 +640,33 @@ impl Database {
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Fast-path dedup: return `true` if a file with this exact path, size,
+    /// AND mtime has already been uploaded.
+    ///
+    /// Backed by the composite index on `(file_path, file_size, file_mtime)`.
+    /// This is the first dedup layer the worker checks: if it hits, we skip
+    /// without opening the file. On a cloud-placeholder file, that means we
+    /// never trigger a re-download. On a miss we fall through to the SHA-1
+    /// content dedup layer.
+    pub fn is_file_uploaded_fast_path(
+        &self,
+        file_path: &str,
+        file_size: i64,
+        file_mtime: i64,
+    ) -> Result<bool, DbError> {
+        let hit: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM uploaded_files
+                 WHERE file_path = ?1 AND file_size = ?2 AND file_mtime = ?3
+                 LIMIT 1",
+                params![file_path, file_size, file_mtime],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(hit.is_some())
     }
 
     /// Return file paths under `folder_path` that have been uploaded.
@@ -766,7 +852,7 @@ impl Database {
             .query_row(
                 "SELECT id, path, label, enabled, watch_mode, poll_interval_secs,
                         album_mode, album_name, include_patterns, exclude_patterns,
-                        post_upload, auto_added, created_at, updated_at
+                        post_upload, ignore_online_files, auto_added, created_at, updated_at
                  FROM watched_folders
                  WHERE id = ?1",
                 params![id],
@@ -832,9 +918,10 @@ fn map_watched_folder(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatchedFolder
         include_patterns: row.get(8)?,
         exclude_patterns: row.get(9)?,
         post_upload: PostUpload::from_str(&row.get::<_, String>(10)?),
-        auto_added: row.get(11)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
+        ignore_online_files: row.get(11)?,
+        auto_added: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
     })
 }
 
@@ -943,6 +1030,7 @@ impl crate::upload::queue::QueueStore for DbStore {
         file_path: &str,
         hash: &str,
         size: u64,
+        mtime: i64,
         asset_id: &str,
         device_asset_id: &str,
         server_url: &str,
@@ -952,11 +1040,22 @@ impl crate::upload::queue::QueueStore for DbStore {
             file_path,
             hash,
             size as i64,
+            mtime,
             Some(asset_id),
             device_asset_id,
             server_url,
         )?;
         Ok(())
+    }
+
+    fn is_file_uploaded_fast_path(
+        &self,
+        file_path: &str,
+        file_size: i64,
+        file_mtime: i64,
+    ) -> anyhow::Result<bool> {
+        let db = self.db.lock().unwrap();
+        Ok(db.is_file_uploaded_fast_path(file_path, file_size, file_mtime)?)
     }
 
     fn get_queue_stats(&self) -> anyhow::Result<crate::upload::queue::QueueStats> {
@@ -1066,6 +1165,7 @@ mod tests {
             None,
             None,
             &PostUpload::Trash,
+            false,
         )
         .unwrap();
 
@@ -1076,6 +1176,18 @@ mod tests {
         assert_eq!(folder.poll_interval_secs, 60);
         assert_eq!(folder.album_mode, AlbumMode::Date);
         assert_eq!(folder.post_upload, PostUpload::Trash);
+        assert!(!folder.ignore_online_files);
+    }
+
+    #[test]
+    fn add_folder_defaults_ignore_online_files_on() {
+        let db = open_test_db();
+        db.add_folder("/photos/cloud", None, false).unwrap();
+        let folder = db.get_folder_by_path("/photos/cloud").unwrap().unwrap();
+        assert!(
+            folder.ignore_online_files,
+            "Newly added folders should default to ignoring cloud-placeholder files"
+        );
     }
 
     // ── uploaded_files ───────────────────────────────────────────────────────
@@ -1091,6 +1203,7 @@ mod tests {
             "/photos/img.jpg",
             hash,
             1024,
+            1_700_000_000,
             Some("asset-uuid-1"),
             "hash123-img.jpg",
             "https://immich.example.com",
@@ -1098,6 +1211,53 @@ mod tests {
         .unwrap();
 
         assert!(db.is_file_uploaded(hash).unwrap());
+    }
+
+    #[test]
+    fn fast_path_dedup_hit_on_same_path_size_mtime() {
+        let db = open_test_db();
+        db.record_upload(
+            "/photos/cloud.jpg",
+            "deadbeef",
+            42_000,
+            1_700_000_000,
+            Some("asset-1"),
+            "device-1",
+            "https://immich.example.com",
+        )
+        .unwrap();
+
+        assert!(db
+            .is_file_uploaded_fast_path("/photos/cloud.jpg", 42_000, 1_700_000_000)
+            .unwrap());
+    }
+
+    #[test]
+    fn fast_path_dedup_miss_on_different_mtime() {
+        let db = open_test_db();
+        db.record_upload(
+            "/photos/cloud.jpg",
+            "deadbeef",
+            42_000,
+            1_700_000_000,
+            Some("asset-1"),
+            "device-1",
+            "https://immich.example.com",
+        )
+        .unwrap();
+
+        // Different mtime → miss (file was touched / re-saved).
+        assert!(!db
+            .is_file_uploaded_fast_path("/photos/cloud.jpg", 42_000, 1_700_000_001)
+            .unwrap());
+        // Different size → miss.
+        assert!(!db
+            .is_file_uploaded_fast_path("/photos/cloud.jpg", 42_001, 1_700_000_000)
+            .unwrap());
+        // Different path → miss.
+        assert!(!db
+            .is_file_uploaded_fast_path("/photos/other.jpg", 42_000, 1_700_000_000)
+            .unwrap());
     }
 
     // ── upload_queue ─────────────────────────────────────────────────────────

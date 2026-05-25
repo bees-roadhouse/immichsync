@@ -359,7 +359,8 @@ impl App {
                         crate::watch::filter::parse_patterns_json(folder.exclude_patterns.as_deref());
                     let filter = FileFilter::new()
                         .with_include_patterns(includes)
-                        .with_exclude_patterns(excludes);
+                        .with_exclude_patterns(excludes)
+                        .with_ignore_online_files(folder.ignore_online_files);
                     let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
                     if let Err(e) =
                         engine.add_folder(path, filter, is_network, self.runtime.handle().clone())
@@ -890,8 +891,27 @@ async fn initial_scan(
     let store2 = store.clone();
     let folder_map2 = folder_map.clone();
 
+    // Capture per-folder `ignore_online_files` flags so the scan filter
+    // matches the live watcher's behavior. Read once up front so we don't
+    // hold the DB mutex while walking the trees.
+    let folder_ignore_online: std::collections::HashMap<i64, bool> = {
+        let store_ref = store.clone();
+        let mut map = std::collections::HashMap::new();
+        for (_path, &id) in folder_map.as_ref() {
+            match store_ref.get_folder(id) {
+                Ok(Some(f)) => {
+                    map.insert(id, f.ignore_online_files);
+                }
+                _ => {
+                    // Default ON if we can't read it ... safe choice.
+                    map.insert(id, true);
+                }
+            }
+        }
+        map
+    };
+
     let result = tokio::task::spawn_blocking(move || {
-        let filter = FileFilter::new();
         let queue = UploadQueue::new(store2, 2);
         let mut scanned: u64 = 0;
         let mut enqueued: u64 = 0;
@@ -900,6 +920,8 @@ async fn initial_scan(
 
         for (folder_path, &folder_id) in folder_map2.as_ref() {
             info!(path = %folder_path.display(), "Initial scan: scanning folder");
+            let ignore_online = folder_ignore_online.get(&folder_id).copied().unwrap_or(true);
+            let filter = FileFilter::new().with_ignore_online_files(ignore_online);
             let mut dirs = vec![folder_path.clone()];
 
             while let Some(dir) = dirs.pop() {
