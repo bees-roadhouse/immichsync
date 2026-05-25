@@ -39,6 +39,11 @@ pub struct App {
     runtime: Arc<tokio::runtime::Runtime>,
     last_stats_update: Instant,
     last_trash_cleanup: Instant,
+    /// Last time we reconciled the WatchEngine's watched-folder set against the DB.
+    /// The Settings subprocess mutates the DB independently of the running engine,
+    /// so we periodically diff and converge to fix the "Remove without Save still
+    /// uploads files" footgun.
+    last_folder_reconcile: Instant,
     paused: bool,
     /// Track previous syncing state to detect transitions for notifications.
     was_syncing: bool,
@@ -56,6 +61,17 @@ pub struct App {
     pending_update: Option<UpdateInfo>,
     /// Set to true once the update has been downloaded and applied.
     update_ready: bool,
+    /// When the last server-reachability ping fired. The tray's Offline state
+    /// is driven by this ... a single failed ping flips us to Offline, and
+    /// a successful ping (or starting an upload, since uploads imply
+    /// reachability) clears it.
+    last_ping_at: Instant,
+    /// Receiver for async ping results. `Ok(true)` = reachable, anything else
+    /// = unreachable.
+    ping_rx: Option<std::sync::mpsc::Receiver<bool>>,
+    /// Latched offline state. The tray icon and tooltip key off this when
+    /// no upload is in flight.
+    server_offline: bool,
 }
 
 /// Tracks whether each type of UI window is currently open, preventing
@@ -102,6 +118,7 @@ impl App {
             runtime,
             last_stats_update: Instant::now(),
             last_trash_cleanup: Instant::now(),
+            last_folder_reconcile: Instant::now(),
             paused: false,
             was_syncing: false,
             notifications,
@@ -111,6 +128,9 @@ impl App {
             last_update_check: Instant::now(),
             pending_update: None,
             update_ready: false,
+            last_ping_at: Instant::now(),
+            ping_rx: None,
+            server_offline: false,
         }
     }
 
@@ -144,8 +164,8 @@ impl App {
         }
 
         // Create system tray (must be on main thread).
-        let (tray, tray_rx) = TrayApp::new()
-            .map_err(|e| anyhow::anyhow!("Failed to create tray: {}", e))?;
+        let (tray, tray_rx) =
+            TrayApp::new().map_err(|e| anyhow::anyhow!("Failed to create tray: {}", e))?;
         self.tray = Some(tray);
         self.tray_rx = Some(tray_rx);
 
@@ -153,12 +173,8 @@ impl App {
         if let Some(ref client) = self.client {
             let uploader: Arc<dyn AssetUploader> = Arc::new(client.clone());
             let store: Arc<dyn QueueStore> = self.db.clone();
-            let mut pipeline = UploadPipeline::new(
-                store,
-                &self.config.server,
-                &self.config.upload,
-                uploader,
-            );
+            let mut pipeline =
+                UploadPipeline::new(store, &self.config.server, &self.config.upload, uploader);
 
             // Pipeline spawns tokio tasks — enter the runtime context.
             let _guard = self.runtime.enter();
@@ -181,9 +197,7 @@ impl App {
         } else {
             info!("No server configured; pipeline not started");
             if let Some(ref mut tray) = self.tray {
-                tray.update_state(TrayState::Error(
-                    "Server not configured".to_string(),
-                ));
+                tray.update_state(TrayState::Error("Server not configured".to_string()));
             }
         }
 
@@ -267,8 +281,26 @@ impl App {
                 self.schedule_update_check(false);
             }
 
+            // Periodic server-reachability check. Drives the Offline tray state.
+            self.poll_ping_result();
+            self.maybe_schedule_ping();
+
             // Periodically refresh tray with queue statistics.
             self.update_tray_stats();
+
+            // Advance the syncing-state icon animation. Cheap when not
+            // syncing (early-returns on the absence of a scheduled deadline).
+            if let Some(ref mut tray) = self.tray {
+                tray.tick_animation();
+            }
+
+            // Periodically reconcile the WatchEngine's view of watched folders
+            // against the DB. The Settings subprocess mutates the DB without
+            // notifying the main process until it exits — until reconcile fires,
+            // a folder removed via Settings would still be watched (and its files
+            // uploaded). Cheap when there's no drift; restarts the engine when
+            // there is.
+            self.reconcile_watch_folders();
 
             // Periodic trash cleanup (hourly).
             if self.last_trash_cleanup.elapsed() >= Duration::from_secs(3600) {
@@ -310,23 +342,23 @@ impl App {
             if folders.is_empty() {
                 drop(db);
                 // First run: add the user's Pictures folder as a default.
-                if let Ok(pictures) =
-                    crate::platform::known_folders::get_pictures_folder()
-                {
+                if let Ok(pictures) = crate::platform::known_folders::get_pictures_folder() {
                     if pictures.exists() {
                         info!(path = %pictures.display(), "Adding default Pictures folder");
                         let db = self.db.inner().lock().unwrap();
-                        if let Ok(id) = db.add_folder(
-                            &pictures.display().to_string(),
-                            Some("Pictures"),
-                            true,
-                        ) {
+                        if let Ok(id) =
+                            db.add_folder(&pictures.display().to_string(), Some("Pictures"), true)
+                        {
+                            // Default Pictures folder has no per-folder patterns.
                             let filter = FileFilter::new();
                             let canon = std::fs::canonicalize(&pictures)
                                 .unwrap_or_else(|_| pictures.clone());
-                            if let Err(e) =
-                                engine.add_folder(pictures, filter, false, self.runtime.handle().clone())
-                            {
+                            if let Err(e) = engine.add_folder(
+                                pictures,
+                                filter,
+                                false,
+                                self.runtime.handle().clone(),
+                            ) {
                                 warn!("Failed to add Pictures watcher: {}", e);
                             } else {
                                 path_to_folder_id.insert(canon, id);
@@ -344,12 +376,20 @@ impl App {
                         warn!(path = %folder.path, "Watch folder missing, skipping");
                         continue;
                     }
-                    let is_network =
-                        folder.watch_mode == crate::db::WatchMode::Poll;
-                    let filter = FileFilter::new();
-                    let canon = std::fs::canonicalize(&path)
-                        .unwrap_or_else(|_| path.clone());
-                    if let Err(e) = engine.add_folder(path, filter, is_network, self.runtime.handle().clone())
+                    let is_network = folder.watch_mode == crate::db::WatchMode::Poll;
+                    let includes = crate::watch::filter::parse_patterns_json(
+                        folder.include_patterns.as_deref(),
+                    );
+                    let excludes = crate::watch::filter::parse_patterns_json(
+                        folder.exclude_patterns.as_deref(),
+                    );
+                    let filter = FileFilter::new()
+                        .with_include_patterns(includes)
+                        .with_exclude_patterns(excludes)
+                        .with_ignore_online_files(folder.ignore_online_files);
+                    let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                    if let Err(e) =
+                        engine.add_folder(path, filter, is_network, self.runtime.handle().clone())
                     {
                         warn!(path = %folder.path, error = %e, "Failed to add watcher");
                     } else {
@@ -368,7 +408,10 @@ impl App {
             let concurrency = self.config.upload.concurrency as usize;
             let folder_map = Arc::new(path_to_folder_id);
 
-            info!("Spawning watch→pipeline bridge task (concurrency={})", concurrency);
+            info!(
+                "Spawning watch→pipeline bridge task (concurrency={})",
+                concurrency
+            );
             let bridge_store = store.clone();
             let bridge_map = folder_map.clone();
             self.runtime.spawn(async move {
@@ -530,28 +573,205 @@ impl App {
             return;
         }
 
+        // Watcher health takes precedence over queue stats: if any watcher
+        // is permanently failed (or degraded after probe misses) we want
+        // the tray to advertise that, not "Idle".
+        let engine_health = self
+            .watch_engine
+            .as_ref()
+            .map(|e| e.health())
+            .unwrap_or(crate::watch::EngineHealth::Healthy);
+
         if let Some(ref pipeline) = self.pipeline {
             if let Ok(stats) = pipeline.stats() {
                 if let Some(ref mut tray) = self.tray {
                     let active = stats.uploading + stats.pending;
                     let is_syncing = active > 0;
 
-                    if is_syncing {
-                        tray.update_state(TrayState::Syncing {
-                            current: stats.uploading as u32,
-                            total: active as u32,
-                        });
-                    } else {
-                        tray.update_state(TrayState::Idle);
+                    match engine_health {
+                        crate::watch::EngineHealth::Failed => {
+                            tray.update_state(TrayState::Error(
+                                "one or more watchers are offline".to_owned(),
+                            ));
+                        }
+                        crate::watch::EngineHealth::Degraded => {
+                            // Stay on the syncing icon if uploads are
+                            // flowing; otherwise advertise the degraded
+                            // state via the Error tray channel (yellow
+                            // would conflict with Paused).
+                            if is_syncing {
+                                tray.update_state(TrayState::Syncing {
+                                    current: stats.uploading as u32,
+                                    total: active as u32,
+                                });
+                            } else {
+                                tray.update_state(TrayState::Error(
+                                    "watcher degraded — auto-restart in progress".to_owned(),
+                                ));
+                            }
+                        }
+                        crate::watch::EngineHealth::Healthy => {
+                            if is_syncing {
+                                // Active uploads override the Offline display ...
+                                // if we're actually moving bytes, by definition
+                                // the server is reachable.
+                                tray.update_state(TrayState::Syncing {
+                                    current: stats.uploading as u32,
+                                    total: active as u32,
+                                });
+                            } else if self.server_offline {
+                                tray.update_state(TrayState::Offline);
+                            } else {
+                                tray.update_state(TrayState::Idle);
+                            }
+                        }
                     }
 
                     // Detect Syncing → Idle transition for notification.
                     if self.was_syncing && !is_syncing && stats.completed > 0 {
-                        self.notifications.notify_upload_complete(stats.completed as u32);
+                        self.notifications
+                            .notify_upload_complete(stats.completed as u32);
                     }
                     self.was_syncing = is_syncing;
                 }
             }
+        }
+    }
+
+    /// Periodically ping the Immich server to detect outages. Drives the
+    /// Offline tray state.
+    ///
+    /// Cadence: every `PING_INTERVAL` (30s). One in-flight ping at a time ...
+    /// `ping_rx` being Some means we're waiting on the previous one.
+    fn maybe_schedule_ping(&mut self) {
+        const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+        if self.ping_rx.is_some() {
+            return; // a ping is already in flight
+        }
+        if self.last_ping_at.elapsed() < PING_INTERVAL {
+            return;
+        }
+        let Some(ref client) = self.client else {
+            return; // no client configured ... nothing to ping
+        };
+
+        self.last_ping_at = Instant::now();
+        let client = client.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ping_rx = Some(rx);
+        self.runtime.spawn(async move {
+            let ok = client.ping().await.unwrap_or(false);
+            let _ = tx.send(ok);
+        });
+    }
+
+    /// Poll the in-flight ping channel and update `server_offline`.
+    fn poll_ping_result(&mut self) {
+        let Some(rx) = self.ping_rx.as_ref() else {
+            return;
+        };
+        let Ok(ok) = rx.try_recv() else {
+            return;
+        };
+        self.ping_rx = None;
+
+        if ok {
+            if self.server_offline {
+                info!("Server reachable again ... clearing Offline state");
+            }
+            self.server_offline = false;
+        } else if !self.server_offline {
+            warn!("Server ping failed ... switching to Offline state");
+            self.server_offline = true;
+        } else {
+            self.server_offline = true;
+        }
+
+        // Reflect the new reachability in the tray menu's server line.
+        if let Some(ref mut tray) = self.tray {
+            let url_display = self
+                .config
+                .server
+                .url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://");
+            if !url_display.is_empty() {
+                tray.set_server_status(url_display, !self.server_offline);
+            }
+        }
+    }
+
+    /// Reconcile the WatchEngine's view of watched folders against the DB.
+    ///
+    /// Background: the Settings window is a separate subprocess. It writes
+    /// directly to the DB on `Remove Folder` / `Add Folder` clicks, but the
+    /// main process only gets a config-update message when the subprocess
+    /// exits. Between those two events, the engine watches a folder the
+    /// user has already removed — files added there still upload. Issue #16.
+    ///
+    /// Fix: every `FOLDER_RECONCILE_INTERVAL`, compare the engine's watched
+    /// set against the DB's enabled-folder set. If they differ, restart the
+    /// engine to converge. Restart also re-spawns the watch→pipeline bridge
+    /// with a refreshed folder map, so per-event folder-id lookup stays
+    /// correct after additions.
+    fn reconcile_watch_folders(&mut self) {
+        const FOLDER_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+
+        if self.last_folder_reconcile.elapsed() < FOLDER_RECONCILE_INTERVAL {
+            return;
+        }
+        self.last_folder_reconcile = Instant::now();
+
+        // What the DB says should be watched.
+        let db_paths: std::collections::HashSet<std::path::PathBuf> = {
+            let db = match self.db.inner().lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    warn!("Folder reconcile: DB mutex poisoned, skipping");
+                    return;
+                }
+            };
+            match db.get_folders() {
+                Ok(folders) => folders
+                    .into_iter()
+                    .filter(|f| f.enabled)
+                    .map(|f| {
+                        let p = std::path::PathBuf::from(&f.path);
+                        std::fs::canonicalize(&p).unwrap_or(p)
+                    })
+                    .collect(),
+                Err(e) => {
+                    warn!(error = %e, "Folder reconcile: get_folders failed, skipping");
+                    return;
+                }
+            }
+        };
+
+        // What the engine actually watches.
+        let engine_paths = match self.watch_engine.as_ref() {
+            Some(e) => e.watched_paths(),
+            None => std::collections::HashSet::new(),
+        };
+
+        if db_paths == engine_paths {
+            return;
+        }
+
+        let removed: Vec<_> = engine_paths.difference(&db_paths).cloned().collect();
+        let added: Vec<_> = db_paths.difference(&engine_paths).cloned().collect();
+        info!(
+            removed = removed.len(),
+            added = added.len(),
+            "Folder reconcile: drift detected, restarting watch engine to converge"
+        );
+
+        if let Some(ref mut engine) = self.watch_engine {
+            engine.stop_all();
+        }
+        self.watch_engine = None;
+        if let Err(e) = self.start_watch_engine() {
+            warn!(error = %e, "Folder reconcile: restart_watch_engine failed");
         }
     }
 
@@ -564,11 +784,12 @@ impl App {
         self.last_update_check = Instant::now();
 
         let repo = self.config.advanced.update_repo.clone();
+        let channel = self.config.advanced.update_channel.clone();
         self.runtime.spawn(async move {
             if with_delay {
                 tokio::time::sleep(updater::STARTUP_DELAY).await;
             }
-            let result = updater::check_for_update(&repo).await;
+            let result = updater::check_for_update(&repo, &channel).await;
             let _ = tx.send(result);
         });
     }
@@ -604,8 +825,12 @@ impl App {
                 let info_clone = info.clone();
                 self.runtime.spawn_blocking(move || {
                     match updater::download_and_apply(&info_clone) {
-                        Ok(()) => { let _ = tx.send(Ok(info_clone.new_version)); }
-                        Err(e) => { let _ = tx.send(Err(e.to_string())); }
+                        Ok(()) => {
+                            let _ = tx.send(Ok(info_clone.new_version));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e.to_string()));
+                        }
                     }
                 });
 
@@ -622,7 +847,11 @@ impl App {
 
     /// Poll the background download channel for completion.
     fn poll_update_download(&mut self) {
-        let result = match self.update_download_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        let result = match self
+            .update_download_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
             Some(r) => r,
             None => return,
         };
@@ -652,7 +881,8 @@ impl App {
                     }
                 }
 
-                self.notifications.notify_error(&format!("Update download failed: {e}"));
+                self.notifications
+                    .notify_error(&format!("Update download failed: {e}"));
             }
         }
     }
@@ -784,15 +1014,32 @@ async fn initial_scan(
     store: Arc<dyn QueueStore>,
     folder_map: Arc<std::collections::HashMap<std::path::PathBuf, i64>>,
 ) {
-    use std::path::PathBuf;
-
     info!("Initial scan: starting");
 
     let store2 = store.clone();
     let folder_map2 = folder_map.clone();
 
+    // Capture per-folder `ignore_online_files` flags so the scan filter
+    // matches the live watcher's behavior. Read once up front so we don't
+    // hold the DB mutex while walking the trees.
+    let folder_ignore_online: std::collections::HashMap<i64, bool> = {
+        let store_ref = store.clone();
+        let mut map = std::collections::HashMap::new();
+        for &id in folder_map.values() {
+            match store_ref.get_folder(id) {
+                Ok(Some(f)) => {
+                    map.insert(id, f.ignore_online_files);
+                }
+                _ => {
+                    // Default ON if we can't read it ... safe choice.
+                    map.insert(id, true);
+                }
+            }
+        }
+        map
+    };
+
     let result = tokio::task::spawn_blocking(move || {
-        let filter = FileFilter::new();
         let queue = UploadQueue::new(store2, 2);
         let mut scanned: u64 = 0;
         let mut enqueued: u64 = 0;
@@ -801,6 +1048,8 @@ async fn initial_scan(
 
         for (folder_path, &folder_id) in folder_map2.as_ref() {
             info!(path = %folder_path.display(), "Initial scan: scanning folder");
+            let ignore_online = folder_ignore_online.get(&folder_id).copied().unwrap_or(true);
+            let filter = FileFilter::new().with_ignore_online_files(ignore_online);
             let mut dirs = vec![folder_path.clone()];
 
             while let Some(dir) = dirs.pop() {
@@ -825,7 +1074,7 @@ async fn initial_scan(
 
                     // Recurse into subdirectories, skipping trash.
                     if path.is_dir() {
-                        if path.file_name().map_or(false, |n| {
+                        if path.file_name().is_some_and(|n| {
                             n == crate::upload::worker::TRASH_DIR_NAME
                         }) {
                             continue;
@@ -854,7 +1103,7 @@ async fn initial_scan(
                     }
 
                     // Log progress every 100 files.
-                    if scanned % 100 == 0 {
+                    if scanned.is_multiple_of(100) {
                         info!(scanned, enqueued, skipped, "Initial scan: progress");
                     }
                 }
@@ -867,13 +1116,7 @@ async fn initial_scan(
 
     match result {
         Ok((scanned, enqueued, skipped, errors)) => {
-            info!(
-                scanned,
-                enqueued,
-                skipped,
-                errors,
-                "Initial scan: complete"
-            );
+            info!(scanned, enqueued, skipped, errors, "Initial scan: complete");
         }
         Err(e) => {
             warn!(error = %e, "Initial scan task panicked");

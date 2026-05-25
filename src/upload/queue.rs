@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::upload::hasher;
 
@@ -46,34 +46,45 @@ pub trait QueueStore: Send + Sync {
     fn dequeue_pending(&self, limit: usize) -> anyhow::Result<Vec<QueueEntry>>;
 
     /// Update the status (and optional error message) of a queue entry.
-    fn update_status(
-        &self,
-        id: i64,
-        status: &str,
-        error: Option<&str>,
-    ) -> anyhow::Result<()>;
+    fn update_status(&self, id: i64, status: &str, error: Option<&str>) -> anyhow::Result<()>;
 
     /// Mark a queue entry as completed and record the resulting asset ID.
-    fn mark_completed(
-        &self,
-        id: i64,
-        asset_id: Option<&str>,
-    ) -> anyhow::Result<()>;
+    fn mark_completed(&self, id: i64, asset_id: Option<&str>) -> anyhow::Result<()>;
 
     /// Return `true` if a file with this SHA-1 hash has already been
     /// successfully uploaded (exists in `uploaded_files`).
     fn is_file_uploaded(&self, hash: &str) -> anyhow::Result<bool>;
 
     /// Insert a record into `uploaded_files` after a successful upload.
+    ///
+    /// `mtime` is the file's modification time in seconds since the Unix epoch,
+    /// stored so the fast-path dedup index can hit on subsequent scans without
+    /// re-hashing the file (which would trigger a cloud-storage download for
+    /// placeholder files).
+    #[allow(clippy::too_many_arguments)]
     fn record_upload(
         &self,
         file_path: &str,
         hash: &str,
         size: u64,
+        mtime: i64,
         asset_id: &str,
         device_asset_id: &str,
         server_url: &str,
     ) -> anyhow::Result<()>;
+
+    /// Fast-path dedup: returns `true` if a file with this exact path, size,
+    /// and mtime has already been uploaded. Lets the worker skip a file
+    /// without ever opening it — critical for cloud-storage placeholders.
+    /// Default returns `Ok(false)` so existing mocks don't have to implement it.
+    fn is_file_uploaded_fast_path(
+        &self,
+        _file_path: &str,
+        _file_size: i64,
+        _file_mtime: i64,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
 
     /// Return current queue statistics.
     fn get_queue_stats(&self) -> anyhow::Result<QueueStats>;
@@ -103,6 +114,10 @@ pub struct NewQueueEntry {
 }
 
 /// A row from the `upload_queue` table.
+///
+/// `status`, `error_message`, `queued_at`, and `completed_at` are read only
+/// by the in-module test suite (see `upload/mod.rs`); release builds
+/// construct entries from the DB layer but never read these fields back.
 #[derive(Debug, Clone)]
 pub struct QueueEntry {
     pub id: i64,
@@ -112,21 +127,30 @@ pub struct QueueEntry {
     pub folder_id: Option<i64>,
 
     /// One of `"pending"`, `"uploading"`, `"failed"`, `"completed"`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub status: String,
 
     pub retry_count: u32,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub error_message: Option<String>,
+    #[allow(dead_code)]
     pub queued_at: DateTime<Utc>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub completed_at: Option<DateTime<Utc>>,
 }
 
 /// Aggregate counts across all queue entries.
+///
+/// `failed` and `total` are populated by the test mock but the production UI
+/// only surfaces `pending`, `uploading`, and `completed` today.
 #[derive(Debug, Clone, Default)]
 pub struct QueueStats {
     pub pending: u64,
     pub uploading: u64,
     pub completed: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub failed: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub total: u64,
 }
 
@@ -139,6 +163,9 @@ pub struct QueueStats {
 pub struct UploadQueue {
     store: Arc<dyn QueueStore>,
     /// Maximum number of concurrent upload workers (advisory; not enforced here).
+    /// Carried so the pipeline can hand it back to the worker config; the
+    /// queue itself does not throttle on it.
+    #[allow(dead_code)]
     pub concurrency: usize,
 }
 
@@ -152,6 +179,17 @@ impl UploadQueue {
     ///
     /// Returns `Ok(Some(id))` when a new queue entry was created, or
     /// `Ok(None)` when the file was skipped due to local dedup.
+    ///
+    /// Dedup runs in two layers:
+    /// 1. **Fast path** ... `(canonical path, size, mtime)` against the
+    ///    `uploaded_files` composite index. On hit we skip without opening
+    ///    the file. This is the load-bearing path for cloud-storage
+    ///    placeholders (OneDrive, iCloud, SeaDrive, etc.) ... opening a
+    ///    placeholder for SHA-1 hashing would trigger a cloud download as a
+    ///    side effect.
+    /// 2. **Content hash** ... fall through, compute SHA-1, check against
+    ///    `uploaded_files.file_hash`. Catches the moved-or-renamed case where
+    ///    path/mtime changed but content is identical.
     pub fn process_file(
         &self,
         path: PathBuf,
@@ -159,36 +197,64 @@ impl UploadQueue {
     ) -> Result<Option<i64>, QueueError> {
         let path_str = path.display().to_string();
 
-        // 1. Hash the file.
+        // Read metadata once: needed for the fast-path query AND, if we miss,
+        // for size + mtime fields we'll persist alongside the hash. Failing
+        // to stat is fatal for this file ... bail with an error so the caller
+        // logs it and moves on.
+        let meta = std::fs::metadata(&path).map_err(|e| QueueError::Hash {
+            path: path_str.clone(),
+            source: hasher::HasherError::Open {
+                path: path_str.clone(),
+                source: e,
+            },
+        })?;
+        let file_size_u64 = meta.len();
+        let file_size_i64 = file_size_u64 as i64;
+        let file_mtime = mtime_secs(&meta);
+
+        // 1. Fast-path dedup ... canonicalise the path so the lookup matches
+        // the form `record_upload` stored (no `\\?\` prefix). Free win when
+        // the file's been uploaded before with the same size + mtime.
+        let canonical = canonical_path_for_storage(&path);
+        let fast_hit = self
+            .store
+            .is_file_uploaded_fast_path(&canonical, file_size_i64, file_mtime)
+            .map_err(QueueError::Store)?;
+        if fast_hit {
+            info!(
+                path = %path_str,
+                size = file_size_i64,
+                mtime = file_mtime,
+                "Skipping already-uploaded file (path+size+mtime fast-path)"
+            );
+            return Ok(None);
+        }
+
+        // 2. SHA-1 hash + content dedup. Reading the file here will trigger
+        // a cloud download for placeholder files ... which is fine because
+        // the watcher's filter already dropped placeholders by default, and
+        // any placeholder that reached here has either been already-materialised
+        // or the user explicitly opted in to uploading placeholders.
         let hash = hasher::hash_file(&path).map_err(|source| QueueError::Hash {
             path: path_str.clone(),
             source,
         })?;
 
-        // 2. Local dedup check.
         let already_uploaded = self
             .store
             .is_file_uploaded(&hash)
             .map_err(QueueError::Store)?;
 
         if already_uploaded {
-            info!(path = %path_str, hash = %hash, "Skipping already-uploaded file");
+            info!(path = %path_str, hash = %hash, "Skipping already-uploaded file (content hash)");
             return Ok(None);
         }
 
-        // 3. Gather file size.
-        let file_size = std::fs::metadata(&path)
-            .map(|m| m.len())
-            .map_err(|e| {
-                warn!(path = %path_str, error = %e, "Could not read file size; using None");
-            })
-            .ok();
-
-        // 4. Enqueue.
+        // 3. Enqueue.
         let entry = NewQueueEntry {
             file_path: path_str.clone(),
             file_hash: Some(hash.clone()),
-            file_size,
+            file_size: Some(file_size_u64),
             folder_id,
         };
 
@@ -208,6 +274,26 @@ impl UploadQueue {
     pub fn get_stats(&self) -> Result<QueueStats, QueueError> {
         self.store.get_queue_stats().map_err(QueueError::Store)
     }
+}
+
+/// Extract a file's modification time as seconds since the Unix epoch.
+/// Returns `0` if the platform / filesystem doesn't expose `modified()`.
+/// Stable across runs for the same physical file, which is what the fast-path
+/// dedup index needs.
+pub(crate) fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Normalize a path for storage in `uploaded_files.file_path` and for
+/// fast-path lookups: strip the Windows extended-length `\\?\` prefix so
+/// the value matches what `worker.rs` writes via `record_upload`.
+pub(crate) fn canonical_path_for_storage(path: &std::path::Path) -> String {
+    let s = path.display().to_string();
+    s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -259,12 +345,7 @@ mod tests {
                 .collect())
         }
 
-        fn update_status(
-            &self,
-            id: i64,
-            status: &str,
-            error: Option<&str>,
-        ) -> anyhow::Result<()> {
+        fn update_status(&self, id: i64, status: &str, error: Option<&str>) -> anyhow::Result<()> {
             let mut entries = self.entries.lock().unwrap();
             if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
                 e.status = status.to_string();
@@ -273,11 +354,7 @@ mod tests {
             Ok(())
         }
 
-        fn mark_completed(
-            &self,
-            id: i64,
-            _asset_id: Option<&str>,
-        ) -> anyhow::Result<()> {
+        fn mark_completed(&self, id: i64, _asset_id: Option<&str>) -> anyhow::Result<()> {
             let mut entries = self.entries.lock().unwrap();
             if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
                 e.status = "completed".to_string();
@@ -287,12 +364,7 @@ mod tests {
         }
 
         fn is_file_uploaded(&self, hash: &str) -> anyhow::Result<bool> {
-            Ok(*self
-                .uploaded
-                .lock()
-                .unwrap()
-                .get(hash)
-                .unwrap_or(&false))
+            Ok(*self.uploaded.lock().unwrap().get(hash).unwrap_or(&false))
         }
 
         fn record_upload(
@@ -300,6 +372,7 @@ mod tests {
             _file_path: &str,
             hash: &str,
             _size: u64,
+            _mtime: i64,
             _asset_id: &str,
             _device_asset_id: &str,
             _server_url: &str,
@@ -366,6 +439,7 @@ mod tests {
                 &tmp.path().display().to_string(),
                 &hash,
                 18,
+                0,
                 "asset-abc",
                 "device-abc",
                 "https://immich.example.com",
@@ -385,8 +459,7 @@ mod tests {
     fn process_file_missing_path_returns_error() {
         let store = Arc::new(MockStore::default());
         let queue = UploadQueue::new(store, 2);
-        let result =
-            queue.process_file(PathBuf::from("/nonexistent/photo.jpg"), None);
+        let result = queue.process_file(PathBuf::from("/nonexistent/photo.jpg"), None);
         assert!(result.is_err());
     }
 }

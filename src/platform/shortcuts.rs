@@ -21,7 +21,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, PROPERTYKEY};
 use windows::Win32::UI::Shell::{
-    IShellLinkW, SHGetKnownFolderPath, FOLDERID_Desktop, FOLDERID_Programs, KNOWN_FOLDER_FLAG,
+    FOLDERID_Desktop, FOLDERID_Programs, IShellLinkW, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG,
 };
 
 // CLSID_ShellLink: {00021401-0000-0000-C000-000000000046}
@@ -74,6 +74,9 @@ pub enum ShortcutError {
 
     #[error("known folder path is not valid UTF-16")]
     InvalidFolderPath,
+
+    #[error("failed to remove shortcut: {0}")]
+    Remove(#[source] std::io::Error),
 }
 
 /// Create a desktop shortcut pointing to the given executable.
@@ -104,6 +107,30 @@ pub fn create_start_menu_shortcut(
     create_shortcut(exe_path, &lnk_path, description)?;
 
     Ok(lnk_path)
+}
+
+/// Remove the desktop shortcut for the given name (no-op if missing).
+pub fn remove_desktop_shortcut(name: &str) -> Result<(), ShortcutError> {
+    let desktop = get_known_folder(&FOLDERID_Desktop)?;
+    let lnk_path = desktop.join(format!("{name}.lnk"));
+    remove_shortcut(&lnk_path)
+}
+
+/// Remove the Start Menu shortcut for the given name (no-op if missing).
+pub fn remove_start_menu_shortcut(name: &str) -> Result<(), ShortcutError> {
+    let programs = get_known_folder(&FOLDERID_Programs)?;
+    let lnk_path = programs.join(format!("{name}.lnk"));
+    remove_shortcut(&lnk_path)
+}
+
+fn remove_shortcut(lnk_path: &Path) -> Result<(), ShortcutError> {
+    if !lnk_path.exists() {
+        tracing::debug!(lnk = %lnk_path.display(), "Shortcut already absent");
+        return Ok(());
+    }
+    info!(lnk = %lnk_path.display(), "Removing shortcut");
+    std::fs::remove_file(lnk_path).map_err(ShortcutError::Remove)?;
+    Ok(())
 }
 
 /// Create a .lnk shortcut file via COM with AppUserModelID set.
@@ -148,9 +175,7 @@ fn create_shortcut(
         }
 
         // Set AppUserModelID so toast notifications can find us.
-        let prop_store: IPropertyStore = shell_link
-            .cast()
-            .map_err(ShortcutError::SetAppId)?;
+        let prop_store: IPropertyStore = shell_link.cast().map_err(ShortcutError::SetAppId)?;
 
         let aumid = PROPVARIANT::from(super::APP_USER_MODEL_ID);
         prop_store
@@ -159,9 +184,8 @@ fn create_shortcut(
         prop_store.Commit().map_err(ShortcutError::SetAppId)?;
 
         // Save the .lnk file via IPersistFile.
-        let persist_file: IPersistFile = shell_link
-            .cast()
-            .map_err(ShortcutError::QueryPersistFile)?;
+        let persist_file: IPersistFile =
+            shell_link.cast().map_err(ShortcutError::QueryPersistFile)?;
 
         let lnk_wide: Vec<u16> = lnk_path
             .as_os_str()

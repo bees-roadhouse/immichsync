@@ -13,21 +13,6 @@ use eframe::egui;
 
 use crate::config::Config;
 
-/// First-run wizard state.
-pub struct FirstRun;
-
-impl FirstRun {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for FirstRun {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Run the first-run wizard. Blocks the calling thread.
 ///
 /// Returns `Some(Config)` with user's settings if completed, `None` if cancelled.
@@ -36,7 +21,8 @@ pub fn run_first_run_wizard() -> Option<Config> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([480.0, 360.0])
             .with_title("ImmichSync — Setup")
-            .with_resizable(false),
+            .with_resizable(false)
+            .with_icon(crate::ui::window_icon::brand_icon_data()),
         ..Default::default()
     };
 
@@ -119,14 +105,12 @@ impl eframe::App for WizardAppWrapper {
 
 impl WizardApp {
     fn update_wizard(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.step {
-                WizardStep::Welcome => self.show_welcome(ui, ctx),
-                WizardStep::ServerConfig => self.show_server_config(ui, ctx),
-                WizardStep::FolderSetup => self.show_folder_setup(ui, ctx),
-                WizardStep::Autostart => self.show_autostart(ui, ctx),
-                WizardStep::Done => self.show_done(ui, ctx),
-            }
+        egui::CentralPanel::default().show(ctx, |ui| match self.step {
+            WizardStep::Welcome => self.show_welcome(ui, ctx),
+            WizardStep::ServerConfig => self.show_server_config(ui, ctx),
+            WizardStep::FolderSetup => self.show_folder_setup(ui, ctx),
+            WizardStep::Autostart => self.show_autostart(ui, ctx),
+            WizardStep::Done => self.show_done(ui, ctx),
         });
     }
 
@@ -196,8 +180,7 @@ impl WizardApp {
             if ui.button("Back").clicked() {
                 self.step = WizardStep::Welcome;
             }
-            let can_proceed =
-                !self.server_url.is_empty() && !self.api_key.is_empty();
+            let can_proceed = !self.server_url.is_empty() && !self.api_key.is_empty();
             ui.add_enabled_ui(can_proceed, |ui| {
                 if ui.button("Next").clicked() {
                     self.config.server.url = self.server_url.clone();
@@ -300,9 +283,7 @@ impl WizardApp {
                 // Add the watch folder to the database.
                 if !self.watch_folder.is_empty() {
                     if let Ok(db) = crate::db::Database::open() {
-                        if let Err(e) =
-                            db.add_folder(&self.watch_folder, None, false)
-                        {
+                        if let Err(e) = db.add_folder(&self.watch_folder, None, false) {
                             tracing::warn!(error = %e, "Failed to add wizard folder");
                         }
                     }
@@ -331,8 +312,7 @@ impl WizardApp {
                             self.test_status = "Connected!".to_string();
                         }
                         Ok(false) => {
-                            self.test_status =
-                                "Server responded but not ready".to_string();
+                            self.test_status = "Server responded but not ready".to_string();
                         }
                         Err(e) => {
                             self.test_status = format!("Failed: {e}");

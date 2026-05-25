@@ -13,8 +13,8 @@
 use thiserror::Error;
 use windows::core::PCWSTR;
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-    HKEY_CURRENT_USER, HKEY, KEY_READ, KEY_WRITE, REG_SZ,
+    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+    KEY_WRITE, REG_SZ,
 };
 
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0";
@@ -24,9 +24,6 @@ const VALUE_NAME: &str = "ImmichSync\0";
 pub enum AutostartError {
     #[error("registry open failed: Win32 error {0:#010x}")]
     RegistryOpen(u32),
-
-    #[error("registry query failed: Win32 error {0:#010x}")]
-    RegistryQuery(u32),
 
     #[error("registry write failed: Win32 error {0:#010x}")]
     RegistryWrite(u32),
@@ -45,48 +42,6 @@ pub enum AutostartError {
 // a Vec<u16> suitable for use as a PCWSTR.
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
-}
-
-/// Check whether the autostart registry value exists for this user.
-pub fn is_autostart_enabled() -> Result<bool, AutostartError> {
-    let key_wide = wide(RUN_KEY);
-    let value_wide = wide(VALUE_NAME);
-
-    // Open the Run key for reading.
-    let mut hkey = HKEY::default();
-    let result = unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR(key_wide.as_ptr()),
-            0,
-            KEY_READ,
-            &mut hkey,
-        )
-    };
-
-    if result.is_err() {
-        return Err(AutostartError::RegistryOpen(result.0 as u32));
-    }
-
-    // Query for the value — we don't need the data, just existence.
-    let query_result = unsafe {
-        RegQueryValueExW(
-            hkey,
-            PCWSTR(value_wide.as_ptr()),
-            None, // reserved
-            None, // type (don't care)
-            None, // data buffer (don't care)
-            None, // data size (don't care)
-        )
-    };
-
-    let _ = unsafe { RegCloseKey(hkey) };
-
-    match query_result.0 {
-        0 => Ok(true),                  // ERROR_SUCCESS — value exists
-        2 => Ok(false),                 // ERROR_FILE_NOT_FOUND — value absent
-        e => Err(AutostartError::RegistryQuery(e as u32)),
-    }
 }
 
 /// Enable or disable autostart for the current user.
@@ -116,7 +71,7 @@ pub fn set_autostart(enabled: bool) -> Result<(), AutostartError> {
         // Always point autostart at the installed exe path so the registry
         // value is stable regardless of where the app was originally launched.
         let exe = crate::platform::install::installed_exe_path()
-            .map_err(|e| AutostartError::ExePath(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| AutostartError::ExePath(std::io::Error::other(e)))?;
         let exe_str = exe.to_str().ok_or(AutostartError::ExePathEncoding)?;
 
         // Encode as a null-terminated wide string for REG_SZ.
@@ -146,14 +101,12 @@ pub fn set_autostart(enabled: bool) -> Result<(), AutostartError> {
     } else {
         tracing::info!("disabling autostart");
 
-        let r = unsafe {
-            RegDeleteValueW(hkey, PCWSTR(value_wide.as_ptr()))
-        };
+        let r = unsafe { RegDeleteValueW(hkey, PCWSTR(value_wide.as_ptr())) };
 
         match r.0 {
-            0 => Ok(()),    // ERROR_SUCCESS
-            2 => Ok(()),    // ERROR_FILE_NOT_FOUND — already absent, that's fine
-            e => Err(AutostartError::RegistryDelete(e as u32)),
+            0 => Ok(()), // ERROR_SUCCESS
+            2 => Ok(()), // ERROR_FILE_NOT_FOUND — already absent, that's fine
+            e => Err(AutostartError::RegistryDelete(e)),
         }
     };
 

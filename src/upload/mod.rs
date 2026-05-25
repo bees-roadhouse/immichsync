@@ -36,9 +36,6 @@ use worker::{AssetUploader, UploadWorker, WorkerConfig};
 
 #[derive(Debug, Error)]
 pub enum PipelineError {
-    #[error("Pipeline is not started; call start() first")]
-    NotStarted,
-
     #[error("Queue error: {0}")]
     Queue(#[from] queue::QueueError),
 
@@ -88,8 +85,7 @@ impl UploadPipeline {
 
         let (pause_tx, _pause_rx) = watch::channel(false);
 
-        let queue =
-            UploadQueue::new(store.clone(), upload.concurrency as usize);
+        let queue = UploadQueue::new(store.clone(), upload.concurrency as usize);
         let worker = Arc::new(UploadWorker::new(worker_config));
 
         Self {
@@ -128,6 +124,12 @@ impl UploadPipeline {
     ///
     /// Returns `Ok(Some(id))` when a new queue entry was created, or
     /// `Ok(None)` when the file was skipped (already uploaded).
+    ///
+    /// Currently only exercised by the in-module test suite; production paths
+    /// drive the queue directly through `crate::app::initial_scan` and the
+    /// watcher. The pipeline keeps this entry point so the test coverage of
+    /// dedup + enqueue stays intact.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn submit(
         &self,
         path: PathBuf,
@@ -248,12 +250,7 @@ mod tests {
                 .collect())
         }
 
-        fn update_status(
-            &self,
-            id: i64,
-            status: &str,
-            error: Option<&str>,
-        ) -> anyhow::Result<()> {
+        fn update_status(&self, id: i64, status: &str, error: Option<&str>) -> anyhow::Result<()> {
             let mut entries = self.entries.lock().unwrap();
             if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
                 e.status = status.to_string();
@@ -262,11 +259,7 @@ mod tests {
             Ok(())
         }
 
-        fn mark_completed(
-            &self,
-            id: i64,
-            _asset_id: Option<&str>,
-        ) -> anyhow::Result<()> {
+        fn mark_completed(&self, id: i64, _asset_id: Option<&str>) -> anyhow::Result<()> {
             let mut entries = self.entries.lock().unwrap();
             if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
                 e.status = "completed".to_string();
@@ -284,6 +277,7 @@ mod tests {
             _file_path: &str,
             hash: &str,
             _size: u64,
+            _mtime: i64,
             _asset_id: &str,
             _device_asset_id: &str,
             _server_url: &str,
@@ -349,12 +343,7 @@ mod tests {
         let uploader: Arc<dyn AssetUploader> = Arc::new(InstantUploader);
         let server = ServerConfig::default();
         let upload = UploadConfig::default();
-        let pipeline = UploadPipeline::new(
-            store.clone(),
-            &server,
-            &upload,
-            uploader,
-        );
+        let pipeline = UploadPipeline::new(store.clone(), &server, &upload, uploader);
         (pipeline, store)
     }
 

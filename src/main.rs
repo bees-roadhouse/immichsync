@@ -25,7 +25,9 @@ fn debug_log(msg: &str) {
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "[{}] [pid={}] {msg}",
+        let _ = writeln!(
+            f,
+            "[{}] [pid={}] {msg}",
             chrono::Local::now().format("%H:%M:%S%.3f"),
             std::process::id(),
         );
@@ -33,28 +35,36 @@ fn debug_log(msg: &str) {
 }
 
 fn main() -> anyhow::Result<()> {
-    debug_log(&format!("=== ImmichSync starting === version={} args={:?}",
-        env!("CARGO_PKG_VERSION"), std::env::args().collect::<Vec<_>>()));
+    debug_log(&format!(
+        "=== ImmichSync starting === version={} args={:?}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::args().collect::<Vec<_>>()
+    ));
 
     // ── Legacy data migration ────────────────────────────────────────────
-    // Move config/db/logs from old %APPDATA%\ImmichSync\ to the new
-    // %APPDATA%\bees-roadhouse\immichsync\ path before anything else
-    // tries to read them.
+    // Two-step migration covers every install we've shipped:
+    //  1. Very-old %APPDATA%\ImmichSync\ (pre-namespace) → roaming config +
+    //     local state under bees-roadhouse\immichsync\.
+    //  2. Mixed %APPDATA%\bees-roadhouse\immichsync\ (binary + DB + logs all
+    //     in roaming) → Windows-standard split: binary in
+    //     %LOCALAPPDATA%\Programs\immichsync\, config stays in roaming,
+    //     DB + logs move to %LOCALAPPDATA%\bees-roadhouse\immichsync\.
     if let Err(e) = platform::migrate_legacy_data() {
         // Non-fatal: log to stderr since tracing isn't up yet.
         eprintln!("Warning: legacy data migration failed: {e}");
+    }
+    if let Err(e) = platform::migrate_to_split_layout() {
+        eprintln!("Warning: split-layout migration failed: {e}");
     }
 
     // Clean up leftover .exe.old from a previous self-update.
     updater::cleanup_old_exe();
 
     // ── Logging ──────────────────────────────────────────────────────────
-    let data_dir = config::Config::data_dir()?;
-    let log_dir = data_dir.join("logs");
+    let log_dir = config::Config::local_data_dir()?.join("logs");
     std::fs::create_dir_all(&log_dir)?;
 
-    let file_appender =
-        tracing_appender::rolling::daily(&log_dir, "immichsync.log");
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "immichsync.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     tracing_subscriber::fmt()
@@ -78,6 +88,22 @@ fn main() -> anyhow::Result<()> {
         return run_window_subprocess(&args[2]);
     }
 
+    // ── Uninstall mode ──────────────────────────────────────────────────
+    // Launched by Windows Apps & Features (Uninstall click) or by `winget
+    // uninstall ImmichSync`. Removes the binary + shortcuts + autostart +
+    // Uninstall registry block. Preserves user data (config.toml + DB +
+    // logs) so reinstall picks up where the user left off.
+    if args.iter().any(|a| a == "--uninstall") {
+        let silent = args.iter().any(|a| a == "--silent");
+        debug_log(&format!("Uninstall mode: silent={silent}"));
+        info!(silent, "Running uninstall");
+        if let Err(e) = platform::uninstall::run(silent) {
+            tracing::error!(error = %e, "Uninstall failed");
+            return Err(e);
+        }
+        return Ok(());
+    }
+
     // ── Install dialog + relaunch ────────────────────────────────────────
     // If not running from the installed location, show an install/update
     // dialog as a subprocess. The subprocess handles killing any running
@@ -86,7 +112,10 @@ fn main() -> anyhow::Result<()> {
     // We call AllowSetForegroundWindow before spawning so the subprocess
     // can bring its window to the foreground on Windows.
     let current_exe_path = std::env::current_exe().unwrap_or_default();
-    debug_log(&format!("Install check: current_exe={}", current_exe_path.display()));
+    debug_log(&format!(
+        "Install check: current_exe={}",
+        current_exe_path.display()
+    ));
     match platform::is_running_installed() {
         Ok(false) => {
             debug_log("is_running_installed=false");
@@ -100,27 +129,40 @@ fn main() -> anyhow::Result<()> {
                 info!("Portable mode enabled, skipping install");
             } else {
                 let installed_exe = platform::installed_exe_path().ok();
-                let installed_exists = installed_exe.as_ref().map_or(false, |p| p.exists());
-                debug_log(&format!("installed_exe={:?}, exists={installed_exists}", installed_exe));
+                let installed_exists = installed_exe.as_ref().is_some_and(|p| p.exists());
+                debug_log(&format!(
+                    "installed_exe={:?}, exists={installed_exists}",
+                    installed_exe
+                ));
 
                 if installed_exists {
                     // Determine if the installed copy needs updating.
                     let installed_ver = platform::install::installed_version();
                     let update_info = match &installed_ver {
-                        None => {
-                            Some((String::from("unknown"), platform::install::running_version().to_string()))
-                        }
+                        None => Some((
+                            String::from("unknown"),
+                            platform::install::running_version().to_string(),
+                        )),
                         Some(_) => platform::install::is_update_available(),
                     };
-                    debug_log(&format!("installed_ver={installed_ver:?}, update_info={update_info:?}"));
+                    debug_log(&format!(
+                        "installed_ver={installed_ver:?}, update_info={update_info:?}"
+                    ));
 
                     if let Some((old_ver, new_ver)) = update_info {
                         info!(
                             from = %old_ver, to = %new_ver,
                             "Newer version running, spawning install-update dialog"
                         );
-                        debug_log(&format!("Spawning install-update dialog: {old_ver} -> {new_ver}"));
-                        match spawn_install_dialog(&["--window", "install-update", "--old-version", &old_ver]) {
+                        debug_log(&format!(
+                            "Spawning install-update dialog: {old_ver} -> {new_ver}"
+                        ));
+                        match spawn_install_dialog(&[
+                            "--window",
+                            "install-update",
+                            "--old-version",
+                            &old_ver,
+                        ]) {
                             Some(0) => {
                                 // The subprocess already relaunched from the installed path
                                 // and killed the old instance + parent. Just exit.
@@ -129,7 +171,9 @@ fn main() -> anyhow::Result<()> {
                                 return Ok(());
                             }
                             other => {
-                                debug_log(&format!("Install dialog returned {other:?}, continuing"));
+                                debug_log(&format!(
+                                    "Install dialog returned {other:?}, continuing"
+                                ));
                                 info!("User declined update, continuing from current location");
                             }
                         }
@@ -154,7 +198,9 @@ fn main() -> anyhow::Result<()> {
                             return Ok(());
                         }
                         other => {
-                            debug_log(&format!("Install dialog returned {other:?}, continuing portable"));
+                            debug_log(&format!(
+                                "Install dialog returned {other:?}, continuing portable"
+                            ));
                             info!("User chose portable mode, continuing from current location");
                         }
                     }
@@ -199,7 +245,13 @@ fn main() -> anyhow::Result<()> {
     if config.server.url.is_empty() {
         info!("Server not configured, launching first-run wizard");
         let exe = platform::installed_exe_path()
-            .map(|p| if p.exists() { p } else { std::env::current_exe().unwrap_or(p) })
+            .map(|p| {
+                if p.exists() {
+                    p
+                } else {
+                    std::env::current_exe().unwrap_or(p)
+                }
+            })
             .unwrap_or_else(|_| std::env::current_exe().expect("current_exe"));
         let status = std::process::Command::new(&exe)
             .args(["--window", "wizard"])
@@ -228,9 +280,7 @@ fn main() -> anyhow::Result<()> {
     let db_store = Arc::new(db::DbStore::new(database));
 
     // ── Immich client ────────────────────────────────────────────────────
-    let client = if !config.server.url.is_empty()
-        && !config.server.api_key.is_empty()
-    {
+    let client = if !config.server.url.is_empty() && !config.server.api_key.is_empty() {
         match api::ImmichClient::with_bandwidth_limit(
             &config.server.url,
             &config.server.api_key,
@@ -298,10 +348,10 @@ fn check_for_update_on_startup() {
         }
     };
 
-    let repo = config::Config::load()
-        .map(|c| c.advanced.update_repo)
+    let (repo, channel) = config::Config::load()
+        .map(|c| (c.advanced.update_repo, c.advanced.update_channel))
         .unwrap_or_default();
-    let result = rt.block_on(updater::check_for_update(&repo));
+    let result = rt.block_on(updater::check_for_update(&repo, &channel));
 
     match result {
         updater::UpdateCheckResult::Available(info) => {
@@ -387,13 +437,18 @@ fn spawn_install_dialog(args: &[&str]) -> Option<i32> {
     }
 
     let exe = std::env::current_exe().expect("current_exe");
-    debug_log(&format!("spawn_install_dialog: exe={}, args={args:?}", exe.display()));
+    debug_log(&format!(
+        "spawn_install_dialog: exe={}, args={args:?}",
+        exe.display()
+    ));
     info!(exe = %exe.display(), args = ?args, "Spawning install dialog subprocess");
 
     match std::process::Command::new(&exe).args(args).status() {
         Ok(status) => {
             let code = status.code();
-            debug_log(&format!("spawn_install_dialog: subprocess exited with code={code:?}"));
+            debug_log(&format!(
+                "spawn_install_dialog: subprocess exited with code={code:?}"
+            ));
             info!(code = ?code, "Install dialog subprocess exited");
             code
         }

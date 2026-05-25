@@ -32,11 +32,10 @@ pub enum HasherError {
 pub fn hash_file(path: &Path) -> Result<String, HasherError> {
     let path_str = path.display().to_string();
 
-    let mut file =
-        std::fs::File::open(path).map_err(|source| HasherError::Open {
-            path: path_str.clone(),
-            source,
-        })?;
+    let mut file = std::fs::File::open(path).map_err(|source| HasherError::Open {
+        path: path_str.clone(),
+        source,
+    })?;
 
     let mut hasher = Sha1::new();
     let mut buf = [0u8; 8192];

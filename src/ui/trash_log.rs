@@ -16,7 +16,8 @@ pub fn show_trash_log(db: Arc<DbStore>) {
         })),
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([700.0, 420.0])
-            .with_title("ImmichSync — Trash"),
+            .with_title("ImmichSync — Trash")
+            .with_icon(crate::ui::window_icon::brand_icon_data()),
         ..Default::default()
     };
 
@@ -171,9 +172,9 @@ fn walk_trash(
                     let modified = meta
                         .modified()
                         .ok()
-                        .and_then(|t| {
+                        .map(|t| {
                             let dt: chrono::DateTime<chrono::Local> = t.into();
-                            Some(dt.format("%Y-%m-%d %H:%M").to_string())
+                            dt.format("%Y-%m-%d %H:%M").to_string()
                         })
                         .unwrap_or_default();
                     (size, modified)

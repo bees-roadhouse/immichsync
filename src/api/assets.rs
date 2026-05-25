@@ -73,8 +73,6 @@ impl BulkCheckResult {
 #[serde(rename_all = "camelCase")]
 struct AssetUploadResponse {
     id: String,
-    #[serde(default)]
-    duplicate_asset_id: Option<String>,
 }
 
 /// Raw JSON returned by `POST /api/assets/bulk-upload-check`.
@@ -261,7 +259,13 @@ impl crate::upload::worker::AssetUploader for ImmichClient {
         modified_at: DateTime<Utc>,
     ) -> anyhow::Result<crate::upload::worker::UploadResult> {
         let result = self
-            .upload_asset(file_path, device_asset_id, device_id, created_at, modified_at)
+            .upload_asset(
+                file_path,
+                device_asset_id,
+                device_id,
+                created_at,
+                modified_at,
+            )
             .await?;
 
         Ok(crate::upload::worker::UploadResult {
@@ -270,11 +274,7 @@ impl crate::upload::worker::AssetUploader for ImmichClient {
         })
     }
 
-    async fn add_asset_to_album(
-        &self,
-        album_name: &str,
-        asset_id: &str,
-    ) -> anyhow::Result<()> {
+    async fn add_asset_to_album(&self, album_name: &str, asset_id: &str) -> anyhow::Result<()> {
         // Get or create album by name.
         let albums = self.get_albums().await?;
         let album_id = if let Some(album) = albums.iter().find(|a| a.album_name == album_name) {
@@ -284,7 +284,8 @@ impl crate::upload::worker::AssetUploader for ImmichClient {
             album.id
         };
 
-        self.add_assets_to_album(&album_id, vec![asset_id.to_string()]).await?;
+        self.add_assets_to_album(&album_id, vec![asset_id.to_string()])
+            .await?;
         Ok(())
     }
 
@@ -341,8 +342,9 @@ fn mime_from_extension(path: &Path) -> &'static str {
         "tiff" | "tif" => "image/tiff",
         "bmp" => "image/bmp",
         // RAW formats — treated as octet-stream; Immich handles them server-side.
-        "raw" | "cr2" | "cr3" | "nef" | "arw" | "dng" | "orf" | "rw2" | "pef" | "srw"
-        | "raf" => "application/octet-stream",
+        "raw" | "cr2" | "cr3" | "nef" | "arw" | "dng" | "orf" | "rw2" | "pef" | "srw" | "raf" => {
+            "application/octet-stream"
+        }
         "mp4" | "m4v" => "video/mp4",
         "mov" => "video/quicktime",
         "avi" => "video/x-msvideo",

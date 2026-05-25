@@ -13,16 +13,11 @@ use tracing::{debug, info, warn};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const DEFAULT_REPO: &str = "gumbees/immichsync";
+const DEFAULT_REPO: &str = "bees-roadhouse/immichsync";
 const ASSET_NAME: &str = "immichsync.exe";
 
 /// Delay before the first automatic update check after startup.
 pub const STARTUP_DELAY: Duration = Duration::from_secs(30);
-
-/// Build the GitHub API URL for the latest release of the given repo.
-fn github_api_url(repo: &str) -> String {
-    format!("https://api.github.com/repos/{repo}/releases/latest")
-}
 
 /// Build the check interval from config hours (0 = disabled).
 pub fn check_interval_from_hours(hours: u32) -> Duration {
@@ -33,6 +28,105 @@ pub fn check_interval_from_hours(hours: u32) -> Duration {
     }
 }
 
+// ─── Repo + channel parsing ─────────────────────────────────────────────────
+
+/// Validate a GitHub `owner/repo` string.
+///
+/// Accepts ASCII alphanumerics plus `.`, `_`, `-` in each segment. Rejects
+/// URLs, SSH refs, enterprise hostnames, and anything else that's not a bare
+/// `owner/repo`. v1 is public github.com only.
+pub fn is_valid_repo(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('/').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    parts.iter().all(|seg| {
+        !seg.is_empty()
+            && seg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    })
+}
+
+/// Validate a pinned tag of the form `vX.Y.Z` or `vX.Y.Z-prerelease`.
+fn is_valid_tag_pin(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix('v') else {
+        return false;
+    };
+    // Split off optional `-prerelease` suffix first.
+    let (core, pre) = match rest.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (rest, None),
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    if !parts
+        .iter()
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    {
+        return false;
+    }
+    if let Some(p) = pre {
+        if p.is_empty()
+            || !p
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Update channel resolved from config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Channel {
+    /// Track the latest published release.
+    Latest,
+    /// Track latest including prereleases.
+    Prerelease,
+    /// Pin to a specific tag.
+    Tag(String),
+    /// Update checks disabled.
+    None,
+}
+
+impl Channel {
+    /// Parse a channel string from config.
+    ///
+    /// Returns `None` if the string is not a recognised channel or valid tag
+    /// pin. Callers should treat unparseable channels as "disable for the
+    /// session" and log a warning.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        match s {
+            "latest" | "" => Some(Channel::Latest),
+            "prerelease" => Some(Channel::Prerelease),
+            "none" => Some(Channel::None),
+            other if is_valid_tag_pin(other) => Some(Channel::Tag(other.to_string())),
+            _ => None,
+        }
+    }
+}
+
+/// Build the GitHub API URL for the resolved channel.
+fn channel_api_url(repo: &str, channel: &Channel) -> Option<String> {
+    match channel {
+        Channel::Latest => Some(format!(
+            "https://api.github.com/repos/{repo}/releases/latest"
+        )),
+        Channel::Prerelease => Some(format!(
+            "https://api.github.com/repos/{repo}/releases?per_page=10"
+        )),
+        Channel::Tag(tag) => Some(format!(
+            "https://api.github.com/repos/{repo}/releases/tags/{tag}"
+        )),
+        Channel::None => None,
+    }
+}
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -40,6 +134,16 @@ struct GitHubRelease {
     tag_name: String,
     body: Option<String>,
     assets: Vec<GitHubAsset>,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRepoInfo {
+    #[serde(default)]
+    private: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,44 +185,104 @@ pub enum UpdateError {
     #[error("invalid version in release tag: {0}")]
     InvalidVersion(String),
 
+    #[error("no matching release for channel")]
+    NoRelease,
+
+    #[error("repo is private or not found: {0}")]
+    PrivateOrMissing(String),
+
     #[error("file error: {0}")]
     File(#[from] std::io::Error),
-
-    #[error("update cancelled")]
-    Cancelled,
 }
 
 // ─── Check ───────────────────────────────────────────────────────────────────
 
-/// Check GitHub for a newer release.
+/// Check GitHub for a newer release on the given channel.
 ///
-/// `repo` is the GitHub `owner/repo` string (e.g. `"gumbees/immichsync"`).
-/// Pass an empty string to use the default.
-pub async fn check_for_update(repo: &str) -> UpdateCheckResult {
+/// `repo` is the GitHub `owner/repo` string. Empty falls back to the
+/// compiled-in default. `channel_str` is the raw config value
+/// (`"latest"`, `"prerelease"`, `"none"`, or `"vX.Y.Z"`). Unparseable
+/// channels and invalid repos resolve to `Failed(...)`; the caller
+/// should log and disable updates for the session.
+pub async fn check_for_update(repo: &str, channel_str: &str) -> UpdateCheckResult {
     let repo = if repo.is_empty() { DEFAULT_REPO } else { repo };
-    match check_inner(repo).await {
+
+    if !is_valid_repo(repo) {
+        return UpdateCheckResult::Failed(format!("invalid repo format: {repo}"));
+    }
+
+    let channel = match Channel::parse(channel_str) {
+        Some(c) => c,
+        None => {
+            return UpdateCheckResult::Failed(format!(
+                "invalid update channel: '{channel_str}' (expected 'latest', 'prerelease', 'none', or 'vX.Y.Z')"
+            ));
+        }
+    };
+
+    if channel == Channel::None {
+        debug!("Update channel is 'none', skipping check");
+        return UpdateCheckResult::UpToDate;
+    }
+
+    match check_inner(repo, &channel).await {
         Ok(result) => result,
         Err(e) => UpdateCheckResult::Failed(e.to_string()),
     }
 }
 
-async fn check_inner(repo: &str) -> Result<UpdateCheckResult, UpdateError> {
-    let url = github_api_url(repo);
+async fn check_inner(repo: &str, channel: &Channel) -> Result<UpdateCheckResult, UpdateError> {
     let client = reqwest::Client::builder()
         .user_agent(format!("ImmichSync/{}", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(15))
         .build()?;
 
-    let release: GitHubRelease = client
-        .get(&url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    // Pre-flight: confirm the repo is public and reachable. If it 404s or
+    // comes back private, disable updates for the session.
+    let repo_url = format!("https://api.github.com/repos/{repo}");
+    let repo_resp = client.get(&repo_url).send().await?;
+    if repo_resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(UpdateError::PrivateOrMissing(repo.to_string()));
+    }
+    let repo_info: GitHubRepoInfo = repo_resp.error_for_status()?.json().await?;
+    if repo_info.private {
+        return Err(UpdateError::PrivateOrMissing(repo.to_string()));
+    }
+
+    // Resolve the release endpoint for this channel.
+    let url = channel_api_url(repo, channel).expect("None channel handled above");
+
+    let release = match channel {
+        Channel::Prerelease => {
+            // List endpoint returns an array; pick the first non-draft entry.
+            let releases: Vec<GitHubRelease> = client
+                .get(&url)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            releases
+                .into_iter()
+                .find(|r| !r.draft)
+                .ok_or(UpdateError::NoRelease)?
+        }
+        Channel::Latest | Channel::Tag(_) => {
+            let resp = client.get(&url).send().await?;
+            if matches!(channel, Channel::Tag(_)) && resp.status() == reqwest::StatusCode::NOT_FOUND
+            {
+                return Err(UpdateError::NoRelease);
+            }
+            resp.error_for_status()?.json::<GitHubRelease>().await?
+        }
+        Channel::None => unreachable!(),
+    };
 
     // Parse version from tag (strip leading 'v' if present).
-    let tag = release.tag_name.strip_prefix('v').unwrap_or(&release.tag_name);
+    let tag = release
+        .tag_name
+        .strip_prefix('v')
+        .unwrap_or(&release.tag_name);
     let remote_ver = semver::Version::parse(tag)
         .map_err(|_| UpdateError::InvalidVersion(release.tag_name.clone()))?;
 
@@ -126,6 +290,8 @@ async fn check_inner(repo: &str) -> Result<UpdateCheckResult, UpdateError> {
     let current_ver = semver::Version::parse(current_str)
         .map_err(|_| UpdateError::InvalidVersion(current_str.to_string()))?;
 
+    // No-downgrade policy: if the resolved release is at or below the running
+    // binary, we just stay where we are (regardless of channel).
     if remote_ver <= current_ver {
         debug!(current = %current_ver, remote = %remote_ver, "Already up to date");
         return Ok(UpdateCheckResult::UpToDate);
@@ -150,6 +316,7 @@ async fn check_inner(repo: &str) -> Result<UpdateCheckResult, UpdateError> {
         current = %current_ver,
         new = %remote_ver,
         size = asset.size,
+        prerelease = release.prerelease,
         "Update available"
     );
 
@@ -162,10 +329,7 @@ async fn check_inner(repo: &str) -> Result<UpdateCheckResult, UpdateError> {
 ///
 /// `progress_fn` is called with `(bytes_downloaded, total_bytes)`.
 /// Returns the path to the downloaded file.
-pub fn download_update_blocking<F>(
-    url: &str,
-    progress_fn: F,
-) -> Result<PathBuf, UpdateError>
+pub fn download_update_blocking<F>(url: &str, progress_fn: F) -> Result<PathBuf, UpdateError>
 where
     F: Fn(u64, u64),
 {
@@ -178,8 +342,12 @@ where
         .build()
         .map_err(UpdateError::Network)?;
 
-    let mut response = client.get(url).send().map_err(UpdateError::Network)?
-        .error_for_status().map_err(UpdateError::Network)?;
+    let mut response = client
+        .get(url)
+        .send()
+        .map_err(UpdateError::Network)?
+        .error_for_status()
+        .map_err(UpdateError::Network)?;
 
     let total = response.content_length().unwrap_or(0);
 
@@ -189,7 +357,7 @@ where
 
     use std::io::{Read, Write};
     loop {
-        let n = response.read(&mut buf).map_err(|e| UpdateError::File(e))?;
+        let n = response.read(&mut buf).map_err(UpdateError::File)?;
         if n == 0 {
             break;
         }
@@ -237,7 +405,8 @@ pub fn apply_update(new_exe_path: &std::path::Path, new_version: &str) -> Result
     std::fs::rename(new_exe_path, &current_exe).map_err(UpdateError::File)?;
 
     // Step 3: Write version.txt next to the exe.
-    let version_file = current_exe.parent()
+    let version_file = current_exe
+        .parent()
         .map(|p| p.join("version.txt"))
         .unwrap_or_else(|| PathBuf::from("version.txt"));
     let _ = std::fs::write(&version_file, new_version);
@@ -291,4 +460,94 @@ pub fn relaunch_self() -> ! {
 
     let _ = std::process::Command::new(&exe).args(&args).spawn();
     std::process::exit(0);
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_repo_accepts_owner_slash_repo() {
+        assert!(is_valid_repo("bees-roadhouse/immichsync"));
+        assert!(is_valid_repo("gumbees/immichsync"));
+        assert!(is_valid_repo("user.name/repo.name"));
+        assert!(is_valid_repo("u_1/r_2"));
+        assert!(is_valid_repo("a/b"));
+    }
+
+    #[test]
+    fn valid_repo_rejects_garbage() {
+        assert!(!is_valid_repo(""));
+        assert!(!is_valid_repo("no-slash"));
+        assert!(!is_valid_repo("/leading-slash"));
+        assert!(!is_valid_repo("trailing-slash/"));
+        assert!(!is_valid_repo("too/many/slashes"));
+        assert!(!is_valid_repo("https://github.com/owner/repo"));
+        assert!(!is_valid_repo("git@github.com:owner/repo"));
+        assert!(!is_valid_repo("owner repo/has spaces"));
+        assert!(!is_valid_repo("owner/repo$"));
+    }
+
+    #[test]
+    fn channel_parse_handles_known_literals() {
+        assert_eq!(Channel::parse("latest"), Some(Channel::Latest));
+        assert_eq!(Channel::parse(""), Some(Channel::Latest));
+        assert_eq!(Channel::parse("prerelease"), Some(Channel::Prerelease));
+        assert_eq!(Channel::parse("none"), Some(Channel::None));
+        assert_eq!(Channel::parse("  latest  "), Some(Channel::Latest));
+    }
+
+    #[test]
+    fn channel_parse_accepts_tag_pins() {
+        assert_eq!(
+            Channel::parse("v0.1.8"),
+            Some(Channel::Tag("v0.1.8".to_string()))
+        );
+        assert_eq!(
+            Channel::parse("v1.0.0-rc.1"),
+            Some(Channel::Tag("v1.0.0-rc.1".to_string()))
+        );
+        assert_eq!(
+            Channel::parse("v10.20.30"),
+            Some(Channel::Tag("v10.20.30".to_string()))
+        );
+    }
+
+    #[test]
+    fn channel_parse_rejects_bogus() {
+        assert_eq!(Channel::parse("stable"), None);
+        assert_eq!(Channel::parse("1.0.0"), None); // missing 'v'
+        assert_eq!(Channel::parse("v1.0"), None); // not three segments
+        assert_eq!(Channel::parse("vX.Y.Z"), None); // non-numeric
+        assert_eq!(Channel::parse("v1.0.0-"), None); // empty prerelease
+    }
+
+    #[test]
+    fn channel_api_url_picks_right_endpoint() {
+        let repo = "bees-roadhouse/immichsync";
+        assert_eq!(
+            channel_api_url(repo, &Channel::Latest),
+            Some("https://api.github.com/repos/bees-roadhouse/immichsync/releases/latest".into())
+        );
+        assert!(channel_api_url(repo, &Channel::Prerelease)
+            .unwrap()
+            .contains("/releases?"));
+        assert_eq!(
+            channel_api_url(repo, &Channel::Tag("v0.1.8".into())),
+            Some(
+                "https://api.github.com/repos/bees-roadhouse/immichsync/releases/tags/v0.1.8"
+                    .into()
+            )
+        );
+        assert_eq!(channel_api_url(repo, &Channel::None), None);
+    }
+
+    #[test]
+    fn check_interval_zero_is_disabled() {
+        assert_eq!(check_interval_from_hours(0), Duration::from_secs(u64::MAX));
+        assert_eq!(check_interval_from_hours(1), Duration::from_secs(3600));
+        assert_eq!(check_interval_from_hours(24), Duration::from_secs(86400));
+    }
 }
