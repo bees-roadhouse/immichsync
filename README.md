@@ -34,7 +34,17 @@ Immich has 84K+ GitHub stars and a thriving community, but no official desktop s
 
 Grab the latest release from [GitHub Releases](https://github.com/gumbees/immichsync/releases).
 
-Run the installer or extract the portable ZIP. That's it.
+Run the binary. On first launch it offers to install itself per-user (no admin needed) to `%LOCALAPPDATA%\Programs\immichsync\` and register in Apps & Features so you can uninstall via Settings → Apps later. Pick **Run Portable** if you want to keep the binary wherever you downloaded it.
+
+### Uninstall
+
+Settings → Apps → Installed apps → ImmichSync → Uninstall. Or from a terminal:
+
+```powershell
+winget uninstall ImmichSync
+```
+
+Uninstall removes the binary, shortcuts, autostart entry, and the Apps & Features registry block. **It preserves your settings and upload history** in `%APPDATA%\bees-roadhouse\immichsync\` and `%LOCALAPPDATA%\bees-roadhouse\immichsync\` so that a future reinstall picks up where you left off ... no first-run wizard, no re-upload of already-synced files.
 
 ### Building from Source
 
@@ -67,7 +77,7 @@ The binary lands in `target/release/immichsync.exe`.
 
 ## Configuration
 
-Settings are stored in `%APPDATA%\bees-roadhouse\immichsync\config.toml`. You can edit this directly or use the Settings UI.
+Settings are stored in `%APPDATA%\bees-roadhouse\immichsync\config.toml` (roaming, machine-portable). You can edit this directly or use the Settings UI. Machine-local state (SQLite upload queue, logs) lives separately in `%LOCALAPPDATA%\bees-roadhouse\immichsync\` so it doesn't get synced across machines on enterprise roaming profiles.
 
 ```toml
 [server]

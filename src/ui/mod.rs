@@ -1,4 +1,4 @@
-// UI layer — system tray, settings window, notifications, first-run wizard,
+// UI layer ... system tray, settings window, notifications, first-run wizard,
 // about dialog, upload log viewer.
 
 pub mod about;
@@ -10,11 +10,4 @@ pub mod trash_log;
 pub mod tray;
 pub mod update;
 pub mod upload_log;
-
-// Re-export the primary public surface so callers can write `ui::TrayApp`
-// instead of `ui::tray::TrayApp`.
-
-pub use first_run::FirstRun;
-pub use notifications::Notifications;
-pub use settings::Settings;
-pub use tray::{TrayAction, TrayApp, TrayError, TrayState};
+pub mod window_icon;

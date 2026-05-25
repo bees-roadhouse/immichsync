@@ -42,7 +42,8 @@ pub fn run_update_dialog(info_path: &str) {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([460.0, 360.0])
             .with_title("ImmichSync Update")
-            .with_resizable(false),
+            .with_resizable(false)
+            .with_icon(crate::ui::window_icon::brand_icon_data()),
         ..Default::default()
     };
 
@@ -88,13 +89,11 @@ impl eframe::App for UpdateApp {
             self.check_download_state();
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.state {
-                DialogState::Prompt => self.show_prompt(ui, ctx),
-                DialogState::Downloading => self.show_downloading(ui, ctx),
-                DialogState::ReadyToRestart => self.show_ready(ui, ctx),
-                DialogState::Error => self.show_error(ui, ctx),
-            }
+        egui::CentralPanel::default().show(ctx, |ui| match self.state {
+            DialogState::Prompt => self.show_prompt(ui, ctx),
+            DialogState::Downloading => self.show_downloading(ui, ctx),
+            DialogState::ReadyToRestart => self.show_ready(ui, ctx),
+            DialogState::Error => self.show_error(ui, ctx),
         });
     }
 }
@@ -111,7 +110,10 @@ impl UpdateApp {
             "A new version of ImmichSync is available: v{}",
             self.info.new_version
         ));
-        ui.label(format!("You are currently running v{}", self.info.current_version));
+        ui.label(format!(
+            "You are currently running v{}",
+            self.info.current_version
+        ));
 
         if self.info.size > 0 {
             ui.add_space(4.0);
@@ -271,7 +273,8 @@ impl UpdateApp {
         } else if downloaded == u64::MAX - 1 && total == 0 {
             self.state = DialogState::Error;
             if self.error_msg.is_empty() {
-                self.error_msg = "Download or installation failed. Check logs for details.".to_string();
+                self.error_msg =
+                    "Download or installation failed. Check logs for details.".to_string();
             }
         }
     }

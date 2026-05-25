@@ -18,7 +18,8 @@ pub fn show_upload_log(db: Arc<DbStore>) {
         })),
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([620.0, 420.0])
-            .with_title("ImmichSync — Upload Log"),
+            .with_title("ImmichSync — Upload Log")
+            .with_icon(crate::ui::window_icon::brand_icon_data()),
         ..Default::default()
     };
 
@@ -156,7 +157,9 @@ fn load_entries(db: &Arc<DbStore>) -> Vec<LogEntry> {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| e.file_path.clone());
 
-            let timestamp = e.completed_at.as_deref()
+            let timestamp = e
+                .completed_at
+                .as_deref()
                 .or(Some(e.queued_at.as_str()))
                 .unwrap_or("")
                 .to_string();

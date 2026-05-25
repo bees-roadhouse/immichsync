@@ -8,6 +8,10 @@ use super::{ApiError, ImmichClient};
 // ---------------------------------------------------------------------------
 
 /// An Immich album, as returned by the API.
+///
+/// Only the fields the rest of the app consumes are deserialized; extra JSON
+/// keys returned by the server (asset_count, description, owner_id, etc.)
+/// are silently ignored by serde.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Album {
@@ -16,18 +20,6 @@ pub struct Album {
 
     /// Human-readable album name.
     pub album_name: String,
-
-    /// Number of assets in the album.
-    #[serde(default)]
-    pub asset_count: u64,
-
-    /// Description / subtitle set on the album.
-    #[serde(default)]
-    pub description: String,
-
-    /// UUID of the user who owns the album.
-    #[serde(default)]
-    pub owner_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -112,12 +104,7 @@ impl ImmichClient {
         let body = AddAssetsRequest { ids: asset_ids };
         let url = self.url(&format!("/api/albums/{album_id}/assets"));
 
-        let response = self
-            .client
-            .put(&url)
-            .json(&body)
-            .send()
-            .await?;
+        let response = self.client.put(&url).json(&body).send().await?;
 
         if !response.status().is_success() {
             return Err(Self::map_status_error(response).await);
@@ -150,11 +137,7 @@ impl ImmichClient {
     pub async fn get_albums(&self) -> Result<Vec<Album>, ApiError> {
         debug!("fetching album list");
 
-        let response = self
-            .client
-            .get(self.url("/api/albums"))
-            .send()
-            .await?;
+        let response = self.client.get(self.url("/api/albums")).send().await?;
 
         if !response.status().is_success() {
             return Err(Self::map_status_error(response).await);

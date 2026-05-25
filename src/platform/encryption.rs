@@ -109,9 +109,11 @@ pub fn decrypt_api_key(encrypted: &str) -> Result<String, EncryptionError> {
     }
 
     // Read DPAPI blob length.
-    let dpapi_len =
-        u32::from_le_bytes(payload[0..4].try_into().map_err(|_| EncryptionError::Malformed)?)
-            as usize;
+    let dpapi_len = u32::from_le_bytes(
+        payload[0..4]
+            .try_into()
+            .map_err(|_| EncryptionError::Malformed)?,
+    ) as usize;
 
     if payload.len() < 4 + dpapi_len {
         return Err(EncryptionError::Malformed);
@@ -142,7 +144,7 @@ pub fn decrypt_api_key(encrypted: &str) -> Result<String, EncryptionError> {
 // ── DPAPI wrappers ──────────────────────────────────────────────────────────
 
 fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, EncryptionError> {
-    let mut input_blob = CRYPT_INTEGER_BLOB {
+    let input_blob = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
         pbData: data.as_ptr() as *mut u8,
     };
@@ -151,12 +153,12 @@ fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, EncryptionError> {
 
     unsafe {
         CryptProtectData(
-            &mut input_blob,
-            None,            // description
-            None,            // optional entropy
-            None,            // reserved
-            None,            // prompt struct
-            0,               // flags
+            &input_blob,
+            None, // description
+            None, // optional entropy
+            None, // reserved
+            None, // prompt struct
+            0,    // flags
             &mut output_blob,
         )
         .map_err(|_| EncryptionError::DpapiProtect)?;
@@ -175,7 +177,7 @@ fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, EncryptionError> {
 }
 
 fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, EncryptionError> {
-    let mut input_blob = CRYPT_INTEGER_BLOB {
+    let input_blob = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
         pbData: data.as_ptr() as *mut u8,
     };
@@ -184,12 +186,12 @@ fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, EncryptionError> {
 
     unsafe {
         CryptUnprotectData(
-            &mut input_blob,
-            None,            // description out
-            None,            // optional entropy
-            None,            // reserved
-            None,            // prompt struct
-            0,               // flags
+            &input_blob,
+            None, // description out
+            None, // optional entropy
+            None, // reserved
+            None, // prompt struct
+            0,    // flags
             &mut output_blob,
         )
         .map_err(|_| EncryptionError::DpapiUnprotect)?;

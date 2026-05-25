@@ -1,6 +1,6 @@
 [package]
 name = "immichsync"
-version = "0.1.8"
+version = "0.2.0"
 edition = "2021"
 description = "Windows system tray app that syncs photos/videos to Immich"
 license = "GPL-3.0-only"
@@ -105,6 +105,16 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Temp files in tests
 [dev-dependencies]
 tempfile = "3"
+
+# Build-time icon pipeline:
+# - Read assets/icon-source.webp via `image`
+# - Generate a multi-resolution .ico via `ico`
+# - Embed the .ico as the EXE resource icon via `winresource`
+# All three are build-only; nothing at runtime depends on them.
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["webp", "png"] }
+ico = "0.4"
+winresource = "0.1"
 
 [profile.release]
 strip = true

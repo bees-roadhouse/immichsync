@@ -77,6 +77,41 @@ Removable devices:
 3. If no event within 5 seconds, switch to `PollWatcher` for that path
 4. Log the fallback so users understand the behavior
 
+### Watcher Health Monitoring & Auto-Restart
+
+The mode-selection health check above runs once at startup. `ReadDirectoryChangesW` can also silently die mid-run — a network share drops, a USB device unplugs without a clean `WM_DEVICECHANGE`, or notify's worker thread hits an unrecoverable error. To detect those, the engine spawns a background **health monitor** task that probes every active watcher periodically.
+
+**Probe mechanism** (same as the initial mode-selection check, applied repeatedly):
+
+1. Write a probe file named `.immichsync_watchcheck` into the watched directory.
+2. Wait for the watcher's normal event pipeline to emit the matching create/modify event. The handler short-circuits on this filename: it never reaches the upload pipeline.
+3. Native watchers: probe timeout = ~8s (debounce window + headroom). Poll watchers: timeout scales with `poll_interval + debounce + 5s`, so a healthy poll watcher isn't flagged on every probe.
+4. Probe interval: 60s per watcher.
+
+**State machine** (per `FolderWatcher` slot):
+
+```
+Healthy ──probe miss──> Degraded (miss_count == 1)
+Degraded ──probe miss──> Degraded (miss_count == 2) ──> restart()
+restart ok ──> Degraded (next probe verifies)
+restart ok + probe ok ──> Healthy
+restart fail ──> Degraded, restart_fail_count++ ──> retry next tick
+restart_fail_count == 3 ──> Failed (permanent; no further probes/restarts)
+```
+
+- **2 consecutive misses → restart.** Stop the dead watcher, drop it from the engine, re-canonicalise the path (in case a remount changed it), recreate from saved config, swap into the slot.
+- **3 consecutive restart failures → give up.** Mark the slot `Failed`, emit a `WatchEvent::Error` so the operator sees it in logs, and stop probing that path until the user reloads config or restarts the app.
+
+**Tray surfacing:**
+
+| Engine health | Tray state |
+|---|---|
+| `Healthy` | `Idle` (green) or `Syncing` (blue) per queue stats |
+| `Degraded` (any restart in progress) | `Error` (red) with "watcher degraded — auto-restart in progress" if idle; stays on `Syncing` if uploads are flowing |
+| `Failed` (any permanent failure) | `Error` (red) with "one or more watchers are offline" |
+
+This is complementary to the **DB-vs-engine reconcile pass** (every 2s): that one converges the watched-folder *set* against the DB; this one converges each watcher's *liveness* against reality.
+
 ### File Filtering
 
 **Include by default:**
@@ -87,10 +122,12 @@ Removable devices:
 - Thumbs.db, desktop.ini, .DS_Store, Zone.Identifier streams
 - Files < 1KB (corrupted/empty)
 - Files still being written (detected via write completion check)
+- Cloud-storage placeholder files (OneDrive Files On-Demand, iCloud Drive for Windows, Google Drive for Desktop, Dropbox Smart Sync, Box Drive, SeaDrive, etc.) ... see the Cloud-Storage Interaction section below
 
 **User-configurable:**
 - Custom include/exclude glob patterns per watch folder
 - Minimum file size threshold
+- Per-folder `ignore_online_files` toggle (default ON)
 
 ### Write Completion Detection
 
@@ -101,6 +138,51 @@ Avoids uploading partial files:
 3. Attempt non-exclusive read open
 4. If all pass -> queue for upload
 5. If not -> re-queue with exponential backoff (up to 30s)
+
+### Cloud-Storage Interaction
+
+Modern cloud-storage clients ... OneDrive Files On-Demand, iCloud Drive for Windows, Google Drive for Desktop, Dropbox Smart Sync, Box Drive, SeaDrive ... store **placeholder files** on disk: full filename and metadata, but no contents. The first read of a placeholder triggers a synchronous download from the cloud. For a folder with thousands of offloaded photos, naive backup-tool behavior would re-pull the entire library on first scan ... defeating the user's storage-tiering decision.
+
+ImmichSync handles this in two layers:
+
+**Filter layer (default ON).** The `FileFilter` reads each candidate file's Windows attribute DWORD via `MetadataExt::file_attributes()` and drops the event if any of these bits are set:
+
+| Constant | Value | Set by |
+|---|---|---|
+| `FILE_ATTRIBUTE_OFFLINE` | `0x0000_1000` | Legacy hierarchical storage, some sync clients |
+| `FILE_ATTRIBUTE_RECALL_ON_OPEN` | `0x0004_0000` | iCloud Drive, older OneDrive |
+| `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` | `0x0040_0000` | Modern OneDrive Files On-Demand, Google Drive, Dropbox |
+
+The check is free ... it's a bit-test against a DWORD already loaded by the `metadata()` call we make for the minimum-size filter. Per-folder toggle in Settings (`Skip cloud-only files`); the DB default on `watched_folders.ignore_online_files` is `1`.
+
+**Worker layer (defense in depth).** Even with the filter on, a file's attributes can change between filter-time and hash-time (the cloud client offloads in the background). The two-layer dedup below also covers this case ... if we've ever uploaded this exact byte-identical file before, the fast-path hit means we never open the file at all.
+
+### Two-Layer Deduplication
+
+The dedup chain is now:
+
+```
+File ready -> stat (size + mtime + attrs) -> Filter (skip cloud placeholders if enabled)
+   -> Fast-path lookup (path + size + mtime)  -> hit: skip
+                                              -> miss: SHA-1 hash
+                                                  -> hash lookup -> hit: skip
+                                                                 -> miss: enqueue
+   -> Upload -> Record (path, hash, size, mtime)
+```
+
+**Layer 1 ... fast-path dedup** (`uploaded_files.(file_path, file_size, file_mtime)` composite index). Lookup is one indexed SELECT against three already-known values; the file is never opened. This is the load-bearing path for cloud placeholders: on a folder of 10k offloaded photos, a second scan triggers zero downloads.
+
+**Layer 2 ... content dedup** (`uploaded_files.file_hash`, SHA-1). The SHA-1 read happens only after a fast-path miss. Catches the renamed-or-touched cases where path or mtime changed but content is byte-identical.
+
+Default behavior (Settings unchanged):
+1. Cloud placeholders are filtered before either layer fires ... zero downloads.
+2. Locally-materialized files hit the fast path on the second run ... zero re-reads.
+3. Locally-materialized files with a new mtime fall through to SHA-1 ... covered by Immich's server-side dedup if content is identical.
+
+Opt-in behavior (`Skip cloud-only files` toggled OFF on a folder):
+1. First scan downloads + uploads all placeholders. Bandwidth cost paid once.
+2. Each upload records `(path, size, mtime)` on the row.
+3. Subsequent scans hit the fast path ... no re-downloads.
 
 ---
 
@@ -115,8 +197,9 @@ File Event -> Debounce -> Filter -> Hash -> Dedup Check -> Queue -> Upload -> Co
 ### Hashing & Deduplication
 
 - **Algorithm:** SHA-1 (matches Immich's internal checksum)
-- **Local dedup:** check SQLite for existing hash -> skip if already uploaded
-- **Server dedup:** Immich performs server-side dedup, but local check saves bandwidth
+- **Layer 1 (fast path):** `(path, size, mtime)` against `uploaded_files` composite index — skip without opening the file. Critical for cloud-placeholder files; see the Cloud-Storage Interaction section above.
+- **Layer 2 (content hash):** SHA-1 against `uploaded_files.file_hash` — runs only on fast-path miss.
+- **Server dedup:** Immich performs server-side dedup, but local checks save bandwidth.
 
 ### Upload Request
 
@@ -156,9 +239,11 @@ Configurable per watch folder:
 
 ## State Database (SQLite)
 
-**Location:** `%APPDATA%\ImmichSync\state.db`
+**Location:** `%LOCALAPPDATA%\bees-roadhouse\immichsync\state.db`
 
 SQLite via `rusqlite` with the `bundled` feature (compiles SQLite from source, no system dependency). WAL mode enabled for crash recovery and concurrent read access.
+
+State lives in `%LOCALAPPDATA%` (not roaming) because watched folder paths, upload progress, and dedup history are machine-local. See the **File Layout** section below.
 
 ### Schema
 
@@ -168,12 +253,14 @@ CREATE TABLE watched_folders (
     path TEXT NOT NULL UNIQUE,
     label TEXT,
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
-    watch_mode TEXT NOT NULL DEFAULT 'native',  -- 'native' | 'poll'
+    watch_mode TEXT NOT NULL DEFAULT 'native',     -- 'native' | 'poll'
     poll_interval_secs INTEGER NOT NULL DEFAULT 30,
-    album_mode TEXT NOT NULL DEFAULT 'none',    -- 'none' | 'folder' | 'date' | 'fixed'
+    album_mode TEXT NOT NULL DEFAULT 'none',       -- 'none' | 'folder' | 'subfolder' | 'date' | 'fixed'
     album_name TEXT,
-    include_patterns TEXT,                       -- JSON array of globs
-    exclude_patterns TEXT,                       -- JSON array of globs
+    include_patterns TEXT,                          -- JSON array of globs
+    exclude_patterns TEXT,                          -- JSON array of globs
+    post_upload TEXT NOT NULL DEFAULT 'keep',      -- 'keep' | 'trash' | 'delete'        (v2)
+    ignore_online_files INTEGER NOT NULL DEFAULT 1,-- skip cloud-placeholder files      (v3)
     auto_added BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -182,8 +269,9 @@ CREATE TABLE watched_folders (
 CREATE TABLE uploaded_files (
     id INTEGER PRIMARY KEY,
     file_path TEXT NOT NULL,
-    file_hash TEXT NOT NULL,                     -- SHA-1
+    file_hash TEXT NOT NULL,                       -- SHA-1
     file_size INTEGER NOT NULL,
+    file_mtime INTEGER NOT NULL DEFAULT 0,         -- seconds since Unix epoch          (v3)
     immich_asset_id TEXT,
     device_asset_id TEXT NOT NULL,
     uploaded_at TEXT NOT NULL,
@@ -196,7 +284,7 @@ CREATE TABLE upload_queue (
     file_hash TEXT,
     file_size INTEGER,
     folder_id INTEGER REFERENCES watched_folders(id),
-    status TEXT NOT NULL DEFAULT 'pending',       -- 'pending' | 'uploading' | 'failed' | 'completed'
+    status TEXT NOT NULL DEFAULT 'pending',         -- 'pending' | 'uploading' | 'failed' | 'completed'
     retry_count INTEGER NOT NULL DEFAULT 0,
     error_message TEXT,
     queued_at TEXT NOT NULL,
@@ -210,6 +298,8 @@ CREATE TABLE config (
 
 CREATE INDEX idx_uploaded_hash ON uploaded_files(file_hash);
 CREATE INDEX idx_uploaded_path ON uploaded_files(file_path);
+CREATE INDEX idx_uploaded_path_size_mtime                                              -- v3 fast-path dedup
+    ON uploaded_files(file_path, file_size, file_mtime);
 CREATE INDEX idx_queue_status ON upload_queue(status);
 ```
 
@@ -224,16 +314,47 @@ CREATE INDEX idx_queue_status ON upload_queue(status);
 
 ## System Tray & UI
 
-### Tray Icon States
+### Brand Icon Pipeline
 
-| State | Icon | Description |
-|-------|------|-------------|
-| Idle | Green circle | Connected, watching, nothing to upload |
-| Syncing | Blue animated arrow | Actively uploading |
-| Queued | Blue dot | Items in queue, uploading |
-| Paused | Yellow bars | User paused |
-| Error | Red X | Server unreachable or auth failed |
-| Offline | Gray circle | No server connection |
+The application ships a single brand mark ... the six-blade shutter wheel at
+`assets/icon-source.webp` (1232x1232, purple/green/orange/teal/maroon/yellow
+blades on a white background). `build.rs` is the canonical icon generator;
+nothing in the runtime binary decodes images.
+
+At build time `build.rs` reads the source webp and emits, into
+`OUT_DIR/icons/`:
+
+| Output | Purpose |
+|---|---|
+| `icon.ico` | Multi-resolution (16, 24, 32, 48, 64, 128, 256), PNG-compressed entries. Embedded as the EXE's Windows resource icon via `winresource`. Drives Explorer thumbnails, Apps & Features `DisplayIcon`, pinned-shortcut icons, and the taskbar fallback. |
+| `tray_idle.rgba` | 32x32 RGBA8 raw bitmap. The canonical static brand mark. Also used for every eframe window's title-bar icon (Settings, Install, About, etc.) via `egui::IconData`. |
+| `tray_offline.rgba` | 32x32 RGBA8 raw bitmap. Desaturated blades with a red circle + white diagonal-slash badge stamped in the bottom-right corner (Slack/Teams disconnect convention ... the badge is the load-bearing signal). |
+| `tray_rot_00..11.rgba` | 12 frames of the idle bitmap rotated clockwise in 30-degree increments. Used for the syncing animation. Frame 0 is byte-identical to `tray_idle.rgba` so transitioning to/from idle is visually invisible. |
+
+Build-time deps: `image` (webp decode + Lanczos3 resize), `ico` (.ico writer),
+`winresource` (Windows resource embedder). Runtime deps: none ... the binary
+just `include_bytes!`'s the pre-decoded RGBA blobs and feeds them straight to
+`tray_icon::Icon::from_rgba` / `egui::IconData`.
+
+### Tray State Machine
+
+Five logical states. The icon, tooltip, and status-menu text are derived from
+the state; transitions are gated through `TrayApp::update_state`.
+
+| State | Icon (static) | Driven by |
+|---|---|---|
+| `Idle` | `tray_idle.rgba` | App startup; queue empty, server reachable |
+| `Syncing { current, total }` | `tray_rot_*.rgba`, cycled every 100ms (1.2s per full revolution) | `pipeline.stats()` reports `uploading + pending > 0` |
+| `Paused` | `tray_offline.rgba` | User clicked Pause Sync |
+| `Error(msg)` | `tray_offline.rgba` | Server unconfigured at startup, or other unrecoverable client init failure |
+| `Offline` | `tray_offline.rgba` | Periodic server ping (`/api/server/ping`, every 30s) fails. Clears the moment a ping succeeds OR an upload starts (uploads imply reachability). |
+
+Two transition rules deserve a callout:
+
+* **`Syncing -> not-Syncing` snaps the rotation cursor back to frame 0.** Without this, entering and exiting Syncing would leave the static idle icon momentarily rotated, then jerk back to upright. Frame 0 is byte-identical to the idle bitmap, so the swap is invisible.
+* **`Syncing` wins over `Offline`.** If we're actually moving bytes, the server is reachable by definition. The Offline overlay only shows when the queue is also drained.
+
+Animation drive: `app.rs::run` calls `TrayApp::tick_animation()` on every main-loop pass (~20Hz). When in Syncing state, that function checks an internal deadline (set 100ms ahead on entry) and advances the frame index modulo 12 if the deadline has passed. Outside Syncing it's a cheap early-return on `Option<Instant>::None`. Long stalls skip frames rather than playing catch-up.
 
 ### Tray Context Menu
 
@@ -279,7 +400,32 @@ Named mutex (`Global\ImmichSync`) ensures only one instance runs. If a second la
 
 ### Auto-Start
 
-Registry key at `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` with the path to the executable.
+Registry key at `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` with the path to the executable. Value points at the install path (`%LOCALAPPDATA%\Programs\immichsync\immichsync.exe`) so it survives the user moving the source download.
+
+### Apps & Features Registration
+
+At install time the app writes a per-user Uninstall key under `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\ImmichSync` so it appears in Settings → Apps → Installed apps. The key carries `DisplayName`, `Publisher`, `DisplayVersion`, `InstallLocation`, `InstallDate`, `EstimatedSize`, `DisplayIcon`, `URLInfoAbout`, `HelpLink`, `UninstallString` (`"<exe>" --uninstall`), `QuietUninstallString` (`"<exe>" --uninstall --silent`), `NoModify=1`, `NoRepair=1`.
+
+`winget uninstall ImmichSync` works against the same key by invoking `QuietUninstallString`.
+
+### Self-Uninstall (`--uninstall`)
+
+Invoked by Windows Apps & Features (or `winget uninstall`). Steps:
+
+1. `WM_CLOSE` to any running ImmichSync shutdown window for graceful shutdown of in-flight uploads.
+2. Remove autostart registry value.
+3. Remove desktop + Start Menu shortcuts.
+4. Remove the Apps & Features Uninstall registry block.
+5. Show "uninstall complete" `MessageBoxW` (unless `--silent`).
+6. Spawn a detached `cmd.exe` that waits ~4 seconds (so the running uninstall exe has time to exit) then `rmdir /s /q` on the install directory. Pattern: `ping 127.0.0.1 -n 5 >nul & rmdir /s /q <install_dir>`.
+
+User data is intentionally preserved on uninstall:
+
+- `%APPDATA%\bees-roadhouse\immichsync\config.toml`
+- `%LOCALAPPDATA%\bees-roadhouse\immichsync\state.db` (+ WAL/SHM)
+- `%LOCALAPPDATA%\bees-roadhouse\immichsync\logs\`
+
+Reinstalling later picks up where the user left off ... no first-run wizard, no re-add of watch folders, no re-upload of already-uploaded files. A future `--purge` flag covers the "really remove everything" case.
 
 ### API Key Encryption
 
@@ -288,6 +434,43 @@ API keys are encrypted with AES-256-GCM using a key derived from Windows DPAPI (
 ### Known Folder Resolution
 
 `SHGetKnownFolderPath(FOLDERID_Pictures)` resolves the user's Pictures folder, handling OneDrive redirects and custom locations.
+
+---
+
+## File Layout
+
+ImmichSync follows the Windows-standard per-user split used by VSCode, Slack, Discord, GitHub Desktop:
+
+| What | Path | Folder ID | Why |
+|---|---|---|---|
+| Binary install | `%LOCALAPPDATA%\Programs\immichsync\immichsync.exe` | `FOLDERID_LocalAppData\Programs` | Per-user install, no admin, doesn't roam |
+| Version stamp | `%LOCALAPPDATA%\Programs\immichsync\version.txt` | (same) | Read by updater to compare versions |
+| Roaming config | `%APPDATA%\bees-roadhouse\immichsync\config.toml` | `FOLDERID_RoamingAppData` | Small, machine-portable, fine to roam |
+| State DB | `%LOCALAPPDATA%\bees-roadhouse\immichsync\state.db` (+ `.db-wal`, `.db-shm`) | `FOLDERID_LocalAppData` | Machine-local: watched paths, upload progress, dedup history |
+| Logs | `%LOCALAPPDATA%\bees-roadhouse\immichsync\logs\immichsync.YYYY-MM-DD` | (same) | Machine-diagnostic, never roams |
+
+Roaming profile sync on managed enterprise networks would otherwise multi-MB-round-trip the binary on every logon. The split puts only the small TOML (`config.toml`) in the roaming path.
+
+### Path Resolution (Rust)
+
+```rust
+Config::install_dir()    // %LOCALAPPDATA%\Programs\immichsync\
+Config::config_dir()     // %APPDATA%\bees-roadhouse\immichsync\
+Config::local_data_dir() // %LOCALAPPDATA%\bees-roadhouse\immichsync\
+Config::config_path()    // config_dir() + "config.toml"
+```
+
+### Legacy Migrations
+
+Two compatibility paths run at startup. Both are idempotent and skip files that already exist at the destination.
+
+**Step 1 — Pre-namespace layout.** Very-early releases stored everything under `%APPDATA%\ImmichSync\` (no `bees-roadhouse` prefix). `migrate_legacy_data()` routes:
+
+- `config.toml` → `%APPDATA%\bees-roadhouse\immichsync\config.toml`
+- `state.db*` → `%LOCALAPPDATA%\bees-roadhouse\immichsync\state.db*`
+- `logs\*` → `%LOCALAPPDATA%\bees-roadhouse\immichsync\logs\*`
+
+**Step 2 — Mixed roaming layout.** Versions 0.1.x put binary + DB + logs all in `%APPDATA%\bees-roadhouse\immichsync\`. `migrate_to_split_layout()` moves DB + logs to `%LOCALAPPDATA%`; leaves `config.toml` (already in the right place). The old binary stays where it is until the user accepts the install prompt — we don't delete an exe out from under a running process.
 
 ---
 
@@ -344,8 +527,10 @@ immichsync/
 │       ├── single_instance.rs   # Named mutex for single instance
 │       ├── drives.rs            # Drive enumeration, type detection
 │       ├── encryption.rs        # DPAPI + AES-256-GCM API key encryption
-│       ├── install.rs           # Self-install to AppData, version tracking
-│       └── shortcuts.rs         # Desktop/start menu shortcut creation
+│       ├── install.rs           # Self-install + Apps & Features registry + migration
+│       ├── uninstall.rs         # `--uninstall` flow: cleanup + scheduled self-delete
+│       ├── shutdown.rs          # Hidden window catching WM_CLOSE/WM_ENDSESSION
+│       └── shortcuts.rs         # Desktop/start menu shortcut create + remove
 ├── tests/
 │   ├── integration/
 │   │   ├── watch_test.rs

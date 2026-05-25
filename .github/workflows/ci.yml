@@ -51,48 +51,34 @@ jobs:
         env:
           CARGO_TARGET_DIR: target
 
-      - name: Build (release)
-        run: cargo build --release --locked
-        env:
-          CARGO_TARGET_DIR: target
-
       - name: Test
+        # `cargo test` builds in debug mode and runs all tests. This is the
+        # actual signal we care about on PRs — does it compile, do tests pass.
+        # The release build (with optimizer, linker, ~10 min on Windows) is
+        # deferred to release.yml on push to release / v* tag.
         run: cargo test --locked
         env:
           CARGO_TARGET_DIR: target
 
-      - name: Clippy (informational)
-        # Not gating yet — codebase has known dead-code warnings to clean up.
-        # Track in repo issues; flip to `-D warnings` once clean.
-        continue-on-error: true
-        run: cargo clippy --all-targets -- -W clippy::all
+      - name: Check (release)
+        # Cheap safety net for "release-only compile failures" without paying
+        # the full release-build cost. `cargo check` skips linking and most
+        # optimization — verifies the source compiles under the release profile
+        # in ~30s. If this passes, the release.yml build is virtually certain
+        # to succeed. If it fails, we catch the regression in PR rather than
+        # at release time.
+        run: cargo check --release --locked
         env:
           CARGO_TARGET_DIR: target
 
-      - name: Format check (informational)
-        # Not gating yet — see issue tracker for a planned `cargo fmt` sweep.
-        continue-on-error: true
+      - name: Clippy
+        # Gating after the issue #9 cleanup. Run `cargo clippy --all-targets
+        # -- -D warnings` locally before opening a PR; CI fails otherwise.
+        run: cargo clippy --all-targets -- -D warnings
+        env:
+          CARGO_TARGET_DIR: target
+
+      - name: Format check
+        # Gating after the v0.2.0 cargo fmt sweep (issue #8).
+        # Run `cargo fmt --all` locally before opening a PR; CI fails otherwise.
         run: cargo fmt --all -- --check
-
-      # Skip artifact upload on PRs targeting release (development → release).
-      # Those PRs trigger the release.yml flow on merge, which builds and
-      # attaches the binary to a real GitHub Release.
-      - name: Compute artifact name
-        if: github.event.pull_request.base.ref != 'release'
-        id: artifact_meta
-        shell: pwsh
-        run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          $shortSha = "${{ github.event.pull_request.head.sha }}".Substring(0, 7)
-          $slug = "${{ github.head_ref }}" -replace '/', '-'
-          $name = "immichsync-$version-$slug-$shortSha"
-          "name=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      - name: Upload binary artifact
-        if: github.event.pull_request.base.ref != 'release'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.artifact_meta.outputs.name }}
-          path: target/release/immichsync.exe
-          retention-days: 90
-          if-no-files-found: error

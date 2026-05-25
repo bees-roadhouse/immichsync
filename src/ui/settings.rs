@@ -17,23 +17,7 @@ use tracing::info;
 
 use crate::config::Config;
 use crate::db::{AlbumMode, Database, PostUpload, WatchMode, WatchedFolder};
-
-/// Settings window state.
-///
-/// Kept for backward compatibility — other modules hold `Option<Settings>`.
-pub struct Settings;
-
-impl Settings {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+use crate::watch::filter::{parse_patterns_json, patterns_to_json};
 
 /// Open the settings window (blocking the calling thread).
 ///
@@ -51,12 +35,22 @@ pub fn show_settings(config: Config, result_tx: Option<Sender<Config>>) {
         })),
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([520.0, 420.0])
-            .with_title("ImmichSync Settings"),
+            .with_title("ImmichSync Settings")
+            .with_icon(crate::ui::window_icon::brand_icon_data()),
         ..Default::default()
     };
 
     // Load watched folders from database for the Watch Folders tab.
     let folders = load_folders();
+
+    // Hydrate per-folder editable pattern text (one glob per line) from the
+    // JSON-encoded DB columns.
+    let mut include_text: HashMap<i64, String> = HashMap::new();
+    let mut exclude_text: HashMap<i64, String> = HashMap::new();
+    for f in &folders {
+        include_text.insert(f.id, patterns_text_from_json(f.include_patterns.as_deref()));
+        exclude_text.insert(f.id, patterns_text_from_json(f.exclude_patterns.as_deref()));
+    }
 
     let app = SettingsApp {
         // Connection tab
@@ -82,11 +76,16 @@ pub fn show_settings(config: Config, result_tx: Option<Sender<Config>>) {
         check_for_updates: config.advanced.check_for_updates,
         update_check_interval_hours: config.advanced.update_check_interval_hours,
         update_repo: config.advanced.update_repo.clone(),
+        update_channel_mode: ChannelMode::from_str(&config.advanced.update_channel),
+        update_tag_pin: ChannelMode::extract_tag(&config.advanced.update_channel),
+        update_channel_error: String::new(),
 
         // Watch Folders tab
         folders,
         folder_to_remove: None,
         apply_existing: HashMap::new(),
+        include_text,
+        exclude_text,
 
         // State
         active_tab: Tab::Connection,
@@ -111,6 +110,48 @@ enum Tab {
     WatchFolders,
     Upload,
     Advanced,
+}
+
+// ── Channel mode (UI representation of update_channel) ──────────────────────
+
+/// UI-side channel selector. Maps onto `config.advanced.update_channel`
+/// (which is the raw string the updater consumes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelMode {
+    Latest,
+    Prerelease,
+    PinToTag,
+    Disabled,
+}
+
+impl ChannelMode {
+    fn from_str(s: &str) -> Self {
+        match s.trim() {
+            "prerelease" => ChannelMode::Prerelease,
+            "none" => ChannelMode::Disabled,
+            "" | "latest" => ChannelMode::Latest,
+            other if other.starts_with('v') => ChannelMode::PinToTag,
+            _ => ChannelMode::Latest,
+        }
+    }
+
+    /// Pull the tag out if the raw channel string is a pin; otherwise empty.
+    fn extract_tag(s: &str) -> String {
+        if s.trim().starts_with('v') {
+            s.trim().to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            ChannelMode::Latest => "Latest stable",
+            ChannelMode::Prerelease => "Latest (including prereleases)",
+            ChannelMode::PinToTag => "Pin to tag",
+            ChannelMode::Disabled => "Disabled",
+        }
+    }
 }
 
 // ── Settings app state ──────────────────────────────────────────────────────
@@ -139,12 +180,19 @@ struct SettingsApp {
     check_for_updates: bool,
     update_check_interval_hours: u32,
     update_repo: String,
+    update_channel_mode: ChannelMode,
+    update_tag_pin: String,
+    update_channel_error: String,
 
     // Watch Folders tab
     folders: Vec<WatchedFolder>,
     folder_to_remove: Option<i64>,
     /// Transient per-folder checkbox: apply trash/delete to already-uploaded files on Save.
     apply_existing: HashMap<i64, bool>,
+    /// Transient per-folder include-patterns text buffer (one glob per line).
+    include_text: HashMap<i64, String>,
+    /// Transient per-folder exclude-patterns text buffer (one glob per line).
+    exclude_text: HashMap<i64, String>,
 
     // State
     active_tab: Tab,
@@ -168,8 +216,7 @@ impl eframe::App for SettingsApp {
         egui::TopBottomPanel::bottom("button_bar").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    self.save_config();
+                if ui.button("Save").clicked() && self.save_config() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 if ui.button("Cancel").clicked() {
@@ -180,13 +227,11 @@ impl eframe::App for SettingsApp {
         });
 
         // Tab content.
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.active_tab {
-                Tab::Connection => self.show_connection_tab(ui),
-                Tab::WatchFolders => self.show_watch_folders_tab(ui),
-                Tab::Upload => self.show_upload_tab(ui),
-                Tab::Advanced => self.show_advanced_tab(ui),
-            }
+        egui::CentralPanel::default().show(ctx, |ui| match self.active_tab {
+            Tab::Connection => self.show_connection_tab(ui),
+            Tab::WatchFolders => self.show_watch_folders_tab(ui),
+            Tab::Upload => self.show_upload_tab(ui),
+            Tab::Advanced => self.show_advanced_tab(ui),
         });
 
         // Process deferred folder removal (avoid borrow conflict).
@@ -286,11 +331,7 @@ impl SettingsApp {
                                 .width(120.0)
                                 .selected_text(&selected)
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut selected,
-                                        "none".to_string(),
-                                        "None",
-                                    );
+                                    ui.selectable_value(&mut selected, "none".to_string(), "None");
                                     ui.selectable_value(
                                         &mut selected,
                                         "folder".to_string(),
@@ -317,10 +358,7 @@ impl SettingsApp {
                             if folder.album_mode == AlbumMode::Fixed {
                                 let name = folder.album_name.get_or_insert_with(String::new);
                                 ui.label("Name:");
-                                ui.add_sized(
-                                    [120.0, 18.0],
-                                    egui::TextEdit::singleline(name),
-                                );
+                                ui.add_sized([120.0, 18.0], egui::TextEdit::singleline(name));
                             }
                         });
 
@@ -364,6 +402,37 @@ impl SettingsApp {
                             // Reset if user switches back to Keep.
                             self.apply_existing.remove(&folder.id);
                         }
+
+                        // Per-folder include/exclude glob patterns. One pattern per line.
+                        // Empty buffers leave the filter at default (extension-only).
+                        ui.add_space(4.0);
+                        ui.label("Include patterns (one glob per line, blank = no restriction):");
+                        let include_buf = self.include_text.entry(folder.id).or_default();
+                        ui.add(
+                            egui::TextEdit::multiline(include_buf)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("e.g. **/raw/** or *.cr3"),
+                        );
+
+                        ui.label("Exclude patterns (one glob per line):");
+                        let exclude_buf = self.exclude_text.entry(folder.id).or_default();
+                        ui.add(
+                            egui::TextEdit::multiline(exclude_buf)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("e.g. **/thumbnails/**"),
+                        );
+
+                        // Skip cloud-storage placeholder files (OneDrive Files
+                        // On-Demand, iCloud, SeaDrive, Google Drive, etc.).
+                        // Default ON ... reading a placeholder triggers a
+                        // cloud download as a side effect, which can re-pull
+                        // an entire offloaded library on first scan.
+                        ui.checkbox(
+                            &mut folder.ignore_online_files,
+                            "Skip cloud-only files (placeholders, not materialized locally)",
+                        );
                     });
                     ui.add_space(2.0);
                 }
@@ -443,11 +512,7 @@ impl SettingsApp {
                     .selected_text(&self.log_level)
                     .show_ui(ui, |ui| {
                         for level in &["trace", "debug", "info", "warn", "error"] {
-                            ui.selectable_value(
-                                &mut self.log_level,
-                                level.to_string(),
-                                *level,
-                            );
+                            ui.selectable_value(&mut self.log_level, level.to_string(), *level);
                         }
                     });
                 ui.end_row();
@@ -466,7 +531,10 @@ impl SettingsApp {
         ui.checkbox(&mut self.autostart, "Start with Windows");
         ui.checkbox(&mut self.minimize_to_tray, "Minimize to system tray");
         ui.checkbox(&mut self.show_notifications, "Show notifications");
-        ui.checkbox(&mut self.check_for_updates, "Automatically check for updates");
+        ui.checkbox(
+            &mut self.check_for_updates,
+            "Automatically check for updates",
+        );
         ui.add_enabled_ui(self.check_for_updates, |ui| {
             ui.indent("update_indent", |ui| {
                 ui.horizontal(|ui| {
@@ -480,6 +548,38 @@ impl SettingsApp {
                     ui.label("Repository:");
                     ui.text_edit_singleline(&mut self.update_repo);
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Channel:");
+                    egui::ComboBox::from_id_salt("update_channel")
+                        .selected_text(self.update_channel_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in [
+                                ChannelMode::Latest,
+                                ChannelMode::Prerelease,
+                                ChannelMode::PinToTag,
+                                ChannelMode::Disabled,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.update_channel_mode,
+                                    mode,
+                                    mode.label(),
+                                );
+                            }
+                        });
+                });
+                if self.update_channel_mode == ChannelMode::PinToTag {
+                    ui.horizontal(|ui| {
+                        ui.label("Tag:");
+                        ui.text_edit_singleline(&mut self.update_tag_pin);
+                        ui.label("(e.g. v0.1.8)");
+                    });
+                }
+                if !self.update_channel_error.is_empty() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 80, 80),
+                        &self.update_channel_error,
+                    );
+                }
             });
         });
         ui.add_enabled_ui(self.show_notifications, |ui| {
@@ -510,8 +610,7 @@ impl SettingsApp {
                             self.test_status = "Connected!".to_string();
                         }
                         Ok(false) => {
-                            self.test_status =
-                                "Server responded but not ready".to_string();
+                            self.test_status = "Server responded but not ready".to_string();
                         }
                         Err(e) => {
                             self.test_status = format!("Failed: {e}");
@@ -528,7 +627,30 @@ impl SettingsApp {
         }
     }
 
-    fn save_config(&mut self) {
+    fn save_config(&mut self) -> bool {
+        // Validate update settings before touching config. Bad values keep the
+        // window open with a visible error so the user can correct them.
+        self.update_channel_error.clear();
+        let repo_trim = self.update_repo.trim().to_string();
+        if !repo_trim.is_empty() && !crate::updater::is_valid_repo(&repo_trim) {
+            self.update_channel_error =
+                "Repository must be in 'owner/name' format (public github.com only).".to_string();
+            self.active_tab = Tab::Advanced;
+            return false;
+        }
+        self.update_repo = repo_trim;
+
+        if self.update_channel_mode == ChannelMode::PinToTag {
+            let tag = self.update_tag_pin.trim().to_string();
+            if crate::updater::Channel::parse(&tag).is_none() {
+                self.update_channel_error =
+                    "Tag pin must look like 'vX.Y.Z' (or 'vX.Y.Z-prerelease').".to_string();
+                self.active_tab = Tab::Advanced;
+                return false;
+            }
+            self.update_tag_pin = tag;
+        }
+
         // Apply UI state back to config.
         self.config.server.url = self.server_url.clone();
         self.config.server.api_key = self.api_key.clone();
@@ -545,6 +667,12 @@ impl SettingsApp {
         self.config.advanced.check_for_updates = self.check_for_updates;
         self.config.advanced.update_check_interval_hours = self.update_check_interval_hours;
         self.config.advanced.update_repo = self.update_repo.clone();
+        self.config.advanced.update_channel = match self.update_channel_mode {
+            ChannelMode::Latest => "latest".to_string(),
+            ChannelMode::Prerelease => "prerelease".to_string(),
+            ChannelMode::Disabled => "none".to_string(),
+            ChannelMode::PinToTag => self.update_tag_pin.trim().to_string(),
+        };
 
         self.config.ui.start_with_windows = self.autostart;
         self.config.ui.minimize_to_tray = self.minimize_to_tray;
@@ -570,6 +698,8 @@ impl SettingsApp {
         if let Some(ref tx) = self.result_tx {
             let _ = tx.send(self.config.clone());
         }
+
+        true
     }
 }
 
@@ -604,6 +734,7 @@ impl SettingsApp {
                             include_patterns: None,
                             exclude_patterns: None,
                             post_upload: PostUpload::Keep,
+                            ignore_online_files: true,
                             auto_added: false,
                             created_at: String::new(),
                             updated_at: String::new(),
@@ -625,11 +756,27 @@ impl SettingsApp {
             }
         }
         self.folders.retain(|f| f.id != id);
+        self.include_text.remove(&id);
+        self.exclude_text.remove(&id);
+        self.apply_existing.remove(&id);
     }
 
     fn save_folders(&self) {
         if let Ok(db) = open_db() {
             for folder in &self.folders {
+                // Convert per-folder line-separated text buffers into JSON
+                // arrays before persisting. Empty buffers store NULL.
+                let include_json = self
+                    .include_text
+                    .get(&folder.id)
+                    .map(|s| patterns_text_to_json(s))
+                    .unwrap_or(None);
+                let exclude_json = self
+                    .exclude_text
+                    .get(&folder.id)
+                    .map(|s| patterns_text_to_json(s))
+                    .unwrap_or(None);
+
                 if let Err(e) = db.update_folder(
                     folder.id,
                     folder.label.as_deref(),
@@ -638,15 +785,21 @@ impl SettingsApp {
                     folder.poll_interval_secs,
                     &folder.album_mode,
                     folder.album_name.as_deref(),
-                    folder.include_patterns.as_deref(),
-                    folder.exclude_patterns.as_deref(),
+                    include_json.as_deref(),
+                    exclude_json.as_deref(),
                     &folder.post_upload,
+                    folder.ignore_online_files,
                 ) {
                     tracing::warn!(id = folder.id, error = %e, "Failed to update folder");
                 }
 
                 // Apply trash/delete to already-uploaded files if the user checked the box.
-                if self.apply_existing.get(&folder.id).copied().unwrap_or(false) {
+                if self
+                    .apply_existing
+                    .get(&folder.id)
+                    .copied()
+                    .unwrap_or(false)
+                {
                     self.apply_post_upload_to_existing(&db, folder);
                 }
             }
@@ -724,5 +877,59 @@ fn load_folders() -> Vec<WatchedFolder> {
             tracing::warn!(error = %e, "Failed to load folders for settings");
             Vec::new()
         }
+    }
+}
+
+/// Convert a JSON-encoded array of patterns (from `watched_folders`) into
+/// editable one-glob-per-line text for the multiline UI buffer.
+fn patterns_text_from_json(raw: Option<&str>) -> String {
+    parse_patterns_json(raw).join("\n")
+}
+
+/// Convert a one-glob-per-line text buffer into a JSON array string for DB
+/// storage. Returns `None` if the buffer is empty (so the column stores NULL).
+fn patterns_text_to_json(text: &str) -> Option<String> {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    patterns_to_json(&lines)
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_text_yields_none_json() {
+        assert!(patterns_text_to_json("").is_none());
+        assert!(patterns_text_to_json("   \n\n  \n").is_none());
+    }
+
+    #[test]
+    fn lines_become_json_array() {
+        let json = patterns_text_to_json("*.jpg\n**/raw/**").unwrap();
+        // Order preserved; whitespace trimmed.
+        let parsed: Vec<String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, vec!["*.jpg".to_string(), "**/raw/**".to_string()]);
+    }
+
+    #[test]
+    fn roundtrip_text_to_json_to_text() {
+        let original = "*.jpg\n**/raw/**\n  ";
+        let json = patterns_text_to_json(original).unwrap();
+        let back = patterns_text_from_json(Some(&json));
+        // Blank line is dropped; whitespace trimmed.
+        assert_eq!(back, "*.jpg\n**/raw/**");
+    }
+
+    #[test]
+    fn json_to_text_handles_none_and_malformed() {
+        assert_eq!(patterns_text_from_json(None), "");
+        // Malformed JSON yields empty text rather than panicking.
+        assert_eq!(patterns_text_from_json(Some("not json")), "");
     }
 }

@@ -21,24 +21,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use thiserror::Error;
 use tokio::sync::Notify;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use crate::upload::metadata;
 use crate::upload::queue::{QueueEntry, QueueStore};
-
-// ─── Errors ──────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Error)]
-pub enum WorkerError {
-    #[error("Worker failed to dequeue pending items: {0}")]
-    Dequeue(anyhow::Error),
-
-    #[error("Worker failed to update queue status: {0}")]
-    StatusUpdate(anyhow::Error),
-}
 
 // ─── Uploader trait ──────────────────────────────────────────────────────────
 
@@ -66,7 +54,10 @@ pub struct BulkCheckItem {
 /// The server's response for one item in a bulk-duplicate-check.
 #[derive(Debug, Clone)]
 pub struct BulkCheckResult {
-    /// The `deviceAssetId` echoed back.
+    /// The `deviceAssetId` echoed back. Production correlates results
+    /// positionally with its request, so the field is never read in either
+    /// build mode; it is kept on the struct to round-trip the API shape.
+    #[allow(dead_code)]
     pub id: String,
 
     /// Whether the asset already exists on the server.
@@ -99,11 +90,7 @@ pub trait AssetUploader: Send + Sync {
     ) -> anyhow::Result<Vec<BulkCheckResult>>;
 
     /// Get or create an album by name, then add an asset to it.
-    async fn add_asset_to_album(
-        &self,
-        _album_name: &str,
-        _asset_id: &str,
-    ) -> anyhow::Result<()> {
+    async fn add_asset_to_album(&self, _album_name: &str, _asset_id: &str) -> anyhow::Result<()> {
         Ok(()) // Default no-op for mock implementations
     }
 }
@@ -190,11 +177,7 @@ impl UploadWorker {
     ///
     /// `store`   — the queue/upload-record backend
     /// `uploader` — the Immich API client
-    pub async fn run(
-        &self,
-        store: Arc<dyn QueueStore>,
-        uploader: Arc<dyn AssetUploader>,
-    ) {
+    pub async fn run(&self, store: Arc<dyn QueueStore>, uploader: Arc<dyn AssetUploader>) {
         info!(
             concurrency = self.config.concurrency,
             device_id = %self.config.device_id,
@@ -346,6 +329,54 @@ async fn process_item(
         }
     };
 
+    // On retry, ask the server whether it already has this asset before
+    // re-uploading. Catches the case where a prior attempt completed
+    // server-side but the connection died before the client got the
+    // response — without this pre-check we'd re-upload the whole file
+    // (potentially 50+ GB) for nothing. Skipped on the first attempt
+    // because the local DB dedup table already covers that path.
+    if entry.retry_count > 0 {
+        if let Some(checksum) = entry.file_hash.as_deref() {
+            let check = uploader
+                .check_duplicates(vec![BulkCheckItem {
+                    id: device_asset_id.clone(),
+                    checksum: checksum.to_string(),
+                }])
+                .await;
+            match check {
+                Ok(results) => {
+                    if let Some(r) = results.first() {
+                        if r.exists {
+                            info!(
+                                id = entry.id,
+                                attempt = entry.retry_count,
+                                asset_id = ?r.asset_id,
+                                "Pre-check: server already has this asset, skipping re-upload"
+                            );
+                            if let Err(e) = store.mark_completed(entry.id, r.asset_id.as_deref()) {
+                                error!(
+                                    id = entry.id,
+                                    error = %e,
+                                    "Failed to mark entry completed after server-side pre-check"
+                                );
+                            }
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Pre-check is best-effort — if it fails, fall through and
+                    // attempt the upload normally.
+                    warn!(
+                        id = entry.id,
+                        error = %e,
+                        "Pre-check before retry failed; proceeding with full upload"
+                    );
+                }
+            }
+        }
+    }
+
     // Attempt the upload.
     let result = uploader
         .upload_asset(
@@ -368,13 +399,26 @@ async fn process_item(
 
             // Record in uploaded_files.
             // Strip the \\?\ extended-path prefix so DB queries match cleanly.
-            let clean_path = entry.file_path.strip_prefix(r"\\?\").unwrap_or(&entry.file_path);
+            let clean_path = entry
+                .file_path
+                .strip_prefix(r"\\?\")
+                .unwrap_or(&entry.file_path);
             if let Some(hash) = &entry.file_hash {
                 let size = entry.file_size.unwrap_or(0);
+                // Re-stat for mtime ... the fast-path dedup index needs it.
+                // Best-effort; on failure we record `0` and the next scan
+                // falls through to the SHA-1 layer for this file.
+                let mtime = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
                 if let Err(e) = store.record_upload(
                     clean_path,
                     hash,
                     size,
+                    mtime,
                     &upload_result.asset_id,
                     &device_asset_id,
                     "", // server_url is not in QueueEntry; the caller may patch this
@@ -392,7 +436,10 @@ async fn process_item(
                 if let Ok(Some(folder)) = store.get_folder(folder_id) {
                     let album_name = resolve_album_name(&folder, &path, &file_meta);
                     if let Some(name) = album_name {
-                        if let Err(e) = uploader.add_asset_to_album(&name, &upload_result.asset_id).await {
+                        if let Err(e) = uploader
+                            .add_asset_to_album(&name, &upload_result.asset_id)
+                            .await
+                        {
                             warn!(
                                 id = entry.id,
                                 album = %name,
@@ -437,10 +484,7 @@ async fn process_item(
                 }
             }
 
-            if let Err(e) = store.mark_completed(
-                entry.id,
-                Some(&upload_result.asset_id),
-            ) {
+            if let Err(e) = store.mark_completed(entry.id, Some(&upload_result.asset_id)) {
                 error!(id = entry.id, error = %e, "Failed to mark entry completed");
             }
         }
@@ -469,9 +513,7 @@ async fn process_item(
 
                 // We set the retry_count via the error path; the DB
                 // implementation is expected to increment it on status update.
-                if let Err(db_err) =
-                    store.update_status(entry.id, "failed", Some(&error_msg))
-                {
+                if let Err(db_err) = store.update_status(entry.id, "failed", Some(&error_msg)) {
                     error!(id = entry.id, error = %db_err, "Failed to mark entry as failed");
                 }
             } else {
@@ -489,9 +531,7 @@ async fn process_item(
                 // The retry_count increment is handled by the DB layer via
                 // a dedicated "increment retry" update; here we just set
                 // status back to pending.
-                if let Err(db_err) =
-                    store.update_status(entry.id, "pending", Some(&error_msg))
-                {
+                if let Err(db_err) = store.update_status(entry.id, "pending", Some(&error_msg)) {
                     error!(id = entry.id, error = %db_err, "Failed to reset entry to pending");
                 }
             }
@@ -506,7 +546,9 @@ async fn process_item(
 /// Sequence (base = 1 s): 1 s, 2 s, 4 s, 8 s, 16 s, 32 s (capped).
 fn backoff_delay(retry: u32, base: Duration) -> Duration {
     const MAX_DELAY_SECS: u64 = 32;
-    let multiplier = 1u64.checked_shl(retry.saturating_sub(1)).unwrap_or(u64::MAX);
+    let multiplier = 1u64
+        .checked_shl(retry.saturating_sub(1))
+        .unwrap_or(u64::MAX);
     let secs = (base.as_secs() * multiplier).min(MAX_DELAY_SECS);
     Duration::from_secs(secs)
 }
@@ -570,9 +612,12 @@ pub fn trash_file(file_path: &std::path::Path, folder_root: &str) -> anyhow::Res
     let trash_root = root.join(TRASH_DIR_NAME);
 
     // Compute relative path from folder root.
-    let relative = file_path
-        .strip_prefix(root)
-        .unwrap_or_else(|_| file_path.file_name().map(std::path::Path::new).unwrap_or(file_path));
+    let relative = file_path.strip_prefix(root).unwrap_or_else(|_| {
+        file_path
+            .file_name()
+            .map(std::path::Path::new)
+            .unwrap_or(file_path)
+    });
 
     let dest = trash_root.join(relative);
 
@@ -612,10 +657,7 @@ pub fn trash_file(file_path: &std::path::Path, folder_root: &str) -> anyhow::Res
 /// `retention_days`.  Removes empty directories afterwards.
 ///
 /// Called on startup and periodically from the app's main loop.
-pub fn cleanup_trash(
-    folders: &[crate::db::WatchedFolder],
-    retention_days: u32,
-) {
+pub fn cleanup_trash(folders: &[crate::db::WatchedFolder], retention_days: u32) {
     use std::time::{Duration, SystemTime};
 
     let max_age = Duration::from_secs(retention_days as u64 * 86400);
@@ -636,7 +678,7 @@ pub fn cleanup_trash(
         walk_and_delete(&trash_root, now, max_age, &mut dirs_to_check);
 
         // Remove empty directories (deepest first).
-        dirs_to_check.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+        dirs_to_check.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
         for dir in dirs_to_check {
             if let Ok(mut entries) = std::fs::read_dir(&dir) {
                 if entries.next().is_none() {
@@ -735,12 +777,7 @@ mod tests {
                 .collect())
         }
 
-        fn update_status(
-            &self,
-            id: i64,
-            status: &str,
-            error: Option<&str>,
-        ) -> anyhow::Result<()> {
+        fn update_status(&self, id: i64, status: &str, error: Option<&str>) -> anyhow::Result<()> {
             let mut entries = self.entries.lock().unwrap();
             if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
                 e.status = status.to_string();
@@ -752,11 +789,7 @@ mod tests {
             Ok(())
         }
 
-        fn mark_completed(
-            &self,
-            id: i64,
-            _asset_id: Option<&str>,
-        ) -> anyhow::Result<()> {
+        fn mark_completed(&self, id: i64, _asset_id: Option<&str>) -> anyhow::Result<()> {
             let mut entries = self.entries.lock().unwrap();
             if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
                 e.status = "completed".to_string();
@@ -774,6 +807,7 @@ mod tests {
             file_path: &str,
             hash: &str,
             _size: u64,
+            _mtime: i64,
             asset_id: &str,
             _device_asset_id: &str,
             _server_url: &str,
@@ -912,7 +946,12 @@ mod tests {
             })
             .unwrap();
 
-        let entry = store.dequeue_pending(1).unwrap().into_iter().next().unwrap();
+        let entry = store
+            .dequeue_pending(1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
 
         let config = WorkerConfig {
             concurrency: 1,
