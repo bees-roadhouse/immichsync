@@ -414,10 +414,20 @@ async fn process_item(
                 .unwrap_or(&entry.file_path);
             if let Some(hash) = &entry.file_hash {
                 let size = entry.file_size.unwrap_or(0);
+                // Re-stat for mtime ... the fast-path dedup index needs it.
+                // Best-effort; on failure we record `0` and the next scan
+                // falls through to the SHA-1 layer for this file.
+                let mtime = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
                 if let Err(e) = store.record_upload(
                     clean_path,
                     hash,
                     size,
+                    mtime,
                     &upload_result.asset_id,
                     &device_asset_id,
                     "", // server_url is not in QueueEntry; the caller may patch this
@@ -806,6 +816,7 @@ mod tests {
             file_path: &str,
             hash: &str,
             _size: u64,
+            _mtime: i64,
             asset_id: &str,
             _device_asset_id: &str,
             _server_url: &str,

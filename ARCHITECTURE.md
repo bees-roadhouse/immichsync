@@ -87,10 +87,12 @@ Removable devices:
 - Thumbs.db, desktop.ini, .DS_Store, Zone.Identifier streams
 - Files < 1KB (corrupted/empty)
 - Files still being written (detected via write completion check)
+- Cloud-storage placeholder files (OneDrive Files On-Demand, iCloud Drive for Windows, Google Drive for Desktop, Dropbox Smart Sync, Box Drive, SeaDrive, etc.) ... see the Cloud-Storage Interaction section below
 
 **User-configurable:**
 - Custom include/exclude glob patterns per watch folder
 - Minimum file size threshold
+- Per-folder `ignore_online_files` toggle (default ON)
 
 ### Write Completion Detection
 
@@ -101,6 +103,51 @@ Avoids uploading partial files:
 3. Attempt non-exclusive read open
 4. If all pass -> queue for upload
 5. If not -> re-queue with exponential backoff (up to 30s)
+
+### Cloud-Storage Interaction
+
+Modern cloud-storage clients ... OneDrive Files On-Demand, iCloud Drive for Windows, Google Drive for Desktop, Dropbox Smart Sync, Box Drive, SeaDrive ... store **placeholder files** on disk: full filename and metadata, but no contents. The first read of a placeholder triggers a synchronous download from the cloud. For a folder with thousands of offloaded photos, naive backup-tool behavior would re-pull the entire library on first scan ... defeating the user's storage-tiering decision.
+
+ImmichSync handles this in two layers:
+
+**Filter layer (default ON).** The `FileFilter` reads each candidate file's Windows attribute DWORD via `MetadataExt::file_attributes()` and drops the event if any of these bits are set:
+
+| Constant | Value | Set by |
+|---|---|---|
+| `FILE_ATTRIBUTE_OFFLINE` | `0x0000_1000` | Legacy hierarchical storage, some sync clients |
+| `FILE_ATTRIBUTE_RECALL_ON_OPEN` | `0x0004_0000` | iCloud Drive, older OneDrive |
+| `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` | `0x0040_0000` | Modern OneDrive Files On-Demand, Google Drive, Dropbox |
+
+The check is free ... it's a bit-test against a DWORD already loaded by the `metadata()` call we make for the minimum-size filter. Per-folder toggle in Settings (`Skip cloud-only files`); the DB default on `watched_folders.ignore_online_files` is `1`.
+
+**Worker layer (defense in depth).** Even with the filter on, a file's attributes can change between filter-time and hash-time (the cloud client offloads in the background). The two-layer dedup below also covers this case ... if we've ever uploaded this exact byte-identical file before, the fast-path hit means we never open the file at all.
+
+### Two-Layer Deduplication
+
+The dedup chain is now:
+
+```
+File ready -> stat (size + mtime + attrs) -> Filter (skip cloud placeholders if enabled)
+   -> Fast-path lookup (path + size + mtime)  -> hit: skip
+                                              -> miss: SHA-1 hash
+                                                  -> hash lookup -> hit: skip
+                                                                 -> miss: enqueue
+   -> Upload -> Record (path, hash, size, mtime)
+```
+
+**Layer 1 ... fast-path dedup** (`uploaded_files.(file_path, file_size, file_mtime)` composite index). Lookup is one indexed SELECT against three already-known values; the file is never opened. This is the load-bearing path for cloud placeholders: on a folder of 10k offloaded photos, a second scan triggers zero downloads.
+
+**Layer 2 ... content dedup** (`uploaded_files.file_hash`, SHA-1). The SHA-1 read happens only after a fast-path miss. Catches the renamed-or-touched cases where path or mtime changed but content is byte-identical.
+
+Default behavior (Settings unchanged):
+1. Cloud placeholders are filtered before either layer fires ... zero downloads.
+2. Locally-materialized files hit the fast path on the second run ... zero re-reads.
+3. Locally-materialized files with a new mtime fall through to SHA-1 ... covered by Immich's server-side dedup if content is identical.
+
+Opt-in behavior (`Skip cloud-only files` toggled OFF on a folder):
+1. First scan downloads + uploads all placeholders. Bandwidth cost paid once.
+2. Each upload records `(path, size, mtime)` on the row.
+3. Subsequent scans hit the fast path ... no re-downloads.
 
 ---
 
@@ -115,8 +162,9 @@ File Event -> Debounce -> Filter -> Hash -> Dedup Check -> Queue -> Upload -> Co
 ### Hashing & Deduplication
 
 - **Algorithm:** SHA-1 (matches Immich's internal checksum)
-- **Local dedup:** check SQLite for existing hash -> skip if already uploaded
-- **Server dedup:** Immich performs server-side dedup, but local check saves bandwidth
+- **Layer 1 (fast path):** `(path, size, mtime)` against `uploaded_files` composite index — skip without opening the file. Critical for cloud-placeholder files; see the Cloud-Storage Interaction section above.
+- **Layer 2 (content hash):** SHA-1 against `uploaded_files.file_hash` — runs only on fast-path miss.
+- **Server dedup:** Immich performs server-side dedup, but local checks save bandwidth.
 
 ### Upload Request
 
@@ -168,12 +216,14 @@ CREATE TABLE watched_folders (
     path TEXT NOT NULL UNIQUE,
     label TEXT,
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
-    watch_mode TEXT NOT NULL DEFAULT 'native',  -- 'native' | 'poll'
+    watch_mode TEXT NOT NULL DEFAULT 'native',     -- 'native' | 'poll'
     poll_interval_secs INTEGER NOT NULL DEFAULT 30,
-    album_mode TEXT NOT NULL DEFAULT 'none',    -- 'none' | 'folder' | 'date' | 'fixed'
+    album_mode TEXT NOT NULL DEFAULT 'none',       -- 'none' | 'folder' | 'subfolder' | 'date' | 'fixed'
     album_name TEXT,
-    include_patterns TEXT,                       -- JSON array of globs
-    exclude_patterns TEXT,                       -- JSON array of globs
+    include_patterns TEXT,                          -- JSON array of globs
+    exclude_patterns TEXT,                          -- JSON array of globs
+    post_upload TEXT NOT NULL DEFAULT 'keep',      -- 'keep' | 'trash' | 'delete'        (v2)
+    ignore_online_files INTEGER NOT NULL DEFAULT 1,-- skip cloud-placeholder files      (v3)
     auto_added BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -182,8 +232,9 @@ CREATE TABLE watched_folders (
 CREATE TABLE uploaded_files (
     id INTEGER PRIMARY KEY,
     file_path TEXT NOT NULL,
-    file_hash TEXT NOT NULL,                     -- SHA-1
+    file_hash TEXT NOT NULL,                       -- SHA-1
     file_size INTEGER NOT NULL,
+    file_mtime INTEGER NOT NULL DEFAULT 0,         -- seconds since Unix epoch          (v3)
     immich_asset_id TEXT,
     device_asset_id TEXT NOT NULL,
     uploaded_at TEXT NOT NULL,
@@ -196,7 +247,7 @@ CREATE TABLE upload_queue (
     file_hash TEXT,
     file_size INTEGER,
     folder_id INTEGER REFERENCES watched_folders(id),
-    status TEXT NOT NULL DEFAULT 'pending',       -- 'pending' | 'uploading' | 'failed' | 'completed'
+    status TEXT NOT NULL DEFAULT 'pending',         -- 'pending' | 'uploading' | 'failed' | 'completed'
     retry_count INTEGER NOT NULL DEFAULT 0,
     error_message TEXT,
     queued_at TEXT NOT NULL,
@@ -210,6 +261,8 @@ CREATE TABLE config (
 
 CREATE INDEX idx_uploaded_hash ON uploaded_files(file_hash);
 CREATE INDEX idx_uploaded_path ON uploaded_files(file_path);
+CREATE INDEX idx_uploaded_path_size_mtime                                              -- v3 fast-path dedup
+    ON uploaded_files(file_path, file_size, file_mtime);
 CREATE INDEX idx_queue_status ON upload_queue(status);
 ```
 

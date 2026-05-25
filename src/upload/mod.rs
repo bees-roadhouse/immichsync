@@ -274,6 +274,7 @@ mod tests {
             _file_path: &str,
             hash: &str,
             _size: u64,
+            _mtime: i64,
             _asset_id: &str,
             _device_asset_id: &str,
             _server_url: &str,
