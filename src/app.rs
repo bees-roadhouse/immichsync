@@ -691,11 +691,12 @@ impl App {
         self.last_update_check = Instant::now();
 
         let repo = self.config.advanced.update_repo.clone();
+        let channel = self.config.advanced.update_channel.clone();
         self.runtime.spawn(async move {
             if with_delay {
                 tokio::time::sleep(updater::STARTUP_DELAY).await;
             }
-            let result = updater::check_for_update(&repo).await;
+            let result = updater::check_for_update(&repo, &channel).await;
             let _ = tx.send(result);
         });
     }

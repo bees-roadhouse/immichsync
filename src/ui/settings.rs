@@ -92,6 +92,9 @@ pub fn show_settings(config: Config, result_tx: Option<Sender<Config>>) {
         check_for_updates: config.advanced.check_for_updates,
         update_check_interval_hours: config.advanced.update_check_interval_hours,
         update_repo: config.advanced.update_repo.clone(),
+        update_channel_mode: ChannelMode::from_str(&config.advanced.update_channel),
+        update_tag_pin: ChannelMode::extract_tag(&config.advanced.update_channel),
+        update_channel_error: String::new(),
 
         // Watch Folders tab
         folders,
@@ -125,6 +128,48 @@ enum Tab {
     Advanced,
 }
 
+// ── Channel mode (UI representation of update_channel) ──────────────────────
+
+/// UI-side channel selector. Maps onto `config.advanced.update_channel`
+/// (which is the raw string the updater consumes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelMode {
+    Latest,
+    Prerelease,
+    PinToTag,
+    Disabled,
+}
+
+impl ChannelMode {
+    fn from_str(s: &str) -> Self {
+        match s.trim() {
+            "prerelease" => ChannelMode::Prerelease,
+            "none" => ChannelMode::Disabled,
+            "" | "latest" => ChannelMode::Latest,
+            other if other.starts_with('v') => ChannelMode::PinToTag,
+            _ => ChannelMode::Latest,
+        }
+    }
+
+    /// Pull the tag out if the raw channel string is a pin; otherwise empty.
+    fn extract_tag(s: &str) -> String {
+        if s.trim().starts_with('v') {
+            s.trim().to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            ChannelMode::Latest => "Latest stable",
+            ChannelMode::Prerelease => "Latest (including prereleases)",
+            ChannelMode::PinToTag => "Pin to tag",
+            ChannelMode::Disabled => "Disabled",
+        }
+    }
+}
+
 // ── Settings app state ──────────────────────────────────────────────────────
 
 struct SettingsApp {
@@ -151,6 +196,9 @@ struct SettingsApp {
     check_for_updates: bool,
     update_check_interval_hours: u32,
     update_repo: String,
+    update_channel_mode: ChannelMode,
+    update_tag_pin: String,
+    update_channel_error: String,
 
     // Watch Folders tab
     folders: Vec<WatchedFolder>,
@@ -185,8 +233,9 @@ impl eframe::App for SettingsApp {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
-                    self.save_config();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    if self.save_config() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
                 }
                 if ui.button("Cancel").clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -517,6 +566,38 @@ impl SettingsApp {
                     ui.label("Repository:");
                     ui.text_edit_singleline(&mut self.update_repo);
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Channel:");
+                    egui::ComboBox::from_id_salt("update_channel")
+                        .selected_text(self.update_channel_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in [
+                                ChannelMode::Latest,
+                                ChannelMode::Prerelease,
+                                ChannelMode::PinToTag,
+                                ChannelMode::Disabled,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.update_channel_mode,
+                                    mode,
+                                    mode.label(),
+                                );
+                            }
+                        });
+                });
+                if self.update_channel_mode == ChannelMode::PinToTag {
+                    ui.horizontal(|ui| {
+                        ui.label("Tag:");
+                        ui.text_edit_singleline(&mut self.update_tag_pin);
+                        ui.label("(e.g. v0.1.8)");
+                    });
+                }
+                if !self.update_channel_error.is_empty() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 80, 80),
+                        &self.update_channel_error,
+                    );
+                }
             });
         });
         ui.add_enabled_ui(self.show_notifications, |ui| {
@@ -564,7 +645,30 @@ impl SettingsApp {
         }
     }
 
-    fn save_config(&mut self) {
+    fn save_config(&mut self) -> bool {
+        // Validate update settings before touching config. Bad values keep the
+        // window open with a visible error so the user can correct them.
+        self.update_channel_error.clear();
+        let repo_trim = self.update_repo.trim().to_string();
+        if !repo_trim.is_empty() && !crate::updater::is_valid_repo(&repo_trim) {
+            self.update_channel_error =
+                "Repository must be in 'owner/name' format (public github.com only).".to_string();
+            self.active_tab = Tab::Advanced;
+            return false;
+        }
+        self.update_repo = repo_trim;
+
+        if self.update_channel_mode == ChannelMode::PinToTag {
+            let tag = self.update_tag_pin.trim().to_string();
+            if crate::updater::Channel::parse(&tag).is_none() {
+                self.update_channel_error =
+                    "Tag pin must look like 'vX.Y.Z' (or 'vX.Y.Z-prerelease').".to_string();
+                self.active_tab = Tab::Advanced;
+                return false;
+            }
+            self.update_tag_pin = tag;
+        }
+
         // Apply UI state back to config.
         self.config.server.url = self.server_url.clone();
         self.config.server.api_key = self.api_key.clone();
@@ -581,6 +685,12 @@ impl SettingsApp {
         self.config.advanced.check_for_updates = self.check_for_updates;
         self.config.advanced.update_check_interval_hours = self.update_check_interval_hours;
         self.config.advanced.update_repo = self.update_repo.clone();
+        self.config.advanced.update_channel = match self.update_channel_mode {
+            ChannelMode::Latest => "latest".to_string(),
+            ChannelMode::Prerelease => "prerelease".to_string(),
+            ChannelMode::Disabled => "none".to_string(),
+            ChannelMode::PinToTag => self.update_tag_pin.trim().to_string(),
+        };
 
         self.config.ui.start_with_windows = self.autostart;
         self.config.ui.minimize_to_tray = self.minimize_to_tray;
@@ -606,6 +716,8 @@ impl SettingsApp {
         if let Some(ref tx) = self.result_tx {
             let _ = tx.send(self.config.clone());
         }
+
+        true
     }
 }
 

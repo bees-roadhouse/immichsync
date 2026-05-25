@@ -326,10 +326,10 @@ fn check_for_update_on_startup() {
         }
     };
 
-    let repo = config::Config::load()
-        .map(|c| c.advanced.update_repo)
+    let (repo, channel) = config::Config::load()
+        .map(|c| (c.advanced.update_repo, c.advanced.update_channel))
         .unwrap_or_default();
-    let result = rt.block_on(updater::check_for_update(&repo));
+    let result = rt.block_on(updater::check_for_update(&repo, &channel));
 
     match result {
         updater::UpdateCheckResult::Available(info) => {
