@@ -1,4 +1,14 @@
-# Build target directory on local disk to avoid UNC path issues when the
-# repo lives on a mapped network drive.
-[build]
-target-dir = "C:\\Users\\natesmith\\.cargo-target\\immichsync"
+# Cargo build configuration.
+#
+# On checkouts hosted on a mapped network drive (e.g. seadrive), cargo can
+# hit UNC path issues that slow or break builds. If you encounter that,
+# set CARGO_TARGET_DIR in your shell environment to a path on a local
+# drive ... for example:
+#
+#   PowerShell (per session):  $env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\cargo-target\immichsync"
+#   PowerShell (persistent):   [Environment]::SetEnvironmentVariable("CARGO_TARGET_DIR", "$env:LOCALAPPDATA\cargo-target\immichsync", "User")
+#   bash (per session):        export CARGO_TARGET_DIR="$HOME/.cargo-target/immichsync"
+#
+# CI overrides this via the CARGO_TARGET_DIR env var on every cargo step
+# (see .github/workflows/ci.yml + release.yml), so no repo-level override
+# is needed for the build pipeline.
