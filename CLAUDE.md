@@ -91,13 +91,13 @@ cargo test
 
 Follows the DevOps book standards: [Branching Strategy](https://kb.beesroadhouse.com/books/developer-operations-devops/page/branching-strategy), [Change Taxonomy](https://kb.beesroadhouse.com/books/developer-operations-devops/page/change-taxonomy), [PR Merge Strategy](https://kb.beesroadhouse.com/books/developer-operations-devops/page/pr-merge-strategy), [Issue Workflow](https://kb.beesroadhouse.com/books/developer-operations-devops/page/issue-workflow).
 
-- `development` is the default branch (always shippable). All changes land via PR — the org `Default Branch Protection` ruleset (id 15744970) requires 1 approving review + thread resolution and rejects direct pushes with `GH013`.
-- `release` is also PR-protected by the org `Release Branch Protection` ruleset (id 15553415), which targets `refs/heads/release`, `refs/heads/release/*`, and `refs/heads/release-*`.
+- `development` is the default branch (always shippable). All changes land via PR — the org `Default Branch Protection` ruleset (id 15744970) requires thread resolution and rejects direct pushes with `GH013`. Approving review is not currently required (solo-developer org; CI is the gate). Re-enable the review count when collaborators arrive.
+- `release` is also PR-protected by the org `Release Branch Protection` ruleset (id 15553415), which targets `refs/heads/release`, `refs/heads/release/*`, and `refs/heads/release-*`. Same review policy (0 required) and thread-resolution requirement.
 - Work branches: `feature/`, `improvement/`, `refactor/`, `bug/`.
 - One discrete change per PR; rebase onto `development` before merge.
 - **Squash-and-merge** for work-branch → `development`. **Merge commit** for `development` → `release` (squashing the release transition breaks ancestor relationship).
 - `BREAKING:` prefix in PR title forces a major version bump regardless of type.
-- Standard PR-create incantation (auto-merge once review + required checks pass):
+- Standard PR-create incantation (auto-merge once required checks pass):
   ```bash
   gh pr create --base development --head <branch> --title "..." --body "..."
   gh pr merge --auto --squash --delete-branch
