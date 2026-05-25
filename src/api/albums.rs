@@ -8,6 +8,10 @@ use super::{ApiError, ImmichClient};
 // ---------------------------------------------------------------------------
 
 /// An Immich album, as returned by the API.
+///
+/// Only the fields the rest of the app consumes are deserialized; extra JSON
+/// keys returned by the server (asset_count, description, owner_id, etc.)
+/// are silently ignored by serde.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Album {
@@ -16,18 +20,6 @@ pub struct Album {
 
     /// Human-readable album name.
     pub album_name: String,
-
-    /// Number of assets in the album.
-    #[serde(default)]
-    pub asset_count: u64,
-
-    /// Description / subtitle set on the album.
-    #[serde(default)]
-    pub description: String,
-
-    /// UUID of the user who owns the album.
-    #[serde(default)]
-    pub owner_id: String,
 }
 
 // ---------------------------------------------------------------------------

@@ -172,9 +172,9 @@ fn walk_trash(
                     let modified = meta
                         .modified()
                         .ok()
-                        .and_then(|t| {
+                        .map(|t| {
                             let dt: chrono::DateTime<chrono::Local> = t.into();
-                            Some(dt.format("%Y-%m-%d %H:%M").to_string())
+                            dt.format("%Y-%m-%d %H:%M").to_string()
                         })
                         .unwrap_or_default();
                     (size, modified)

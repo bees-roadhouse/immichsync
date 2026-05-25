@@ -1,6 +1,5 @@
 // Watch engine orchestrator
 
-pub mod device;
 pub mod filter;
 pub mod folder;
 pub mod network;
@@ -41,7 +40,10 @@ pub enum WatchError {
     #[error("Path is already being watched: {0:?}")]
     AlreadyWatching(PathBuf),
 
+    /// Returned by `remove_folder` (which is currently only exercised by
+    /// tests) when the caller asks to drop a path that isn't tracked.
     #[error("Path is not being watched: {0:?}")]
+    #[cfg_attr(not(test), allow(dead_code))]
     NotWatching(PathBuf),
 
     #[error("Failed to start watcher for {path:?}: {source}")]
@@ -189,8 +191,8 @@ impl WatchEngine {
     /// - `path`       — the directory to watch (must exist)
     /// - `filter`     — file filter to apply to events from this folder
     /// - `is_network` — if `true`, a [`NetworkWatcher`] with health-check
-    ///                  fallback is used; if `false`, a [`FolderWatcher`]
-    ///                  (native, debounced) is used
+    ///   fallback is used; if `false`, a [`FolderWatcher`]
+    ///   (native, debounced) is used
     ///
     /// # Errors
     ///
@@ -261,6 +263,11 @@ impl WatchEngine {
     ///
     /// Returns [`WatchError::NotWatching`] if the path is not currently
     /// registered.
+    ///
+    /// Production today never narrows the watched set; `stop_all` + rebuild
+    /// is the only teardown path. Kept for the test suite that covers the
+    /// engine's add/remove invariants.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn remove_folder(&mut self, path: &Path) -> Result<(), WatchError> {
         let mut slots = self.slots.lock().unwrap();
 
@@ -326,6 +333,10 @@ impl WatchEngine {
     }
 
     /// Return `true` if the given path is currently being watched.
+    ///
+    /// Production reconciles via `watched_paths`; this single-path lookup is
+    /// only used by the engine's test suite.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_watching(&self, path: &Path) -> bool {
         let slots = self.slots.lock().unwrap();
         if slots.contains_key(path) {

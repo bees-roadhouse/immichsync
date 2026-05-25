@@ -145,6 +145,11 @@ impl FileFilter {
     }
 
     /// Override the minimum file size threshold (bytes).
+    ///
+    /// Used by the filter test suite to exercise the size-threshold branch
+    /// without rewriting the whole filter; production builds construct the
+    /// filter with the config-derived defaults and never tune it after.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_min_size(mut self, bytes: u64) -> Self {
         self.min_size = bytes;
         self

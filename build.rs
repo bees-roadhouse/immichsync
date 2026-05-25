@@ -23,7 +23,7 @@
 use std::path::PathBuf;
 
 use image::imageops::FilterType;
-use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba, RgbaImage};
+use image::{GenericImageView, ImageBuffer, Rgba, RgbaImage};
 
 const SOURCE_PATH: &str = "assets/icon-source.webp";
 

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::upload::hasher;
 
@@ -114,6 +114,10 @@ pub struct NewQueueEntry {
 }
 
 /// A row from the `upload_queue` table.
+///
+/// `status`, `error_message`, `queued_at`, and `completed_at` are read only
+/// by the in-module test suite (see `upload/mod.rs`); release builds
+/// construct entries from the DB layer but never read these fields back.
 #[derive(Debug, Clone)]
 pub struct QueueEntry {
     pub id: i64,
@@ -123,21 +127,30 @@ pub struct QueueEntry {
     pub folder_id: Option<i64>,
 
     /// One of `"pending"`, `"uploading"`, `"failed"`, `"completed"`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub status: String,
 
     pub retry_count: u32,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub error_message: Option<String>,
+    #[allow(dead_code)]
     pub queued_at: DateTime<Utc>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub completed_at: Option<DateTime<Utc>>,
 }
 
 /// Aggregate counts across all queue entries.
+///
+/// `failed` and `total` are populated by the test mock but the production UI
+/// only surfaces `pending`, `uploading`, and `completed` today.
 #[derive(Debug, Clone, Default)]
 pub struct QueueStats {
     pub pending: u64,
     pub uploading: u64,
     pub completed: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub failed: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub total: u64,
 }
 
@@ -150,6 +163,9 @@ pub struct QueueStats {
 pub struct UploadQueue {
     store: Arc<dyn QueueStore>,
     /// Maximum number of concurrent upload workers (advisory; not enforced here).
+    /// Carried so the pipeline can hand it back to the worker config; the
+    /// queue itself does not throttle on it.
+    #[allow(dead_code)]
     pub concurrency: usize,
 }
 

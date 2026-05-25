@@ -31,7 +31,7 @@ use std::path::PathBuf;
 
 use tracing::{info, warn};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_CLOSE};
 
 use crate::config::Config;
@@ -93,9 +93,8 @@ fn stop_running_instance() -> anyhow::Result<()> {
     // Window class name must match `platform::shutdown::install`.
     let class_wide: Vec<u16> = "ImmichSyncShutdown\0".encode_utf16().collect();
 
-    let hwnd = unsafe {
-        FindWindowW(PCWSTR(class_wide.as_ptr()), PCWSTR::null()).unwrap_or(HWND::default())
-    };
+    let hwnd =
+        unsafe { FindWindowW(PCWSTR(class_wide.as_ptr()), PCWSTR::null()).unwrap_or_default() };
 
     if hwnd.0.is_null() {
         info!("No running ImmichSync instance to stop");

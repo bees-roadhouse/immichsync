@@ -1,12 +1,6 @@
 pub mod albums;
 pub mod assets;
-pub mod auth;
 pub mod server;
-
-pub use albums::Album;
-pub use assets::{BulkCheckItem, BulkCheckResult, UploadResult};
-pub use auth::UserInfo;
-pub use server::ServerInfo;
 
 use reqwest::header::{HeaderMap, HeaderValue};
 use std::time::Duration;
@@ -45,11 +39,14 @@ pub enum ApiError {
 }
 
 /// Shared HTTP client that carries the base URL and API key for every request.
+///
+/// The API key is set as a default header on the underlying `reqwest::Client`
+/// at construction time, so every request inherits it automatically; we do
+/// not need to store the raw key after that point.
 #[derive(Clone, Debug)]
 pub struct ImmichClient {
     pub(crate) client: reqwest::Client,
     pub(crate) base_url: String,
-    pub(crate) api_key: String,
     /// Bandwidth limit in bytes/sec. 0 means unlimited.
     pub(crate) bandwidth_limit_bps: u64,
 }
@@ -101,7 +98,6 @@ impl ImmichClient {
         Ok(Self {
             client,
             base_url,
-            api_key,
             bandwidth_limit_bps: bandwidth_limit_kbps * 1024,
         })
     }

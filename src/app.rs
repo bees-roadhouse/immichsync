@@ -1014,8 +1014,6 @@ async fn initial_scan(
     store: Arc<dyn QueueStore>,
     folder_map: Arc<std::collections::HashMap<std::path::PathBuf, i64>>,
 ) {
-    use std::path::PathBuf;
-
     info!("Initial scan: starting");
 
     let store2 = store.clone();
@@ -1027,7 +1025,7 @@ async fn initial_scan(
     let folder_ignore_online: std::collections::HashMap<i64, bool> = {
         let store_ref = store.clone();
         let mut map = std::collections::HashMap::new();
-        for (_path, &id) in folder_map.as_ref() {
+        for &id in folder_map.values() {
             match store_ref.get_folder(id) {
                 Ok(Some(f)) => {
                     map.insert(id, f.ignore_online_files);
@@ -1076,7 +1074,7 @@ async fn initial_scan(
 
                     // Recurse into subdirectories, skipping trash.
                     if path.is_dir() {
-                        if path.file_name().map_or(false, |n| {
+                        if path.file_name().is_some_and(|n| {
                             n == crate::upload::worker::TRASH_DIR_NAME
                         }) {
                             continue;
@@ -1105,7 +1103,7 @@ async fn initial_scan(
                     }
 
                     // Log progress every 100 files.
-                    if scanned % 100 == 0 {
+                    if scanned.is_multiple_of(100) {
                         info!(scanned, enqueued, skipped, "Initial scan: progress");
                     }
                 }

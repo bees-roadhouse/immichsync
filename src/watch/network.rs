@@ -1,6 +1,6 @@
 // Network share watcher with fallback
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,8 +42,11 @@ trait AnyDebouncer: Send {
     fn stop(&mut self);
 }
 
-struct NativeDebouncer(Debouncer<notify::RecommendedWatcher, RecommendedCache>);
-struct PollDebouncer(Debouncer<PollWatcher, RecommendedCache>);
+// The wrapped debouncer is the lifecycle owner: dropping it tears the
+// underlying watcher down. Nothing else reads the inner value, hence the
+// dead-code allow.
+struct NativeDebouncer(#[allow(dead_code)] Debouncer<notify::RecommendedWatcher, RecommendedCache>);
+struct PollDebouncer(#[allow(dead_code)] Debouncer<PollWatcher, RecommendedCache>);
 
 impl AnyDebouncer for NativeDebouncer {
     fn stop(&mut self) {
@@ -226,11 +229,6 @@ impl NetworkWatcher {
         if let Ok(mut p) = self.probe_ack.lock() {
             p.take();
         }
-    }
-
-    /// Return the path being watched.
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     /// Cheap clone for probing — all inner state is already `Arc`-backed.

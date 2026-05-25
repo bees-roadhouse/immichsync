@@ -36,9 +36,6 @@ use worker::{AssetUploader, UploadWorker, WorkerConfig};
 
 #[derive(Debug, Error)]
 pub enum PipelineError {
-    #[error("Pipeline is not started; call start() first")]
-    NotStarted,
-
     #[error("Queue error: {0}")]
     Queue(#[from] queue::QueueError),
 
@@ -127,6 +124,12 @@ impl UploadPipeline {
     ///
     /// Returns `Ok(Some(id))` when a new queue entry was created, or
     /// `Ok(None)` when the file was skipped (already uploaded).
+    ///
+    /// Currently only exercised by the in-module test suite; production paths
+    /// drive the queue directly through `crate::app::initial_scan` and the
+    /// watcher. The pipeline keeps this entry point so the test coverage of
+    /// dedup + enqueue stays intact.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn submit(
         &self,
         path: PathBuf,
