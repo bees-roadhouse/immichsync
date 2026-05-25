@@ -1,32 +1,64 @@
 name: Generate Repo Artifacts
 
+# PR-driven SBOM + STRUCTURE regeneration.
+#
+# Runs on every PR targeting development or release. Regenerates SBOM.md
+# and STRUCTURE.md from the PR's head commit, and if anything changed,
+# commits + pushes the update directly onto the PR's head branch using
+# the workflow's GITHUB_TOKEN.
+#
+# Why PR-driven (not post-merge):
+#   - The PR that's about to merge carries the artifact update with it ...
+#     development is always in sync without a separate "chore: regenerate"
+#     PR chasing it.
+#   - No need for `can_approve_pull_request_reviews` org-level permission
+#     just to open a regen PR ... the workflow pushes directly to the PR
+#     branch, which only needs `contents: write` (already declared below
+#     and allowed at the repo level).
+#
+# Loop avoidance:
+#   - paths-ignore on SBOM.md/STRUCTURE.md so the workflow's own commit
+#     doesn't retrigger this workflow.
+#   - GitHub's default security model already prevents GITHUB_TOKEN-driven
+#     pushes from retriggering same-repo workflows (no PAT in use here).
+#   - Belt + suspenders: the commit step is a no-op when `git diff --quiet`
+#     reports no changes, so re-runs with identical state simply exit clean.
+#
+# Skipping:
+#   - Skip the entire job for PRs from forks (head_repository != base_repository).
+#     Fork PRs run with a read-only token and can't push back; running the job
+#     would just fail at the push step. Maintainer can regenerate post-merge.
+
 on:
-  push:
-    branches:
-      - development
-      - release
+  pull_request:
+    branches: [development, release]
+    types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore:
       - 'SBOM.md'
       - 'STRUCTURE.md'
-  schedule:
-    # Weekly refresh catches upstream license/version metadata changes
-    - cron: '0 6 * * 1'
-  workflow_dispatch:
 
 permissions:
   contents: write
-  pull-requests: write
 
 concurrency:
-  group: artifacts-${{ github.ref }}
+  group: artifacts-${{ github.head_ref }}
   cancel-in-progress: true
 
 jobs:
   generate:
+    name: Regenerate SBOM and STRUCTURE
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    if: github.event.pull_request.head.repo.full_name == github.repository
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+          # Use the workflow token so subsequent pushes are authenticated.
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install tooling
         run: sudo apt-get install -y tree jq
@@ -81,26 +113,17 @@ jobs:
           } > SBOM.md
           rm metadata.json
 
-      # Open a PR instead of pushing directly. The org-level Default Branch
-      # Protection ruleset requires PRs to the default branch, so the previous
-      # git-auto-commit-action push was rejected (GH006). Tracked in issue #14.
-      - name: Open PR with regenerated artifacts
-        uses: peter-evans/create-pull-request@v6
-        with:
-          branch: chore/regenerate-artifacts
-          base: ${{ github.ref_name }}
-          delete-branch: true
-          add-paths: |
-            SBOM.md
-            STRUCTURE.md
-          commit-message: "chore: regenerate SBOM and STRUCTURE"
-          committer: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
-          author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
-          title: "chore: regenerate SBOM and STRUCTURE"
-          body: |
-            Auto-generated regeneration of `SBOM.md` and `STRUCTURE.md` from commit ${{ github.sha }}.
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-            Triggered by: `${{ github.event_name }}` on `${{ github.ref_name }}`.
-          labels: |
-            type:enhancement
-            category:improvement
+          if git diff --quiet -- SBOM.md STRUCTURE.md; then
+            echo "No changes to SBOM.md or STRUCTURE.md ... nothing to commit."
+            exit 0
+          fi
+
+          git add SBOM.md STRUCTURE.md
+          git commit -m "chore: regenerate SBOM and STRUCTURE"
+          git push origin HEAD:${{ github.head_ref }}
+          echo "Pushed regenerated artifacts to PR branch ${{ github.head_ref }}."
