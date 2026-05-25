@@ -77,6 +77,41 @@ Removable devices:
 3. If no event within 5 seconds, switch to `PollWatcher` for that path
 4. Log the fallback so users understand the behavior
 
+### Watcher Health Monitoring & Auto-Restart
+
+The mode-selection health check above runs once at startup. `ReadDirectoryChangesW` can also silently die mid-run — a network share drops, a USB device unplugs without a clean `WM_DEVICECHANGE`, or notify's worker thread hits an unrecoverable error. To detect those, the engine spawns a background **health monitor** task that probes every active watcher periodically.
+
+**Probe mechanism** (same as the initial mode-selection check, applied repeatedly):
+
+1. Write a probe file named `.immichsync_watchcheck` into the watched directory.
+2. Wait for the watcher's normal event pipeline to emit the matching create/modify event. The handler short-circuits on this filename: it never reaches the upload pipeline.
+3. Native watchers: probe timeout = ~8s (debounce window + headroom). Poll watchers: timeout scales with `poll_interval + debounce + 5s`, so a healthy poll watcher isn't flagged on every probe.
+4. Probe interval: 60s per watcher.
+
+**State machine** (per `FolderWatcher` slot):
+
+```
+Healthy ──probe miss──> Degraded (miss_count == 1)
+Degraded ──probe miss──> Degraded (miss_count == 2) ──> restart()
+restart ok ──> Degraded (next probe verifies)
+restart ok + probe ok ──> Healthy
+restart fail ──> Degraded, restart_fail_count++ ──> retry next tick
+restart_fail_count == 3 ──> Failed (permanent; no further probes/restarts)
+```
+
+- **2 consecutive misses → restart.** Stop the dead watcher, drop it from the engine, re-canonicalise the path (in case a remount changed it), recreate from saved config, swap into the slot.
+- **3 consecutive restart failures → give up.** Mark the slot `Failed`, emit a `WatchEvent::Error` so the operator sees it in logs, and stop probing that path until the user reloads config or restarts the app.
+
+**Tray surfacing:**
+
+| Engine health | Tray state |
+|---|---|
+| `Healthy` | `Idle` (green) or `Syncing` (blue) per queue stats |
+| `Degraded` (any restart in progress) | `Error` (red) with "watcher degraded — auto-restart in progress" if idle; stays on `Syncing` if uploads are flowing |
+| `Failed` (any permanent failure) | `Error` (red) with "one or more watchers are offline" |
+
+This is complementary to the **DB-vs-engine reconcile pass** (every 2s): that one converges the watched-folder *set* against the DB; this one converges each watcher's *liveness* against reality.
+
 ### File Filtering
 
 **Include by default:**
