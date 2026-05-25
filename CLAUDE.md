@@ -91,12 +91,19 @@ cargo test
 
 Follows the DevOps book standards: [Branching Strategy](https://kb.beesroadhouse.com/books/developer-operations-devops/page/branching-strategy), [Change Taxonomy](https://kb.beesroadhouse.com/books/developer-operations-devops/page/change-taxonomy), [PR Merge Strategy](https://kb.beesroadhouse.com/books/developer-operations-devops/page/pr-merge-strategy), [Issue Workflow](https://kb.beesroadhouse.com/books/developer-operations-devops/page/issue-workflow).
 
-- `development` is the default branch (always shippable, direct pushes allowed)
-- `release` is the only protected branch (org ruleset)
-- Work branches: `feature/`, `improvement/`, `refactor/`, `bug/`
-- One discrete change per PR; rebase onto `development` before merge
-- **Squash-and-merge** for work-branch → `development`. **Merge commit** for `development` → `release` (squashing the release transition breaks ancestor relationship)
-- `BREAKING:` prefix in PR title forces a major version bump regardless of type
+- `development` is the default branch (always shippable). All changes land via PR — the org `Default Branch Protection` ruleset (id 15744970) requires 1 approving review + thread resolution and rejects direct pushes with `GH013`.
+- `release` is also PR-protected by the org `Release Branch Protection` ruleset (id 15553415), which targets `refs/heads/release`, `refs/heads/release/*`, and `refs/heads/release-*`.
+- Work branches: `feature/`, `improvement/`, `refactor/`, `bug/`.
+- One discrete change per PR; rebase onto `development` before merge.
+- **Squash-and-merge** for work-branch → `development`. **Merge commit** for `development` → `release` (squashing the release transition breaks ancestor relationship).
+- `BREAKING:` prefix in PR title forces a major version bump regardless of type.
+- Standard PR-create incantation (auto-merge once review + required checks pass):
+  ```bash
+  gh pr create --base development --head <branch> --title "..." --body "..."
+  gh pr merge --auto --squash --delete-branch
+  ```
+  Use `--admin --squash --delete-branch` instead for the documented "small touchups" OrganizationAdmin bypass (docs typos, link fixes, version-bump-only PRs). See [Branching Strategy](https://kb.beesroadhouse.com/books/developer-operations-devops/page/branching-strategy) for the full policy.
+- Required status checks on this repo (per repo-level ruleset id 16845497): `Build & test` (ci.yml) AND `Regenerate SBOM and STRUCTURE` (generate-artifacts.yml).
 
 ### Two-Tier Labels
 
