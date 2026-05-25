@@ -353,10 +353,12 @@ impl App {
                         continue;
                     }
                     let is_network = folder.watch_mode == crate::db::WatchMode::Poll;
-                    let includes =
-                        crate::watch::filter::parse_patterns_json(folder.include_patterns.as_deref());
-                    let excludes =
-                        crate::watch::filter::parse_patterns_json(folder.exclude_patterns.as_deref());
+                    let includes = crate::watch::filter::parse_patterns_json(
+                        folder.include_patterns.as_deref(),
+                    );
+                    let excludes = crate::watch::filter::parse_patterns_json(
+                        folder.exclude_patterns.as_deref(),
+                    );
                     let filter = FileFilter::new()
                         .with_include_patterns(includes)
                         .with_exclude_patterns(excludes)
@@ -547,19 +549,53 @@ impl App {
             return;
         }
 
+        // Watcher health takes precedence over queue stats: if any watcher
+        // is permanently failed (or degraded after probe misses) we want
+        // the tray to advertise that, not "Idle".
+        let engine_health = self
+            .watch_engine
+            .as_ref()
+            .map(|e| e.health())
+            .unwrap_or(crate::watch::EngineHealth::Healthy);
+
         if let Some(ref pipeline) = self.pipeline {
             if let Ok(stats) = pipeline.stats() {
                 if let Some(ref mut tray) = self.tray {
                     let active = stats.uploading + stats.pending;
                     let is_syncing = active > 0;
 
-                    if is_syncing {
-                        tray.update_state(TrayState::Syncing {
-                            current: stats.uploading as u32,
-                            total: active as u32,
-                        });
-                    } else {
-                        tray.update_state(TrayState::Idle);
+                    match engine_health {
+                        crate::watch::EngineHealth::Failed => {
+                            tray.update_state(TrayState::Error(
+                                "one or more watchers are offline".to_owned(),
+                            ));
+                        }
+                        crate::watch::EngineHealth::Degraded => {
+                            // Stay on the syncing icon if uploads are
+                            // flowing; otherwise advertise the degraded
+                            // state via the Error tray channel (yellow
+                            // would conflict with Paused).
+                            if is_syncing {
+                                tray.update_state(TrayState::Syncing {
+                                    current: stats.uploading as u32,
+                                    total: active as u32,
+                                });
+                            } else {
+                                tray.update_state(TrayState::Error(
+                                    "watcher degraded — auto-restart in progress".to_owned(),
+                                ));
+                            }
+                        }
+                        crate::watch::EngineHealth::Healthy => {
+                            if is_syncing {
+                                tray.update_state(TrayState::Syncing {
+                                    current: stats.uploading as u32,
+                                    total: active as u32,
+                                });
+                            } else {
+                                tray.update_state(TrayState::Idle);
+                            }
+                        }
                     }
 
                     // Detect Syncing → Idle transition for notification.

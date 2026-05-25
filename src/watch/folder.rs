@@ -11,6 +11,12 @@ use tracing::{debug, error, info, warn};
 
 use crate::watch::filter::FileFilter;
 
+/// Filename of the probe file used by the periodic liveness check.
+///
+/// Both [`FolderWatcher`] and `NetworkWatcher` filter this name out of their
+/// regular event flow so it never reaches the upload pipeline.
+pub const PROBE_FILENAME: &str = ".immichsync_watchcheck";
+
 /// Events emitted by any watcher and consumed by the upload pipeline.
 #[derive(Debug, Clone)]
 pub enum WatchEvent {
@@ -33,6 +39,12 @@ const STABILITY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Maximum time we will wait for a file to become stable before giving up.
 const MAX_WRITE_WAIT: Duration = Duration::from_secs(30);
 
+/// Default per-probe timeout used by the health monitor.
+///
+/// `notify`'s debouncer holds events for [`DEBOUNCE_WINDOW`] (2s) before
+/// flushing, so probes must wait at least that long plus headroom.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// A local-folder watcher that uses the platform's native filesystem
 /// notification API (via `notify`) with a debounce layer on top.
 ///
@@ -49,6 +61,10 @@ pub struct FolderWatcher {
     /// The debouncer handle — kept alive so the watcher keeps running.
     /// `None` before `start()` or after `stop()`.
     debouncer: Arc<Mutex<Option<Debouncer<notify::RecommendedWatcher, RecommendedCache>>>>,
+    /// Probe-ack channel slot used by the periodic health check.
+    /// `Some(sender)` while a probe is outstanding; the handler takes the
+    /// sender out and signals once when the probe event lands.
+    probe_ack: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 impl FolderWatcher {
@@ -70,6 +86,7 @@ impl FolderWatcher {
             event_tx,
             rt_handle,
             debouncer: Arc::new(Mutex::new(None)),
+            probe_ack: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -83,6 +100,7 @@ impl FolderWatcher {
         let tx = self.event_tx.clone();
         let watch_path = self.path.clone();
         let rt = self.rt_handle.clone();
+        let probe_ack = Arc::clone(&self.probe_ack);
 
         // The debouncer callback runs on a thread owned by notify — NOT a
         // tokio thread. We use the runtime handle to spawn async tasks from
@@ -100,6 +118,21 @@ impl FolderWatcher {
                         }
 
                         for path in event.event.paths.clone() {
+                            // Probe-file events: signal the health monitor
+                            // and never forward them to the upload pipeline.
+                            if path
+                                .file_name()
+                                .map(|n| n == PROBE_FILENAME)
+                                .unwrap_or(false)
+                            {
+                                if let Ok(mut guard) = probe_ack.lock() {
+                                    if let Some(tx) = guard.take() {
+                                        let _ = tx.send(());
+                                    }
+                                }
+                                continue;
+                            }
+
                             // Only consider regular files
                             if !path.is_file() {
                                 continue;
@@ -156,6 +189,82 @@ impl FolderWatcher {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Cheap clone for probing — all inner state is already `Arc`-backed.
+    /// Used by the engine's health monitor so it can call [`probe`] without
+    /// holding the engine slot lock.
+    pub(super) fn shallow_clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            filter: Arc::clone(&self.filter),
+            event_tx: self.event_tx.clone(),
+            rt_handle: self.rt_handle.clone(),
+            debouncer: Arc::clone(&self.debouncer),
+            probe_ack: Arc::clone(&self.probe_ack),
+        }
+    }
+
+    /// Run a single liveness probe: touch the probe file inside the watched
+    /// directory and wait for the corresponding event to come back through
+    /// the debouncer.
+    ///
+    /// Returns `Ok(true)` if the event arrived within [`PROBE_TIMEOUT`],
+    /// `Ok(false)` on timeout, and `Err` if the probe file could not be
+    /// written (path missing, permission denied, share offline, etc.) — those
+    /// are also treated as a probe miss by the engine but surface the cause.
+    pub async fn probe(&self) -> anyhow::Result<bool> {
+        run_filesystem_probe(&self.path, &self.probe_ack).await
+    }
+}
+
+/// Shared probe implementation used by both `FolderWatcher` and the
+/// `NetworkWatcher` (native mode). Writes the probe file, awaits the ack on
+/// the watcher's `probe_ack` slot, and cleans up on the way out.
+pub(crate) async fn run_filesystem_probe(
+    path: &Path,
+    probe_ack: &Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+) -> anyhow::Result<bool> {
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    // Install the ack sender. If a previous probe is still outstanding we
+    // replace it; the old sender drops and its receiver gets a `RecvError`,
+    // which the previous caller already treats as a timeout.
+    {
+        let mut guard = probe_ack
+            .lock()
+            .map_err(|_| anyhow::anyhow!("probe_ack mutex poisoned"))?;
+        *guard = Some(ack_tx);
+    }
+
+    let probe_path = path.join(PROBE_FILENAME);
+    let write_result = tokio::fs::write(&probe_path, b"immichsync").await;
+
+    if let Err(e) = write_result {
+        // Drop the pending ack so a stale sender doesn't hang around.
+        if let Ok(mut guard) = probe_ack.lock() {
+            guard.take();
+        }
+        return Err(anyhow::anyhow!(
+            "Probe write to {:?} failed: {}",
+            probe_path,
+            e
+        ));
+    }
+
+    let result = match tokio::time::timeout(PROBE_TIMEOUT, ack_rx).await {
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(_)) | Err(_) => {
+            // Timeout or sender dropped — clear the slot if it's still our sender.
+            if let Ok(mut guard) = probe_ack.lock() {
+                guard.take();
+            }
+            Ok(false)
+        }
+    };
+
+    // Best-effort cleanup; ignore errors (file may already be gone).
+    let _ = tokio::fs::remove_file(&probe_path).await;
+
+    result
 }
 
 /// Perform write-completion detection and, if successful, send

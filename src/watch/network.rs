@@ -12,7 +12,9 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::watch::filter::FileFilter;
-use crate::watch::folder::{write_complete_and_send, WatchEvent};
+use crate::watch::folder::{
+    run_filesystem_probe, write_complete_and_send, WatchEvent, PROBE_FILENAME, PROBE_TIMEOUT,
+};
 
 /// How long to wait for the health-check file event before falling back to polling.
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -20,8 +22,12 @@ const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Debounce window used for both the native and poll watchers.
 const DEBOUNCE_WINDOW: Duration = Duration::from_secs(2);
 
-/// Name of the temporary file created during the native-watcher health check.
-const HEALTH_CHECK_FILENAME: &str = ".immichsync_watchcheck";
+/// Backwards-compatible alias for the probe filename.
+///
+/// The mode-selection health check at `start()` and the periodic liveness
+/// probe both use the same well-known name so a single filter check in the
+/// event handler keeps it out of the upload pipeline.
+const HEALTH_CHECK_FILENAME: &str = PROBE_FILENAME;
 
 /// Which underlying watch strategy is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +79,13 @@ pub struct NetworkWatcher {
     rt_handle: tokio::runtime::Handle,
     /// The live debouncer; `None` when stopped.
     debouncer: Arc<Mutex<Option<Box<dyn AnyDebouncer>>>>,
+    /// Which underlying watch strategy is currently active.
+    /// `None` until `start()` chooses one. Reads outside this module are
+    /// only used by the periodic health probe to size its timeout.
+    mode: Arc<Mutex<Option<WatchMode>>>,
+    /// Probe-ack slot used by the periodic liveness check (mirrors the
+    /// `FolderWatcher` field).
+    probe_ack: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 impl NetworkWatcher {
@@ -97,6 +110,8 @@ impl NetworkWatcher {
             poll_interval,
             rt_handle,
             debouncer: Arc::new(Mutex::new(None)),
+            mode: Arc::new(Mutex::new(None)),
+            probe_ack: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -125,7 +140,77 @@ impl NetworkWatcher {
             }
         }
 
+        if let Ok(mut guard) = self.mode.lock() {
+            *guard = Some(mode);
+        }
+
         Ok(())
+    }
+
+    /// Return the active watch strategy, if any.
+    ///
+    /// `None` before [`start`][Self::start] succeeds or after [`stop`][Self::stop].
+    pub fn mode(&self) -> Option<WatchMode> {
+        self.mode.lock().ok().and_then(|g| *g)
+    }
+
+    /// The timeout the health monitor should use when probing this watcher.
+    ///
+    /// Native mode pays only the debouncer delay, so [`PROBE_TIMEOUT`] is fine.
+    /// Poll mode needs `poll_interval + DEBOUNCE_WINDOW` plus headroom so a
+    /// healthy poll watcher doesn't get flagged on every probe.
+    pub fn probe_timeout(&self) -> Duration {
+        match self.mode() {
+            Some(WatchMode::Poll) => self.poll_interval + DEBOUNCE_WINDOW + Duration::from_secs(5),
+            _ => PROBE_TIMEOUT,
+        }
+    }
+
+    /// Run a single liveness probe (see [`FolderWatcher::probe`]).
+    pub async fn probe(&self) -> anyhow::Result<bool> {
+        // For poll-mode we need a longer window than the shared probe helper
+        // hard-codes; reuse the helper for native mode and roll our own for
+        // poll mode.
+        match self.mode() {
+            Some(WatchMode::Poll) => self.probe_with_timeout(self.probe_timeout()).await,
+            _ => run_filesystem_probe(&self.path, &self.probe_ack).await,
+        }
+    }
+
+    async fn probe_with_timeout(&self, timeout: Duration) -> anyhow::Result<bool> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        {
+            let mut guard = self
+                .probe_ack
+                .lock()
+                .map_err(|_| anyhow::anyhow!("probe_ack mutex poisoned"))?;
+            *guard = Some(ack_tx);
+        }
+
+        let probe_path = self.path.join(PROBE_FILENAME);
+        if let Err(e) = tokio::fs::write(&probe_path, b"immichsync").await {
+            if let Ok(mut guard) = self.probe_ack.lock() {
+                guard.take();
+            }
+            return Err(anyhow::anyhow!(
+                "Probe write to {:?} failed: {}",
+                probe_path,
+                e
+            ));
+        }
+
+        let result = match tokio::time::timeout(timeout, ack_rx).await {
+            Ok(Ok(())) => Ok(true),
+            _ => {
+                if let Ok(mut guard) = self.probe_ack.lock() {
+                    guard.take();
+                }
+                Ok(false)
+            }
+        };
+
+        let _ = tokio::fs::remove_file(&probe_path).await;
+        result
     }
 
     /// Stop watching and release all resources.
@@ -135,11 +220,31 @@ impl NetworkWatcher {
             d.stop();
             info!("Network watcher stopped: {:?}", self.path);
         }
+        if let Ok(mut m) = self.mode.lock() {
+            *m = None;
+        }
+        if let Ok(mut p) = self.probe_ack.lock() {
+            p.take();
+        }
     }
 
     /// Return the path being watched.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Cheap clone for probing — all inner state is already `Arc`-backed.
+    pub(super) fn shallow_clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            filter: Arc::clone(&self.filter),
+            event_tx: self.event_tx.clone(),
+            poll_interval: self.poll_interval,
+            rt_handle: self.rt_handle.clone(),
+            debouncer: Arc::clone(&self.debouncer),
+            mode: Arc::clone(&self.mode),
+            probe_ack: Arc::clone(&self.probe_ack),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -224,7 +329,12 @@ impl NetworkWatcher {
         let tx = self.event_tx.clone();
         let watch_path = self.path.clone();
 
-        let handler = build_handler(filter, tx, self.rt_handle.clone());
+        let handler = build_handler(
+            filter,
+            tx,
+            self.rt_handle.clone(),
+            Arc::clone(&self.probe_ack),
+        );
 
         let mut debouncer = new_debouncer(DEBOUNCE_WINDOW, None, handler)
             .map_err(|e| anyhow::anyhow!("Failed to create native debouncer: {}", e))?;
@@ -243,7 +353,12 @@ impl NetworkWatcher {
         let watch_path = self.path.clone();
         let poll_interval = self.poll_interval;
 
-        let handler = build_handler(filter, tx, self.rt_handle.clone());
+        let handler = build_handler(
+            filter,
+            tx,
+            self.rt_handle.clone(),
+            Arc::clone(&self.probe_ack),
+        );
 
         // `new_debouncer_opt` lets us supply custom notify::Config so we can
         // specify the poll interval, and infers T = PollWatcher from the
@@ -275,6 +390,7 @@ fn build_handler(
     filter: Arc<FileFilter>,
     tx: mpsc::Sender<WatchEvent>,
     rt: tokio::runtime::Handle,
+    probe_ack: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 ) -> impl FnMut(DebounceEventResult) + Send + 'static {
     move |result: DebounceEventResult| match result {
         Ok(events) => {
@@ -288,16 +404,22 @@ fn build_handler(
                 }
 
                 for path in event.event.paths.clone() {
-                    if !path.is_file() {
-                        continue;
-                    }
-
-                    // Never forward the transient health-check file.
+                    // Probe-file events: signal the health monitor, never
+                    // forward to the upload pipeline.
                     if path
                         .file_name()
                         .map(|n| n == HEALTH_CHECK_FILENAME)
                         .unwrap_or(false)
                     {
+                        if let Ok(mut guard) = probe_ack.lock() {
+                            if let Some(tx) = guard.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                        continue;
+                    }
+
+                    if !path.is_file() {
                         continue;
                     }
 
