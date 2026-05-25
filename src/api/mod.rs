@@ -9,6 +9,7 @@ pub use auth::UserInfo;
 pub use server::ServerInfo;
 
 use reqwest::header::{HeaderMap, HeaderValue};
+use std::time::Duration;
 use thiserror::Error;
 
 /// All errors that can arise from Immich API calls.
@@ -79,8 +80,21 @@ impl ImmichClient {
         // default means callers never have to remember to add it.
         default_headers.insert("x-api-key", key_value);
 
+        // Timeouts/keep-alive tuned for streaming uploads of large files (50GB+ videos):
+        // - No overall .timeout() — a 50GB upload at 10MB/s legitimately takes ~83 minutes.
+        // - read_timeout: 120s without any bytes flowing = dead connection, abort fast.
+        // - connect_timeout: 30s to establish TCP+TLS is plenty on any non-pathological link.
+        // - tcp_keepalive: 60s probes keep middleboxes (firewalls, NATs) from idle-closing
+        //   the connection during long uploads. Without this, a quiet TCP stream is silently
+        //   reaped by a firewall and read_timeout takes the full 120s to notice.
+        // - pool_idle_timeout: 120s caps how long an idle connection stays in the pool
+        //   before a fresh one is opened on next use.
         let client = reqwest::Client::builder()
             .default_headers(default_headers)
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(120))
+            .tcp_keepalive(Duration::from_secs(60))
+            .pool_idle_timeout(Duration::from_secs(120))
             .build()
             .map_err(ApiError::Network)?;
 

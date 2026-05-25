@@ -346,6 +346,54 @@ async fn process_item(
         }
     };
 
+    // On retry, ask the server whether it already has this asset before
+    // re-uploading. Catches the case where a prior attempt completed
+    // server-side but the connection died before the client got the
+    // response — without this pre-check we'd re-upload the whole file
+    // (potentially 50+ GB) for nothing. Skipped on the first attempt
+    // because the local DB dedup table already covers that path.
+    if entry.retry_count > 0 {
+        if let Some(checksum) = entry.file_hash.as_deref() {
+            let check = uploader
+                .check_duplicates(vec![BulkCheckItem {
+                    id: device_asset_id.clone(),
+                    checksum: checksum.to_string(),
+                }])
+                .await;
+            match check {
+                Ok(results) => {
+                    if let Some(r) = results.first() {
+                        if r.exists {
+                            info!(
+                                id = entry.id,
+                                attempt = entry.retry_count,
+                                asset_id = ?r.asset_id,
+                                "Pre-check: server already has this asset, skipping re-upload"
+                            );
+                            if let Err(e) = store.mark_completed(entry.id, r.asset_id.as_deref()) {
+                                error!(
+                                    id = entry.id,
+                                    error = %e,
+                                    "Failed to mark entry completed after server-side pre-check"
+                                );
+                            }
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Pre-check is best-effort — if it fails, fall through and
+                    // attempt the upload normally.
+                    warn!(
+                        id = entry.id,
+                        error = %e,
+                        "Pre-check before retry failed; proceeding with full upload"
+                    );
+                }
+            }
+        }
+    }
+
     // Attempt the upload.
     let result = uploader
         .upload_asset(
