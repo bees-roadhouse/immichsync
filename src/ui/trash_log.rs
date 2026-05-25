@@ -16,7 +16,8 @@ pub fn show_trash_log(db: Arc<DbStore>) {
         })),
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([700.0, 420.0])
-            .with_title("ImmichSync — Trash"),
+            .with_title("ImmichSync — Trash")
+            .with_icon(crate::ui::window_icon::brand_icon_data()),
         ..Default::default()
     };
 

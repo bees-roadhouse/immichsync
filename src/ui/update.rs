@@ -42,7 +42,8 @@ pub fn run_update_dialog(info_path: &str) {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([460.0, 360.0])
             .with_title("ImmichSync Update")
-            .with_resizable(false),
+            .with_resizable(false)
+            .with_icon(crate::ui::window_icon::brand_icon_data()),
         ..Default::default()
     };
 

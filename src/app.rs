@@ -61,6 +61,17 @@ pub struct App {
     pending_update: Option<UpdateInfo>,
     /// Set to true once the update has been downloaded and applied.
     update_ready: bool,
+    /// When the last server-reachability ping fired. The tray's Offline state
+    /// is driven by this ... a single failed ping flips us to Offline, and
+    /// a successful ping (or starting an upload, since uploads imply
+    /// reachability) clears it.
+    last_ping_at: Instant,
+    /// Receiver for async ping results. `Ok(true)` = reachable, anything else
+    /// = unreachable.
+    ping_rx: Option<std::sync::mpsc::Receiver<bool>>,
+    /// Latched offline state. The tray icon and tooltip key off this when
+    /// no upload is in flight.
+    server_offline: bool,
 }
 
 /// Tracks whether each type of UI window is currently open, preventing
@@ -117,6 +128,9 @@ impl App {
             last_update_check: Instant::now(),
             pending_update: None,
             update_ready: false,
+            last_ping_at: Instant::now(),
+            ping_rx: None,
+            server_offline: false,
         }
     }
 
@@ -267,8 +281,18 @@ impl App {
                 self.schedule_update_check(false);
             }
 
+            // Periodic server-reachability check. Drives the Offline tray state.
+            self.poll_ping_result();
+            self.maybe_schedule_ping();
+
             // Periodically refresh tray with queue statistics.
             self.update_tray_stats();
+
+            // Advance the syncing-state icon animation. Cheap when not
+            // syncing (early-returns on the absence of a scheduled deadline).
+            if let Some(ref mut tray) = self.tray {
+                tray.tick_animation();
+            }
 
             // Periodically reconcile the WatchEngine's view of watched folders
             // against the DB. The Settings subprocess mutates the DB without
@@ -588,10 +612,15 @@ impl App {
                         }
                         crate::watch::EngineHealth::Healthy => {
                             if is_syncing {
+                                // Active uploads override the Offline display ...
+                                // if we're actually moving bytes, by definition
+                                // the server is reachable.
                                 tray.update_state(TrayState::Syncing {
                                     current: stats.uploading as u32,
                                     total: active as u32,
                                 });
+                            } else if self.server_offline {
+                                tray.update_state(TrayState::Offline);
                             } else {
                                 tray.update_state(TrayState::Idle);
                             }
@@ -605,6 +634,70 @@ impl App {
                     }
                     self.was_syncing = is_syncing;
                 }
+            }
+        }
+    }
+
+    /// Periodically ping the Immich server to detect outages. Drives the
+    /// Offline tray state.
+    ///
+    /// Cadence: every `PING_INTERVAL` (30s). One in-flight ping at a time ...
+    /// `ping_rx` being Some means we're waiting on the previous one.
+    fn maybe_schedule_ping(&mut self) {
+        const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+        if self.ping_rx.is_some() {
+            return; // a ping is already in flight
+        }
+        if self.last_ping_at.elapsed() < PING_INTERVAL {
+            return;
+        }
+        let Some(ref client) = self.client else {
+            return; // no client configured ... nothing to ping
+        };
+
+        self.last_ping_at = Instant::now();
+        let client = client.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ping_rx = Some(rx);
+        self.runtime.spawn(async move {
+            let ok = client.ping().await.unwrap_or(false);
+            let _ = tx.send(ok);
+        });
+    }
+
+    /// Poll the in-flight ping channel and update `server_offline`.
+    fn poll_ping_result(&mut self) {
+        let Some(rx) = self.ping_rx.as_ref() else {
+            return;
+        };
+        let Ok(ok) = rx.try_recv() else {
+            return;
+        };
+        self.ping_rx = None;
+
+        if ok {
+            if self.server_offline {
+                info!("Server reachable again ... clearing Offline state");
+            }
+            self.server_offline = false;
+        } else if !self.server_offline {
+            warn!("Server ping failed ... switching to Offline state");
+            self.server_offline = true;
+        } else {
+            self.server_offline = true;
+        }
+
+        // Reflect the new reachability in the tray menu's server line.
+        if let Some(ref mut tray) = self.tray {
+            let url_display = self
+                .config
+                .server
+                .url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://");
+            if !url_display.is_empty() {
+                tray.set_server_status(url_display, !self.server_offline);
             }
         }
     }

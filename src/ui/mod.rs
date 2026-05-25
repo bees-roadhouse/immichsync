@@ -10,6 +10,7 @@ pub mod trash_log;
 pub mod tray;
 pub mod update;
 pub mod upload_log;
+pub mod window_icon;
 
 // Re-export the primary public surface so callers can write `ui::TrayApp`
 // instead of `ui::tray::TrayApp`.

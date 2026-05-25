@@ -314,16 +314,47 @@ CREATE INDEX idx_queue_status ON upload_queue(status);
 
 ## System Tray & UI
 
-### Tray Icon States
+### Brand Icon Pipeline
 
-| State | Icon | Description |
-|-------|------|-------------|
-| Idle | Green circle | Connected, watching, nothing to upload |
-| Syncing | Blue animated arrow | Actively uploading |
-| Queued | Blue dot | Items in queue, uploading |
-| Paused | Yellow bars | User paused |
-| Error | Red X | Server unreachable or auth failed |
-| Offline | Gray circle | No server connection |
+The application ships a single brand mark ... the six-blade shutter wheel at
+`assets/icon-source.webp` (1232x1232, purple/green/orange/teal/maroon/yellow
+blades on a white background). `build.rs` is the canonical icon generator;
+nothing in the runtime binary decodes images.
+
+At build time `build.rs` reads the source webp and emits, into
+`OUT_DIR/icons/`:
+
+| Output | Purpose |
+|---|---|
+| `icon.ico` | Multi-resolution (16, 24, 32, 48, 64, 128, 256), PNG-compressed entries. Embedded as the EXE's Windows resource icon via `winresource`. Drives Explorer thumbnails, Apps & Features `DisplayIcon`, pinned-shortcut icons, and the taskbar fallback. |
+| `tray_idle.rgba` | 32x32 RGBA8 raw bitmap. The canonical static brand mark. Also used for every eframe window's title-bar icon (Settings, Install, About, etc.) via `egui::IconData`. |
+| `tray_offline.rgba` | 32x32 RGBA8 raw bitmap. Desaturated blades with a red circle + white diagonal-slash badge stamped in the bottom-right corner (Slack/Teams disconnect convention ... the badge is the load-bearing signal). |
+| `tray_rot_00..11.rgba` | 12 frames of the idle bitmap rotated clockwise in 30-degree increments. Used for the syncing animation. Frame 0 is byte-identical to `tray_idle.rgba` so transitioning to/from idle is visually invisible. |
+
+Build-time deps: `image` (webp decode + Lanczos3 resize), `ico` (.ico writer),
+`winresource` (Windows resource embedder). Runtime deps: none ... the binary
+just `include_bytes!`'s the pre-decoded RGBA blobs and feeds them straight to
+`tray_icon::Icon::from_rgba` / `egui::IconData`.
+
+### Tray State Machine
+
+Five logical states. The icon, tooltip, and status-menu text are derived from
+the state; transitions are gated through `TrayApp::update_state`.
+
+| State | Icon (static) | Driven by |
+|---|---|---|
+| `Idle` | `tray_idle.rgba` | App startup; queue empty, server reachable |
+| `Syncing { current, total }` | `tray_rot_*.rgba`, cycled every 100ms (1.2s per full revolution) | `pipeline.stats()` reports `uploading + pending > 0` |
+| `Paused` | `tray_offline.rgba` | User clicked Pause Sync |
+| `Error(msg)` | `tray_offline.rgba` | Server unconfigured at startup, or other unrecoverable client init failure |
+| `Offline` | `tray_offline.rgba` | Periodic server ping (`/api/server/ping`, every 30s) fails. Clears the moment a ping succeeds OR an upload starts (uploads imply reachability). |
+
+Two transition rules deserve a callout:
+
+* **`Syncing -> not-Syncing` snaps the rotation cursor back to frame 0.** Without this, entering and exiting Syncing would leave the static idle icon momentarily rotated, then jerk back to upright. Frame 0 is byte-identical to the idle bitmap, so the swap is invisible.
+* **`Syncing` wins over `Offline`.** If we're actually moving bytes, the server is reachable by definition. The Offline overlay only shows when the queue is also drained.
+
+Animation drive: `app.rs::run` calls `TrayApp::tick_animation()` on every main-loop pass (~20Hz). When in Syncing state, that function checks an internal deadline (set 100ms ahead on entry) and advances the frame index modulo 12 if the deadline has passed. Outside Syncing it's a cheap early-return on `Option<Instant>::None`. Long stalls skip frames rather than playing catch-up.
 
 ### Tray Context Menu
 

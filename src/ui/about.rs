@@ -17,7 +17,8 @@ pub fn show_about() {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([340.0, 220.0])
             .with_title("About ImmichSync")
-            .with_resizable(false),
+            .with_resizable(false)
+            .with_icon(crate::ui::window_icon::brand_icon_data()),
         ..Default::default()
     };
 
