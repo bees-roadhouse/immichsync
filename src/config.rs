@@ -226,24 +226,13 @@ impl Default for AdvancedConfig {
 /// Stored at `%APPDATA%\bees-roadhouse\immichsync\config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Config {
     pub server: ServerConfig,
     pub upload: UploadConfig,
     pub devices: DevicesConfig,
     pub ui: UiConfig,
     pub advanced: AdvancedConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            upload: UploadConfig::default(),
-            devices: DevicesConfig::default(),
-            ui: UiConfig::default(),
-            advanced: AdvancedConfig::default(),
-        }
-    }
 }
 
 impl Config {

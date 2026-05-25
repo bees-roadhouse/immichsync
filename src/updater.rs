@@ -83,9 +83,6 @@ pub enum UpdateError {
 
     #[error("file error: {0}")]
     File(#[from] std::io::Error),
-
-    #[error("update cancelled")]
-    Cancelled,
 }
 
 // ─── Check ───────────────────────────────────────────────────────────────────
@@ -193,7 +190,7 @@ where
 
     use std::io::{Read, Write};
     loop {
-        let n = response.read(&mut buf).map_err(|e| UpdateError::File(e))?;
+        let n = response.read(&mut buf).map_err(UpdateError::File)?;
         if n == 0 {
             break;
         }

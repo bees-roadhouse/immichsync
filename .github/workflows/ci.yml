@@ -71,11 +71,12 @@ jobs:
         env:
           CARGO_TARGET_DIR: target
 
-      - name: Clippy (informational)
-        # Not gating yet — codebase has known dead-code warnings to clean up.
-        # Track in repo issues; flip to `-D warnings` once clean.
-        continue-on-error: true
-        run: cargo clippy --all-targets -- -W clippy::all
+      - name: Clippy
+        # Gating after issue #9 cleaned up the accumulated dead-code and
+        # unused-import warnings. `-D warnings` promotes every clippy lint
+        # to an error so we catch regressions in PR rather than letting them
+        # pile up again.
+        run: cargo clippy --all-targets -- -D warnings
         env:
           CARGO_TARGET_DIR: target
 

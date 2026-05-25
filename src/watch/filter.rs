@@ -76,6 +76,7 @@ impl FileFilter {
     /// When any include patterns are set, a file must match **at least one**
     /// of them to be included (in addition to passing the extension/exclusion
     /// checks). Patterns that fail to compile are logged and skipped.
+    #[cfg(test)]
     pub fn with_include_patterns(mut self, patterns: Vec<String>) -> Self {
         self.include_patterns = patterns
             .into_iter()
@@ -94,6 +95,7 @@ impl FileFilter {
     ///
     /// If a file matches **any** of these patterns it is excluded, even if it
     /// would otherwise pass all other checks.
+    #[cfg(test)]
     pub fn with_exclude_patterns(mut self, patterns: Vec<String>) -> Self {
         self.exclude_patterns = patterns
             .into_iter()
@@ -109,6 +111,7 @@ impl FileFilter {
     }
 
     /// Override the minimum file size threshold (bytes).
+    #[cfg(test)]
     pub fn with_min_size(mut self, bytes: u64) -> Self {
         self.min_size = bytes;
         self

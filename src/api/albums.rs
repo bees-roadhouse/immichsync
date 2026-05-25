@@ -16,18 +16,6 @@ pub struct Album {
 
     /// Human-readable album name.
     pub album_name: String,
-
-    /// Number of assets in the album.
-    #[serde(default)]
-    pub asset_count: u64,
-
-    /// Description / subtitle set on the album.
-    #[serde(default)]
-    pub description: String,
-
-    /// UUID of the user who owns the album.
-    #[serde(default)]
-    pub owner_id: String,
 }
 
 // ---------------------------------------------------------------------------

@@ -4,7 +4,6 @@
 // provided; the entire application targets Windows 10/11.
 
 pub mod autostart;
-pub mod drives;
 pub mod encryption;
 pub mod install;
 pub mod known_folders;
@@ -22,13 +21,9 @@ pub const APP_USER_MODEL_ID: &str = "BeesRoadhouse.ImmichSync";
 // callers can write `platform::SingleInstance` instead of
 // `platform::single_instance::SingleInstance`.
 
-pub use autostart::{is_autostart_enabled, set_autostart, AutostartError};
-pub use drives::{has_dcim_folder, list_drives, DriveInfo, DriveType};
-pub use encryption::{decrypt_api_key, encrypt_api_key, is_encrypted, EncryptionError};
+pub use autostart::set_autostart;
 pub use install::{
     install_exe, installed_exe_path, is_running_installed, migrate_legacy_data, relaunch_installed,
-    running_version,
 };
-pub use known_folders::{get_pictures_folder, KnownFolderError};
-pub use shortcuts::{create_desktop_shortcut, create_start_menu_shortcut, ShortcutError};
-pub use single_instance::{SingleInstance, SingleInstanceError};
+pub use shortcuts::{create_desktop_shortcut, create_start_menu_shortcut};
+pub use single_instance::SingleInstance;

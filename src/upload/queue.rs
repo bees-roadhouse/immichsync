@@ -94,7 +94,13 @@ pub struct NewQueueEntry {
 }
 
 /// A row from the `upload_queue` table.
+///
+/// Mirror of the DB row. Some fields are written during dequeue (so the
+/// struct round-trips faithfully) but not yet read by any consumer outside
+/// the in-memory mock store used in tests. Allowed at the struct level so
+/// the model stays whole.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct QueueEntry {
     pub id: i64,
     pub file_path: String,
@@ -112,7 +118,11 @@ pub struct QueueEntry {
 }
 
 /// Aggregate counts across all queue entries.
+///
+/// `failed` and `total` are populated by the store implementations but no
+/// consumer reads them yet; kept for symmetry with the DB-level QueueStats.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct QueueStats {
     pub pending: u64,
     pub uploading: u64,
@@ -129,14 +139,15 @@ pub struct QueueStats {
 /// picks them up via the store's [`QueueStore::dequeue_pending`].
 pub struct UploadQueue {
     store: Arc<dyn QueueStore>,
-    /// Maximum number of concurrent upload workers (advisory; not enforced here).
-    pub concurrency: usize,
 }
 
 impl UploadQueue {
-    /// Create a new queue backed by `store`.
-    pub fn new(store: Arc<dyn QueueStore>, concurrency: usize) -> Self {
-        Self { store, concurrency }
+    /// Create a new queue backed by `store`. The `_concurrency` argument is
+    /// kept on the signature for callers passing through a config value, but
+    /// the concurrency cap is enforced by [`crate::upload::worker::WorkerConfig`],
+    /// not by the queue.
+    pub fn new(store: Arc<dyn QueueStore>, _concurrency: usize) -> Self {
+        Self { store }
     }
 
     /// Hash the file, check for local dedup, and enqueue if not already uploaded.

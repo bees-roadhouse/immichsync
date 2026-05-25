@@ -203,22 +203,6 @@ pub struct WatchedFolder {
     pub updated_at: String,
 }
 
-/// A file that has been successfully uploaded to the Immich server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UploadedFile {
-    pub id: i64,
-    pub file_path: String,
-    /// SHA-1 hex digest — matches Immich's internal checksum field.
-    pub file_hash: String,
-    pub file_size: i64,
-    /// Immich-assigned asset UUID returned after upload.
-    pub immich_asset_id: Option<String>,
-    /// `"{path_hash}-{filename}"` device-scoped asset identifier.
-    pub device_asset_id: String,
-    pub uploaded_at: String,
-    pub server_url: String,
-}
-
 /// A pending, active, or terminal entry in the upload queue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueEntry {
@@ -414,30 +398,6 @@ impl Database {
         Ok(())
     }
 
-    // ── config table helpers ─────────────────────────────────────────────────
-
-    /// Get a value from the key-value `config` table.
-    pub fn get_config_value(&self, key: &str) -> Result<Option<String>, DbError> {
-        let value = self
-            .conn
-            .query_row(
-                "SELECT value FROM config WHERE key = ?1",
-                params![key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(value)
-    }
-
-    /// Set a value in the key-value `config` table.
-    pub fn set_config_value(&self, key: &str, value: &str) -> Result<(), DbError> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
-            params![key, value],
-        )?;
-        Ok(())
-    }
-
     // ── watched_folders ──────────────────────────────────────────────────────
 
     /// Add a new watched folder. Returns the new row's `id`.
@@ -497,6 +457,10 @@ impl Database {
     }
 
     /// Update mutable fields of a watched folder.
+    // 11 args mirrors the column set on `watched_folders`. Folding into a
+    // struct would force a parallel type for one call site (settings save);
+    // not worth the indirection.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_folder(
         &self,
         id: i64,
@@ -744,21 +708,6 @@ impl Database {
         Ok(stats)
     }
 
-    /// Re-queue failed entries that have not exceeded `max_retries`, resetting
-    /// their status to `pending` and clearing the error message.
-    pub fn requeue_failed(&self, max_retries: i32) -> Result<usize, DbError> {
-        let count = self.conn.execute(
-            "UPDATE upload_queue
-             SET status = 'pending',
-                 error_message = NULL,
-                 completed_at = NULL
-             WHERE status = 'failed'
-               AND retry_count < ?1",
-            params![max_retries],
-        )?;
-        Ok(count)
-    }
-
     /// Return a single watched folder by id.
     pub fn get_folder(&self, id: i64) -> Result<Option<WatchedFolder>, DbError> {
         let result = self
@@ -805,14 +754,6 @@ impl Database {
         if count > 0 {
             info!(count, "Reset stale uploading entries to pending");
         }
-        Ok(count)
-    }
-
-    /// Delete all completed queue entries.  Useful for housekeeping.
-    pub fn purge_completed(&self) -> Result<usize, DbError> {
-        let count = self
-            .conn
-            .execute("DELETE FROM upload_queue WHERE status = 'completed'", [])?;
         Ok(count)
     }
 }
@@ -995,22 +936,6 @@ mod tests {
         db
     }
 
-    // ── Config table ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn config_roundtrip() {
-        let db = open_test_db();
-        db.set_config_value("foo", "bar").unwrap();
-        let val = db.get_config_value("foo").unwrap();
-        assert_eq!(val, Some("bar".to_string()));
-    }
-
-    #[test]
-    fn config_missing_key_returns_none() {
-        let db = open_test_db();
-        assert_eq!(db.get_config_value("does_not_exist").unwrap(), None);
-    }
-
     // ── watched_folders ──────────────────────────────────────────────────────
 
     #[test]
@@ -1112,15 +1037,10 @@ mod tests {
 
         let entries = db.dequeue_pending(10).unwrap();
         assert_eq!(entries.len(), 2);
-        // After dequeue_pending all returned entries should be Uploading.
-        for e in &entries {
-            // Status in DB was updated; re-fetch to verify.
-            let stats = db.get_queue_stats().unwrap();
-            assert_eq!(stats.uploading, 2);
-            assert_eq!(stats.pending, 0);
-            let _ = e; // suppress unused warning
-            break;
-        }
+        // dequeue_pending flips the rows to Uploading as a side effect.
+        let stats = db.get_queue_stats().unwrap();
+        assert_eq!(stats.uploading, 2);
+        assert_eq!(stats.pending, 0);
     }
 
     #[test]
@@ -1148,34 +1068,6 @@ mod tests {
 
         let stats = db.get_queue_stats().unwrap();
         assert_eq!(stats.failed, 1);
-    }
-
-    #[test]
-    fn requeue_failed() {
-        let db = open_test_db();
-        let id = db.enqueue("/photos/e.jpg", None, None, None).unwrap();
-        db.update_queue_status(id, &QueueStatus::Failed, Some("err"))
-            .unwrap();
-
-        let requeued = db.requeue_failed(5).unwrap();
-        assert_eq!(requeued, 1);
-
-        let stats = db.get_queue_stats().unwrap();
-        assert_eq!(stats.pending, 1);
-        assert_eq!(stats.failed, 0);
-    }
-
-    #[test]
-    fn purge_completed() {
-        let db = open_test_db();
-        let id = db.enqueue("/photos/f.jpg", None, None, None).unwrap();
-        db.update_queue_status(id, &QueueStatus::Completed, None)
-            .unwrap();
-
-        let purged = db.purge_completed().unwrap();
-        assert_eq!(purged, 1);
-        let stats = db.get_queue_stats().unwrap();
-        assert_eq!(stats.completed, 0);
     }
 
     #[test]

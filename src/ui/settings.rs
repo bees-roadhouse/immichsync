@@ -18,23 +18,6 @@ use tracing::info;
 use crate::config::Config;
 use crate::db::{AlbumMode, Database, PostUpload, WatchMode, WatchedFolder};
 
-/// Settings window state.
-///
-/// Kept for backward compatibility — other modules hold `Option<Settings>`.
-pub struct Settings;
-
-impl Settings {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Open the settings window (blocking the calling thread).
 ///
 /// Safe to call from any thread — uses `with_any_thread(true)` so eframe can

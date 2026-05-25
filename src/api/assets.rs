@@ -44,9 +44,6 @@ pub struct BulkCheckItem {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BulkCheckResult {
-    /// The device asset ID that was queried.
-    pub id: String,
-
     /// Immich's verdict: `"accept"` (not a duplicate) or `"reject"` (already
     /// exists).  May be other values in future Immich versions.
     pub action: String,
@@ -73,8 +70,6 @@ impl BulkCheckResult {
 #[serde(rename_all = "camelCase")]
 struct AssetUploadResponse {
     id: String,
-    #[serde(default)]
-    duplicate_asset_id: Option<String>,
 }
 
 /// Raw JSON returned by `POST /api/assets/bulk-upload-check`.
@@ -310,7 +305,6 @@ impl crate::upload::worker::AssetUploader for ImmichClient {
             .map(|r| {
                 let exists = r.is_duplicate();
                 crate::upload::worker::BulkCheckResult {
-                    id: r.id,
                     exists,
                     asset_id: r.asset_id,
                 }

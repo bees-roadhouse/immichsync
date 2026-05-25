@@ -1,10 +1,10 @@
 // Folder watcher (notify-based)
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use notify::{RecursiveMode, Watcher};
+use notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -16,8 +16,6 @@ use crate::watch::filter::FileFilter;
 pub enum WatchEvent {
     /// File has been confirmed fully written and is ready for upload.
     FileReady(PathBuf),
-    /// File was removed from disk (reserved for future use, e.g. mirrored deletes).
-    FileRemoved(PathBuf),
     /// A non-fatal error occurred inside the watcher.
     Error(String),
 }
@@ -150,11 +148,6 @@ impl FolderWatcher {
                 info!("Folder watcher stopped: {:?}", self.path);
             }
         }
-    }
-
-    /// Return the path being watched.
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 }
 

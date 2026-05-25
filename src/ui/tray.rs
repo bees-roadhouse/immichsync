@@ -30,8 +30,6 @@ pub enum TrayState {
     Paused,
     /// An error has occurred (server unreachable, auth failure, etc.).
     Error(String),
-    /// No network / server not reachable.
-    Offline,
 }
 
 /// User actions emitted by the tray menu.
@@ -122,7 +120,6 @@ fn make_icon(r: u8, g: u8, b: u8) -> Result<Icon, TrayError> {
 //   Syncing  — blue   (0x21, 0x96, 0xF3)
 //   Paused   — yellow (0xFF, 0xC1, 0x07)
 //   Error    — red    (0xF4, 0x43, 0x36)
-//   Offline  — gray   (0x9E, 0x9E, 0x9E)
 
 fn icon_for_state(state: &TrayState) -> Result<Icon, TrayError> {
     match state {
@@ -130,7 +127,6 @@ fn icon_for_state(state: &TrayState) -> Result<Icon, TrayError> {
         TrayState::Syncing { .. } => make_icon(0x21, 0x96, 0xF3),
         TrayState::Paused => make_icon(0xFF, 0xC1, 0x07),
         TrayState::Error(_) => make_icon(0xF4, 0x43, 0x36),
-        TrayState::Offline => make_icon(0x9E, 0x9E, 0x9E),
     }
 }
 
@@ -142,7 +138,6 @@ fn tooltip_for_state(state: &TrayState) -> String {
         }
         TrayState::Paused => "ImmichSync — Paused".to_owned(),
         TrayState::Error(msg) => format!("ImmichSync — Error: {}", msg),
-        TrayState::Offline => "ImmichSync — Offline".to_owned(),
     }
 }
 
@@ -154,7 +149,6 @@ fn status_text_for_state(state: &TrayState) -> String {
         }
         TrayState::Paused => "Paused".to_owned(),
         TrayState::Error(msg) => format!("Error: {}", msg),
-        TrayState::Offline => "Server offline".to_owned(),
     }
 }
 
@@ -190,9 +184,6 @@ pub struct TrayApp {
     check_updates_item: MenuItem,
     update_available_item: MenuItem,
     restart_to_update_item: MenuItem,
-
-    /// Sender half of the action channel.  Cloned into the menu-event handler.
-    action_tx: mpsc::Sender<TrayAction>,
 }
 
 impl TrayApp {
@@ -299,32 +290,27 @@ impl TrayApp {
             let tx = action_tx.clone();
             std::thread::spawn(move || {
                 let receiver = MenuEvent::receiver();
-                loop {
-                    match receiver.recv() {
-                        Ok(event) => {
-                            let action = match event.id().0.as_str() {
-                                ID_PAUSE => Some(TrayAction::Pause),
-                                ID_RESUME => Some(TrayAction::Resume),
-                                ID_UPLOAD_NOW => Some(TrayAction::UploadNow),
-                                ID_SETTINGS => Some(TrayAction::OpenSettings),
-                                ID_ABOUT => Some(TrayAction::About),
-                                ID_VIEW_LOG => Some(TrayAction::ViewLog),
-                                ID_VIEW_TRASH => Some(TrayAction::ViewTrash),
-                                ID_CHECK_UPDATES => Some(TrayAction::CheckForUpdates),
-                                ID_UPDATE_AVAILABLE => Some(TrayAction::OpenUpdateDialog),
-                                ID_RESTART_TO_UPDATE => Some(TrayAction::RestartToUpdate),
-                                ID_QUIT => Some(TrayAction::Quit),
-                                _ => None,
-                            };
-                            if let Some(a) = action {
-                                tracing::debug!("tray action: {:?}", a);
-                                if tx.send(a).is_err() {
-                                    // Main thread has dropped the receiver; exit.
-                                    break;
-                                }
-                            }
+                while let Ok(event) = receiver.recv() {
+                    let action = match event.id().0.as_str() {
+                        ID_PAUSE => Some(TrayAction::Pause),
+                        ID_RESUME => Some(TrayAction::Resume),
+                        ID_UPLOAD_NOW => Some(TrayAction::UploadNow),
+                        ID_SETTINGS => Some(TrayAction::OpenSettings),
+                        ID_ABOUT => Some(TrayAction::About),
+                        ID_VIEW_LOG => Some(TrayAction::ViewLog),
+                        ID_VIEW_TRASH => Some(TrayAction::ViewTrash),
+                        ID_CHECK_UPDATES => Some(TrayAction::CheckForUpdates),
+                        ID_UPDATE_AVAILABLE => Some(TrayAction::OpenUpdateDialog),
+                        ID_RESTART_TO_UPDATE => Some(TrayAction::RestartToUpdate),
+                        ID_QUIT => Some(TrayAction::Quit),
+                        _ => None,
+                    };
+                    if let Some(a) = action {
+                        tracing::debug!("tray action: {:?}", a);
+                        if tx.send(a).is_err() {
+                            // Main thread has dropped the receiver; exit.
+                            break;
                         }
-                        Err(_) => break, // channel closed
                     }
                 }
             });
@@ -343,7 +329,6 @@ impl TrayApp {
             check_updates_item,
             update_available_item,
             restart_to_update_item,
-            action_tx,
         };
 
         Ok((app, action_rx))
@@ -402,7 +387,7 @@ impl TrayApp {
         match version {
             Some(v) => {
                 self.update_available_item
-                    .set_text(&format!("Update Available (v{v})!"));
+                    .set_text(format!("Update Available (v{v})!"));
                 self.update_available_item.set_enabled(true);
             }
             None => {
@@ -420,7 +405,7 @@ impl TrayApp {
         match version {
             Some(v) => {
                 self.restart_to_update_item
-                    .set_text(&format!("Restart to Update (v{v})"));
+                    .set_text(format!("Restart to Update (v{v})"));
                 self.restart_to_update_item.set_enabled(true);
                 // Hide the "Update Available" item since the download is done.
                 self.update_available_item.set_text("Update Available!");
@@ -431,11 +416,5 @@ impl TrayApp {
                 self.restart_to_update_item.set_enabled(false);
             }
         }
-    }
-
-    /// Return a clone of the action sender, useful for injecting actions
-    /// programmatically (e.g. from a device event thread).
-    pub fn action_sender(&self) -> mpsc::Sender<TrayAction> {
-        self.action_tx.clone()
     }
 }

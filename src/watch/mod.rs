@@ -1,12 +1,13 @@
 // Watch engine orchestrator
 
-pub mod device;
 pub mod filter;
 pub mod folder;
 pub mod network;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -29,6 +30,7 @@ pub enum WatchError {
     #[error("Path is already being watched: {0:?}")]
     AlreadyWatching(PathBuf),
 
+    #[cfg(test)]
     #[error("Path is not being watched: {0:?}")]
     NotWatching(PathBuf),
 
@@ -105,8 +107,8 @@ impl WatchEngine {
     /// - `path`       — the directory to watch (must exist)
     /// - `filter`     — file filter to apply to events from this folder
     /// - `is_network` — if `true`, a [`NetworkWatcher`] with health-check
-    ///                  fallback is used; if `false`, a [`FolderWatcher`]
-    ///                  (native, debounced) is used
+    ///   fallback is used; if `false`, a [`FolderWatcher`]
+    ///   (native, debounced) is used
     ///
     /// # Errors
     ///
@@ -161,6 +163,7 @@ impl WatchEngine {
     ///
     /// Returns [`WatchError::NotWatching`] if the path is not currently
     /// registered.
+    #[cfg(test)]
     pub fn remove_folder(&mut self, path: &Path) -> Result<(), WatchError> {
         // Try the exact path first; if that fails, try the canonicalised form.
         let key = if self.watchers.contains_key(path) {
@@ -209,6 +212,7 @@ impl WatchEngine {
     }
 
     /// Return `true` if the given path is currently being watched.
+    #[cfg(test)]
     pub fn is_watching(&self, path: &Path) -> bool {
         if self.watchers.contains_key(path) {
             return true;

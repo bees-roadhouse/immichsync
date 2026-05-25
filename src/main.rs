@@ -1,4 +1,12 @@
 #![windows_subsystem = "windows"]
+// Several module-level error enums (ConfigError, DbError, UpdateError,
+// PlatformError) embed third-party error types via `#[from]` — notably
+// `toml::de::Error` and `windows` API errors — that pull each variant
+// past clippy's 128-byte large-Err threshold. Boxing the variants
+// individually would force every `?` propagation site to convert, with no
+// runtime benefit on the failure-rare paths in a tray app. Allow it crate-
+// wide rather than scatter per-function attributes.
+#![allow(clippy::result_large_err)]
 
 mod app;
 mod config;
@@ -107,7 +115,7 @@ fn main() -> anyhow::Result<()> {
                 info!("Portable mode enabled, skipping install");
             } else {
                 let installed_exe = platform::installed_exe_path().ok();
-                let installed_exists = installed_exe.as_ref().map_or(false, |p| p.exists());
+                let installed_exists = installed_exe.as_ref().is_some_and(|p| p.exists());
                 debug_log(&format!(
                     "installed_exe={:?}, exists={installed_exists}",
                     installed_exe

@@ -20,13 +20,16 @@ pub mod metadata;
 pub mod queue;
 pub mod worker;
 
+#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use thiserror::Error;
 use tokio::sync::watch;
-use tracing::{debug, info};
+#[cfg(test)]
+use tracing::debug;
+use tracing::info;
 
 use crate::config::{ServerConfig, UploadConfig};
 use queue::{QueueStats, QueueStore, UploadQueue};
@@ -36,9 +39,6 @@ use worker::{AssetUploader, UploadWorker, WorkerConfig};
 
 #[derive(Debug, Error)]
 pub enum PipelineError {
-    #[error("Pipeline is not started; call start() first")]
-    NotStarted,
-
     #[error("Queue error: {0}")]
     Queue(#[from] queue::QueueError),
 
@@ -127,6 +127,7 @@ impl UploadPipeline {
     ///
     /// Returns `Ok(Some(id))` when a new queue entry was created, or
     /// `Ok(None)` when the file was skipped (already uploaded).
+    #[cfg(test)]
     pub fn submit(
         &self,
         path: PathBuf,
@@ -325,8 +326,7 @@ mod tests {
         ) -> anyhow::Result<Vec<BulkCheckResult>> {
             Ok(items
                 .into_iter()
-                .map(|i| BulkCheckResult {
-                    id: i.id,
+                .map(|_| BulkCheckResult {
                     exists: false,
                     asset_id: None,
                 })

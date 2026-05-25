@@ -144,7 +144,7 @@ pub fn decrypt_api_key(encrypted: &str) -> Result<String, EncryptionError> {
 // ── DPAPI wrappers ──────────────────────────────────────────────────────────
 
 fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, EncryptionError> {
-    let mut input_blob = CRYPT_INTEGER_BLOB {
+    let input_blob = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
         pbData: data.as_ptr() as *mut u8,
     };
@@ -153,7 +153,7 @@ fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, EncryptionError> {
 
     unsafe {
         CryptProtectData(
-            &mut input_blob,
+            &input_blob,
             None, // description
             None, // optional entropy
             None, // reserved
@@ -177,7 +177,7 @@ fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, EncryptionError> {
 }
 
 fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, EncryptionError> {
-    let mut input_blob = CRYPT_INTEGER_BLOB {
+    let input_blob = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
         pbData: data.as_ptr() as *mut u8,
     };
@@ -186,7 +186,7 @@ fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, EncryptionError> {
 
     unsafe {
         CryptUnprotectData(
-            &mut input_blob,
+            &input_blob,
             None, // description out
             None, // optional entropy
             None, // reserved

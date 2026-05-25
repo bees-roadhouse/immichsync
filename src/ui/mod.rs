@@ -10,11 +10,3 @@ pub mod trash_log;
 pub mod tray;
 pub mod update;
 pub mod upload_log;
-
-// Re-export the primary public surface so callers can write `ui::TrayApp`
-// instead of `ui::tray::TrayApp`.
-
-pub use first_run::FirstRun;
-pub use notifications::Notifications;
-pub use settings::Settings;
-pub use tray::{TrayAction, TrayApp, TrayError, TrayState};

@@ -1,6 +1,6 @@
 // Network share watcher with fallback
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,7 +36,11 @@ trait AnyDebouncer: Send {
     fn stop(&mut self);
 }
 
+// The inner debouncer is held purely for its Drop impl (unregisters the OS
+// watcher). Nothing reads the field directly.
+#[allow(dead_code)]
 struct NativeDebouncer(Debouncer<notify::RecommendedWatcher, RecommendedCache>);
+#[allow(dead_code)]
 struct PollDebouncer(Debouncer<PollWatcher, RecommendedCache>);
 
 impl AnyDebouncer for NativeDebouncer {
@@ -135,11 +139,6 @@ impl NetworkWatcher {
             d.stop();
             info!("Network watcher stopped: {:?}", self.path);
         }
-    }
-
-    /// Return the path being watched.
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     // -----------------------------------------------------------------------
