@@ -1,8 +1,18 @@
 //! Configuration management for ImmichSync.
 //!
-//! Loads and saves `%APPDATA%\bees-roadhouse\immichsync\config.toml`.
-//! On first run (or missing file) returns compiled-in defaults.
-//! Writes are atomic: write to a temp file then rename.
+//! Path layout follows the Windows-standard per-user split (matches VSCode,
+//! Slack, Discord, GitHub Desktop):
+//!
+//! - **Binary install**: `%LOCALAPPDATA%\Programs\immichsync\immichsync.exe`
+//!   (resolved via [`Config::install_dir`])
+//! - **Roaming config**: `%APPDATA%\bees-roadhouse\immichsync\config.toml`
+//!   (resolved via [`Config::config_dir`]). Small, portable across machines.
+//! - **Local data**: `%LOCALAPPDATA%\bees-roadhouse\immichsync\` containing
+//!   `state.db` + `logs\` (resolved via [`Config::local_data_dir`]). Machine-
+//!   local state, never roams.
+//!
+//! `config.toml` is loaded from the roaming dir; writes are atomic
+//! (write-temp-then-rename).
 
 use std::fs;
 use std::path::PathBuf;
@@ -233,7 +243,7 @@ impl Default for AdvancedConfig {
 
 /// Top-level application configuration.
 ///
-/// Stored at `%APPDATA%\bees-roadhouse\immichsync\config.toml`.
+/// Stored at `%APPDATA%\bees-roadhouse\immichsync\config.toml` (roaming).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -257,9 +267,12 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Returns the `%APPDATA%\bees-roadhouse\immichsync` directory, creating
-    /// it if it does not exist.
-    pub fn data_dir() -> Result<PathBuf, ConfigError> {
+    /// Returns the roaming config directory:
+    /// `%APPDATA%\bees-roadhouse\immichsync\`. Created on first use.
+    ///
+    /// Contains `config.toml` only. Small, portable across machines, fine to
+    /// participate in roaming profile sync.
+    pub fn config_dir() -> Result<PathBuf, ConfigError> {
         let base = dirs::config_dir().ok_or(ConfigError::NoDataDir)?;
         let dir = base.join("bees-roadhouse").join("immichsync");
 
@@ -268,15 +281,57 @@ impl Config {
                 path: dir.clone(),
                 source,
             })?;
-            debug!(path = %dir.display(), "Created ImmichSync data directory");
+            debug!(path = %dir.display(), "Created ImmichSync config directory");
         }
 
         Ok(dir)
     }
 
-    /// Returns the path to `config.toml`.
+    /// Returns the local (non-roaming) data directory:
+    /// `%LOCALAPPDATA%\bees-roadhouse\immichsync\`. Created on first use.
+    ///
+    /// Contains the SQLite state DB and the `logs\` subdirectory. Machine-
+    /// local state ... watched folder set, upload progress, log files all
+    /// belong here, not in the roaming profile.
+    pub fn local_data_dir() -> Result<PathBuf, ConfigError> {
+        let base = dirs::data_local_dir().ok_or(ConfigError::NoDataDir)?;
+        let dir = base.join("bees-roadhouse").join("immichsync");
+
+        if !dir.exists() {
+            fs::create_dir_all(&dir).map_err(|source| ConfigError::CreateDir {
+                path: dir.clone(),
+                source,
+            })?;
+            debug!(path = %dir.display(), "Created ImmichSync local data directory");
+        }
+
+        Ok(dir)
+    }
+
+    /// Returns the binary install directory:
+    /// `%LOCALAPPDATA%\Programs\immichsync\`. Created on first use.
+    ///
+    /// This is where the installed `immichsync.exe` (and `version.txt`)
+    /// lives. Matches the per-user pattern used by VSCode, Slack, Discord,
+    /// and other major Windows apps that ship without admin elevation.
+    pub fn install_dir() -> Result<PathBuf, ConfigError> {
+        let base = dirs::data_local_dir().ok_or(ConfigError::NoDataDir)?;
+        let dir = base.join("Programs").join("immichsync");
+
+        if !dir.exists() {
+            fs::create_dir_all(&dir).map_err(|source| ConfigError::CreateDir {
+                path: dir.clone(),
+                source,
+            })?;
+            debug!(path = %dir.display(), "Created ImmichSync install directory");
+        }
+
+        Ok(dir)
+    }
+
+    /// Returns the path to `config.toml` in the roaming config dir.
     pub fn config_path() -> Result<PathBuf, ConfigError> {
-        Ok(Self::data_dir()?.join("config.toml"))
+        Ok(Self::config_dir()?.join("config.toml"))
     }
 
     /// Load configuration from disk.
@@ -417,5 +472,77 @@ url = "https://photos.example.com"
         // Fields not in the TOML should fall back to their Default impl.
         assert_eq!(cfg.upload.concurrency, 2);
         assert_eq!(cfg.advanced.log_level, "info");
+    }
+
+    #[test]
+    fn config_dir_under_roaming_appdata() {
+        // dirs::config_dir() on Windows resolves to %APPDATA% (roaming).
+        let dir = Config::config_dir().expect("config_dir");
+        let roaming = dirs::config_dir().expect("dirs config_dir");
+        assert!(
+            dir.starts_with(&roaming),
+            "config_dir ({}) should be under roaming ({})",
+            dir.display(),
+            roaming.display()
+        );
+        assert!(
+            dir.ends_with("bees-roadhouse\\immichsync")
+                || dir.ends_with("bees-roadhouse/immichsync")
+        );
+    }
+
+    #[test]
+    fn local_data_dir_under_local_appdata() {
+        // dirs::data_local_dir() on Windows resolves to %LOCALAPPDATA%.
+        let dir = Config::local_data_dir().expect("local_data_dir");
+        let local = dirs::data_local_dir().expect("dirs data_local_dir");
+        assert!(
+            dir.starts_with(&local),
+            "local_data_dir ({}) should be under local ({})",
+            dir.display(),
+            local.display()
+        );
+        assert!(
+            dir.ends_with("bees-roadhouse\\immichsync")
+                || dir.ends_with("bees-roadhouse/immichsync")
+        );
+    }
+
+    #[test]
+    fn install_dir_under_local_appdata_programs() {
+        let dir = Config::install_dir().expect("install_dir");
+        let local = dirs::data_local_dir().expect("dirs data_local_dir");
+        assert!(
+            dir.starts_with(&local),
+            "install_dir ({}) should be under local ({})",
+            dir.display(),
+            local.display()
+        );
+        assert!(dir.ends_with("Programs\\immichsync") || dir.ends_with("Programs/immichsync"));
+    }
+
+    #[test]
+    fn paths_are_distinct() {
+        // The whole point of the split: these three dirs are not the same.
+        let cfg = Config::config_dir().expect("config_dir");
+        let local = Config::local_data_dir().expect("local_data_dir");
+        let install = Config::install_dir().expect("install_dir");
+        assert_ne!(cfg, local, "config_dir must differ from local_data_dir");
+        assert_ne!(cfg, install, "config_dir must differ from install_dir");
+        assert_ne!(
+            local, install,
+            "local_data_dir must differ from install_dir"
+        );
+    }
+
+    #[test]
+    fn config_path_lives_in_config_dir() {
+        let path = Config::config_path().expect("config_path");
+        let dir = Config::config_dir().expect("config_dir");
+        assert_eq!(path.parent(), Some(dir.as_path()));
+        assert_eq!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("config.toml")
+        );
     }
 }

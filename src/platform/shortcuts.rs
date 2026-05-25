@@ -74,6 +74,9 @@ pub enum ShortcutError {
 
     #[error("known folder path is not valid UTF-16")]
     InvalidFolderPath,
+
+    #[error("failed to remove shortcut: {0}")]
+    Remove(#[source] std::io::Error),
 }
 
 /// Create a desktop shortcut pointing to the given executable.
@@ -104,6 +107,30 @@ pub fn create_start_menu_shortcut(
     create_shortcut(exe_path, &lnk_path, description)?;
 
     Ok(lnk_path)
+}
+
+/// Remove the desktop shortcut for the given name (no-op if missing).
+pub fn remove_desktop_shortcut(name: &str) -> Result<(), ShortcutError> {
+    let desktop = get_known_folder(&FOLDERID_Desktop)?;
+    let lnk_path = desktop.join(format!("{name}.lnk"));
+    remove_shortcut(&lnk_path)
+}
+
+/// Remove the Start Menu shortcut for the given name (no-op if missing).
+pub fn remove_start_menu_shortcut(name: &str) -> Result<(), ShortcutError> {
+    let programs = get_known_folder(&FOLDERID_Programs)?;
+    let lnk_path = programs.join(format!("{name}.lnk"));
+    remove_shortcut(&lnk_path)
+}
+
+fn remove_shortcut(lnk_path: &Path) -> Result<(), ShortcutError> {
+    if !lnk_path.exists() {
+        tracing::debug!(lnk = %lnk_path.display(), "Shortcut already absent");
+        return Ok(());
+    }
+    info!(lnk = %lnk_path.display(), "Removing shortcut");
+    std::fs::remove_file(lnk_path).map_err(ShortcutError::Remove)?;
+    Ok(())
 }
 
 /// Create a .lnk shortcut file via COM with AppUserModelID set.

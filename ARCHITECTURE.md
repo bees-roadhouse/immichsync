@@ -239,9 +239,11 @@ Configurable per watch folder:
 
 ## State Database (SQLite)
 
-**Location:** `%APPDATA%\ImmichSync\state.db`
+**Location:** `%LOCALAPPDATA%\bees-roadhouse\immichsync\state.db`
 
 SQLite via `rusqlite` with the `bundled` feature (compiles SQLite from source, no system dependency). WAL mode enabled for crash recovery and concurrent read access.
+
+State lives in `%LOCALAPPDATA%` (not roaming) because watched folder paths, upload progress, and dedup history are machine-local. See the **File Layout** section below.
 
 ### Schema
 
@@ -367,7 +369,32 @@ Named mutex (`Global\ImmichSync`) ensures only one instance runs. If a second la
 
 ### Auto-Start
 
-Registry key at `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` with the path to the executable.
+Registry key at `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` with the path to the executable. Value points at the install path (`%LOCALAPPDATA%\Programs\immichsync\immichsync.exe`) so it survives the user moving the source download.
+
+### Apps & Features Registration
+
+At install time the app writes a per-user Uninstall key under `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\ImmichSync` so it appears in Settings → Apps → Installed apps. The key carries `DisplayName`, `Publisher`, `DisplayVersion`, `InstallLocation`, `InstallDate`, `EstimatedSize`, `DisplayIcon`, `URLInfoAbout`, `HelpLink`, `UninstallString` (`"<exe>" --uninstall`), `QuietUninstallString` (`"<exe>" --uninstall --silent`), `NoModify=1`, `NoRepair=1`.
+
+`winget uninstall ImmichSync` works against the same key by invoking `QuietUninstallString`.
+
+### Self-Uninstall (`--uninstall`)
+
+Invoked by Windows Apps & Features (or `winget uninstall`). Steps:
+
+1. `WM_CLOSE` to any running ImmichSync shutdown window for graceful shutdown of in-flight uploads.
+2. Remove autostart registry value.
+3. Remove desktop + Start Menu shortcuts.
+4. Remove the Apps & Features Uninstall registry block.
+5. Show "uninstall complete" `MessageBoxW` (unless `--silent`).
+6. Spawn a detached `cmd.exe` that waits ~4 seconds (so the running uninstall exe has time to exit) then `rmdir /s /q` on the install directory. Pattern: `ping 127.0.0.1 -n 5 >nul & rmdir /s /q <install_dir>`.
+
+User data is intentionally preserved on uninstall:
+
+- `%APPDATA%\bees-roadhouse\immichsync\config.toml`
+- `%LOCALAPPDATA%\bees-roadhouse\immichsync\state.db` (+ WAL/SHM)
+- `%LOCALAPPDATA%\bees-roadhouse\immichsync\logs\`
+
+Reinstalling later picks up where the user left off ... no first-run wizard, no re-add of watch folders, no re-upload of already-uploaded files. A future `--purge` flag covers the "really remove everything" case.
 
 ### API Key Encryption
 
@@ -376,6 +403,43 @@ API keys are encrypted with AES-256-GCM using a key derived from Windows DPAPI (
 ### Known Folder Resolution
 
 `SHGetKnownFolderPath(FOLDERID_Pictures)` resolves the user's Pictures folder, handling OneDrive redirects and custom locations.
+
+---
+
+## File Layout
+
+ImmichSync follows the Windows-standard per-user split used by VSCode, Slack, Discord, GitHub Desktop:
+
+| What | Path | Folder ID | Why |
+|---|---|---|---|
+| Binary install | `%LOCALAPPDATA%\Programs\immichsync\immichsync.exe` | `FOLDERID_LocalAppData\Programs` | Per-user install, no admin, doesn't roam |
+| Version stamp | `%LOCALAPPDATA%\Programs\immichsync\version.txt` | (same) | Read by updater to compare versions |
+| Roaming config | `%APPDATA%\bees-roadhouse\immichsync\config.toml` | `FOLDERID_RoamingAppData` | Small, machine-portable, fine to roam |
+| State DB | `%LOCALAPPDATA%\bees-roadhouse\immichsync\state.db` (+ `.db-wal`, `.db-shm`) | `FOLDERID_LocalAppData` | Machine-local: watched paths, upload progress, dedup history |
+| Logs | `%LOCALAPPDATA%\bees-roadhouse\immichsync\logs\immichsync.YYYY-MM-DD` | (same) | Machine-diagnostic, never roams |
+
+Roaming profile sync on managed enterprise networks would otherwise multi-MB-round-trip the binary on every logon. The split puts only the small TOML (`config.toml`) in the roaming path.
+
+### Path Resolution (Rust)
+
+```rust
+Config::install_dir()    // %LOCALAPPDATA%\Programs\immichsync\
+Config::config_dir()     // %APPDATA%\bees-roadhouse\immichsync\
+Config::local_data_dir() // %LOCALAPPDATA%\bees-roadhouse\immichsync\
+Config::config_path()    // config_dir() + "config.toml"
+```
+
+### Legacy Migrations
+
+Two compatibility paths run at startup. Both are idempotent and skip files that already exist at the destination.
+
+**Step 1 — Pre-namespace layout.** Very-early releases stored everything under `%APPDATA%\ImmichSync\` (no `bees-roadhouse` prefix). `migrate_legacy_data()` routes:
+
+- `config.toml` → `%APPDATA%\bees-roadhouse\immichsync\config.toml`
+- `state.db*` → `%LOCALAPPDATA%\bees-roadhouse\immichsync\state.db*`
+- `logs\*` → `%LOCALAPPDATA%\bees-roadhouse\immichsync\logs\*`
+
+**Step 2 — Mixed roaming layout.** Versions 0.1.x put binary + DB + logs all in `%APPDATA%\bees-roadhouse\immichsync\`. `migrate_to_split_layout()` moves DB + logs to `%LOCALAPPDATA%`; leaves `config.toml` (already in the right place). The old binary stays where it is until the user accepts the install prompt — we don't delete an exe out from under a running process.
 
 ---
 
@@ -432,8 +496,10 @@ immichsync/
 │       ├── single_instance.rs   # Named mutex for single instance
 │       ├── drives.rs            # Drive enumeration, type detection
 │       ├── encryption.rs        # DPAPI + AES-256-GCM API key encryption
-│       ├── install.rs           # Self-install to AppData, version tracking
-│       └── shortcuts.rs         # Desktop/start menu shortcut creation
+│       ├── install.rs           # Self-install + Apps & Features registry + migration
+│       ├── uninstall.rs         # `--uninstall` flow: cleanup + scheduled self-delete
+│       ├── shutdown.rs          # Hidden window catching WM_CLOSE/WM_ENDSESSION
+│       └── shortcuts.rs         # Desktop/start menu shortcut create + remove
 ├── tests/
 │   ├── integration/
 │   │   ├── watch_test.rs

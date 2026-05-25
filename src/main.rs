@@ -42,20 +42,26 @@ fn main() -> anyhow::Result<()> {
     ));
 
     // ── Legacy data migration ────────────────────────────────────────────
-    // Move config/db/logs from old %APPDATA%\ImmichSync\ to the new
-    // %APPDATA%\bees-roadhouse\immichsync\ path before anything else
-    // tries to read them.
+    // Two-step migration covers every install we've shipped:
+    //  1. Very-old %APPDATA%\ImmichSync\ (pre-namespace) → roaming config +
+    //     local state under bees-roadhouse\immichsync\.
+    //  2. Mixed %APPDATA%\bees-roadhouse\immichsync\ (binary + DB + logs all
+    //     in roaming) → Windows-standard split: binary in
+    //     %LOCALAPPDATA%\Programs\immichsync\, config stays in roaming,
+    //     DB + logs move to %LOCALAPPDATA%\bees-roadhouse\immichsync\.
     if let Err(e) = platform::migrate_legacy_data() {
         // Non-fatal: log to stderr since tracing isn't up yet.
         eprintln!("Warning: legacy data migration failed: {e}");
+    }
+    if let Err(e) = platform::migrate_to_split_layout() {
+        eprintln!("Warning: split-layout migration failed: {e}");
     }
 
     // Clean up leftover .exe.old from a previous self-update.
     updater::cleanup_old_exe();
 
     // ── Logging ──────────────────────────────────────────────────────────
-    let data_dir = config::Config::data_dir()?;
-    let log_dir = data_dir.join("logs");
+    let log_dir = config::Config::local_data_dir()?.join("logs");
     std::fs::create_dir_all(&log_dir)?;
 
     let file_appender = tracing_appender::rolling::daily(&log_dir, "immichsync.log");
@@ -80,6 +86,22 @@ fn main() -> anyhow::Result<()> {
     if args.len() > 2 && args[1] == "--window" {
         debug_log(&format!("Subprocess mode: --window {}", &args[2]));
         return run_window_subprocess(&args[2]);
+    }
+
+    // ── Uninstall mode ──────────────────────────────────────────────────
+    // Launched by Windows Apps & Features (Uninstall click) or by `winget
+    // uninstall ImmichSync`. Removes the binary + shortcuts + autostart +
+    // Uninstall registry block. Preserves user data (config.toml + DB +
+    // logs) so reinstall picks up where the user left off.
+    if args.iter().any(|a| a == "--uninstall") {
+        let silent = args.iter().any(|a| a == "--silent");
+        debug_log(&format!("Uninstall mode: silent={silent}"));
+        info!(silent, "Running uninstall");
+        if let Err(e) = platform::uninstall::run(silent) {
+            tracing::error!(error = %e, "Uninstall failed");
+            return Err(e);
+        }
+        return Ok(());
     }
 
     // ── Install dialog + relaunch ────────────────────────────────────────
