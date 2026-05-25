@@ -39,6 +39,11 @@ pub struct App {
     runtime: Arc<tokio::runtime::Runtime>,
     last_stats_update: Instant,
     last_trash_cleanup: Instant,
+    /// Last time we reconciled the WatchEngine's watched-folder set against the DB.
+    /// The Settings subprocess mutates the DB independently of the running engine,
+    /// so we periodically diff and converge to fix the "Remove without Save still
+    /// uploads files" footgun.
+    last_folder_reconcile: Instant,
     paused: bool,
     /// Track previous syncing state to detect transitions for notifications.
     was_syncing: bool,
@@ -102,6 +107,7 @@ impl App {
             runtime,
             last_stats_update: Instant::now(),
             last_trash_cleanup: Instant::now(),
+            last_folder_reconcile: Instant::now(),
             paused: false,
             was_syncing: false,
             notifications,
@@ -269,6 +275,14 @@ impl App {
 
             // Periodically refresh tray with queue statistics.
             self.update_tray_stats();
+
+            // Periodically reconcile the WatchEngine's view of watched folders
+            // against the DB. The Settings subprocess mutates the DB without
+            // notifying the main process until it exits — until reconcile fires,
+            // a folder removed via Settings would still be watched (and its files
+            // uploaded). Cheap when there's no drift; restarts the engine when
+            // there is.
+            self.reconcile_watch_folders();
 
             // Periodic trash cleanup (hourly).
             if self.last_trash_cleanup.elapsed() >= Duration::from_secs(3600) {
@@ -552,6 +566,79 @@ impl App {
                     self.was_syncing = is_syncing;
                 }
             }
+        }
+    }
+
+    /// Reconcile the WatchEngine's view of watched folders against the DB.
+    ///
+    /// Background: the Settings window is a separate subprocess. It writes
+    /// directly to the DB on `Remove Folder` / `Add Folder` clicks, but the
+    /// main process only gets a config-update message when the subprocess
+    /// exits. Between those two events, the engine watches a folder the
+    /// user has already removed — files added there still upload. Issue #16.
+    ///
+    /// Fix: every `FOLDER_RECONCILE_INTERVAL`, compare the engine's watched
+    /// set against the DB's enabled-folder set. If they differ, restart the
+    /// engine to converge. Restart also re-spawns the watch→pipeline bridge
+    /// with a refreshed folder map, so per-event folder-id lookup stays
+    /// correct after additions.
+    fn reconcile_watch_folders(&mut self) {
+        const FOLDER_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+
+        if self.last_folder_reconcile.elapsed() < FOLDER_RECONCILE_INTERVAL {
+            return;
+        }
+        self.last_folder_reconcile = Instant::now();
+
+        // What the DB says should be watched.
+        let db_paths: std::collections::HashSet<std::path::PathBuf> = {
+            let db = match self.db.inner().lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    warn!("Folder reconcile: DB mutex poisoned, skipping");
+                    return;
+                }
+            };
+            match db.get_folders() {
+                Ok(folders) => folders
+                    .into_iter()
+                    .filter(|f| f.enabled)
+                    .map(|f| {
+                        let p = std::path::PathBuf::from(&f.path);
+                        std::fs::canonicalize(&p).unwrap_or(p)
+                    })
+                    .collect(),
+                Err(e) => {
+                    warn!(error = %e, "Folder reconcile: get_folders failed, skipping");
+                    return;
+                }
+            }
+        };
+
+        // What the engine actually watches.
+        let engine_paths = match self.watch_engine.as_ref() {
+            Some(e) => e.watched_paths(),
+            None => std::collections::HashSet::new(),
+        };
+
+        if db_paths == engine_paths {
+            return;
+        }
+
+        let removed: Vec<_> = engine_paths.difference(&db_paths).cloned().collect();
+        let added: Vec<_> = db_paths.difference(&engine_paths).cloned().collect();
+        info!(
+            removed = removed.len(),
+            added = added.len(),
+            "Folder reconcile: drift detected, restarting watch engine to converge"
+        );
+
+        if let Some(ref mut engine) = self.watch_engine {
+            engine.stop_all();
+        }
+        self.watch_engine = None;
+        if let Err(e) = self.start_watch_engine() {
+            warn!(error = %e, "Folder reconcile: restart_watch_engine failed");
         }
     }
 

@@ -203,6 +203,16 @@ impl WatchEngine {
         self.watchers.len()
     }
 
+    /// Return the set of canonicalized paths currently being watched.
+    ///
+    /// Used by the reconcile pass that compares the engine's view of watched
+    /// folders against the DB's view, to detect drift introduced by the
+    /// Settings subprocess mutating the DB without the main process getting
+    /// a config-update message until the subprocess exits.
+    pub fn watched_paths(&self) -> std::collections::HashSet<PathBuf> {
+        self.watchers.keys().cloned().collect()
+    }
+
     /// Return `true` if the given path is currently being watched.
     pub fn is_watching(&self, path: &Path) -> bool {
         if self.watchers.contains_key(path) {
