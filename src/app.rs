@@ -353,10 +353,12 @@ impl App {
                         continue;
                     }
                     let is_network = folder.watch_mode == crate::db::WatchMode::Poll;
-                    let includes =
-                        crate::watch::filter::parse_patterns_json(folder.include_patterns.as_deref());
-                    let excludes =
-                        crate::watch::filter::parse_patterns_json(folder.exclude_patterns.as_deref());
+                    let includes = crate::watch::filter::parse_patterns_json(
+                        folder.include_patterns.as_deref(),
+                    );
+                    let excludes = crate::watch::filter::parse_patterns_json(
+                        folder.exclude_patterns.as_deref(),
+                    );
                     let filter = FileFilter::new()
                         .with_include_patterns(includes)
                         .with_exclude_patterns(excludes)
