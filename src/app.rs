@@ -4,11 +4,13 @@
 // settings UI.  The main loop is a native Win32 message pump — simpler and
 // more reliable for a tray-only app than running a full winit event loop.
 
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, WM_QUIT,
 };
@@ -39,6 +41,13 @@ pub struct App {
     runtime: Arc<tokio::runtime::Runtime>,
     last_stats_update: Instant,
     last_trash_cleanup: Instant,
+    /// Last time we pruned the logs directory against the retention cap.
+    last_log_prune: Instant,
+    /// Paths we've already emitted the "Watch folder missing" warning for
+    /// since process start. Subsequent skip events for the same path are
+    /// demoted to TRACE so the reconcile loop (which calls `start_watch_engine`
+    /// on every drift) doesn't spam the log file once per cycle.
+    warned_missing_paths: HashSet<PathBuf>,
     /// Last time we reconciled the WatchEngine's watched-folder set against the DB.
     /// The Settings subprocess mutates the DB independently of the running engine,
     /// so we periodically diff and converge to fix the "Remove without Save still
@@ -118,6 +127,8 @@ impl App {
             runtime,
             last_stats_update: Instant::now(),
             last_trash_cleanup: Instant::now(),
+            last_log_prune: Instant::now(),
+            warned_missing_paths: HashSet::new(),
             last_folder_reconcile: Instant::now(),
             paused: false,
             was_syncing: false,
@@ -300,6 +311,11 @@ impl App {
             // there is.
             self.reconcile_watch_folders();
 
+            // Periodic log-retention check (hourly). Caps logs/ at 1 GiB by
+            // deleting oldest files first; never touches today's file. Cheap
+            // when totals are well under the cap (single dir read + sum).
+            self.maybe_prune_logs();
+
             // Periodic trash cleanup (hourly).
             if self.last_trash_cleanup.elapsed() >= Duration::from_secs(3600) {
                 self.last_trash_cleanup = Instant::now();
@@ -371,7 +387,7 @@ impl App {
                     }
                     let path = std::path::PathBuf::from(&folder.path);
                     if !path.exists() {
-                        warn!(path = %folder.path, "Watch folder missing, skipping");
+                        warn_missing_folder_once(&mut self.warned_missing_paths, &path);
                         continue;
                     }
                     let is_network = folder.watch_mode == crate::db::WatchMode::Poll;
@@ -721,8 +737,7 @@ impl App {
         }
         self.last_folder_reconcile = Instant::now();
 
-        // What the DB says should be watched.
-        let db_paths: std::collections::HashSet<std::path::PathBuf> = {
+        let folders = {
             let db = match self.db.inner().lock() {
                 Ok(g) => g,
                 Err(_) => {
@@ -731,14 +746,7 @@ impl App {
                 }
             };
             match db.get_folders() {
-                Ok(folders) => folders
-                    .into_iter()
-                    .filter(|f| f.enabled)
-                    .map(|f| {
-                        let p = std::path::PathBuf::from(&f.path);
-                        std::fs::canonicalize(&p).unwrap_or(p)
-                    })
-                    .collect(),
+                Ok(f) => f,
                 Err(e) => {
                     warn!(error = %e, "Folder reconcile: get_folders failed, skipping");
                     return;
@@ -746,21 +754,18 @@ impl App {
             }
         };
 
-        // What the engine actually watches.
         let engine_paths = match self.watch_engine.as_ref() {
             Some(e) => e.watched_paths(),
-            None => std::collections::HashSet::new(),
+            None => HashSet::new(),
         };
 
-        if db_paths == engine_paths {
+        let Some(drift) = compute_watch_drift(&folders, &engine_paths) else {
             return;
-        }
+        };
 
-        let removed: Vec<_> = engine_paths.difference(&db_paths).cloned().collect();
-        let added: Vec<_> = db_paths.difference(&engine_paths).cloned().collect();
         info!(
-            removed = removed.len(),
-            added = added.len(),
+            removed = drift.removed.len(),
+            added = drift.added.len(),
             "Folder reconcile: drift detected, restarting watch engine to converge"
         );
 
@@ -771,6 +776,26 @@ impl App {
         if let Err(e) = self.start_watch_engine() {
             warn!(error = %e, "Folder reconcile: restart_watch_engine failed");
         }
+    }
+
+    /// Prune the logs directory against the retention cap, if enough time
+    /// has elapsed since the last prune.
+    fn maybe_prune_logs(&mut self) {
+        const LOG_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60); // hourly
+
+        if self.last_log_prune.elapsed() < LOG_PRUNE_INTERVAL {
+            return;
+        }
+        self.last_log_prune = Instant::now();
+
+        let dir = match crate::config::Config::local_data_dir() {
+            Ok(d) => d.join("logs"),
+            Err(e) => {
+                warn!(error = %e, "Log retention: cannot resolve local_data_dir");
+                return;
+            }
+        };
+        crate::platform::logs::prune_logs(&dir, crate::platform::logs::DEFAULT_LOG_CAP_BYTES);
     }
 
     /// Spawn an async update check on the tokio runtime.
@@ -1213,4 +1238,178 @@ fn resolve_folder_id(
         dir = d.parent();
     }
     None
+}
+
+// ─── Watch-folder drift detection ────────────────────────────────────────────
+
+/// What changed between the DB's view of watched folders and the engine's.
+///
+/// `removed` = paths the engine currently watches that the DB no longer wants.
+/// `added`   = paths the DB wants watched that the engine isn't watching yet.
+///
+/// Returned by [`compute_watch_drift`] when (and only when) the two sets diverge
+/// in a way that warrants restarting the engine. A "diverge" that's entirely
+/// explained by enabled-but-missing-on-disk DB rows is treated as no drift,
+/// because [`App::start_watch_engine`] would just skip those paths again on
+/// restart and we'd loop forever. Issue #49.
+struct WatchDrift {
+    removed: Vec<PathBuf>,
+    added: Vec<PathBuf>,
+}
+
+/// Compare the DB's enabled+existing folders against the engine's watched set.
+///
+/// Returns `Some(drift)` when restart is warranted, `None` otherwise. Filters
+/// `enabled && path.exists()` so we don't fight `start_watch_engine`'s own
+/// skip semantics, which would otherwise produce a permanent drift signal for
+/// any stale missing-path row in `watched_folders` (the regression in #49).
+fn compute_watch_drift(
+    folders: &[crate::db::WatchedFolder],
+    engine_paths: &HashSet<PathBuf>,
+) -> Option<WatchDrift> {
+    let db_paths: HashSet<PathBuf> = folders
+        .iter()
+        .filter(|f| f.enabled)
+        .filter(|f| std::path::Path::new(&f.path).exists())
+        .map(|f| {
+            let p = PathBuf::from(&f.path);
+            std::fs::canonicalize(&p).unwrap_or(p)
+        })
+        .collect();
+
+    if &db_paths == engine_paths {
+        return None;
+    }
+
+    let removed: Vec<_> = engine_paths.difference(&db_paths).cloned().collect();
+    let added: Vec<_> = db_paths.difference(engine_paths).cloned().collect();
+    Some(WatchDrift { removed, added })
+}
+
+/// Emit the "Watch folder missing, skipping" log exactly once per (path,
+/// process lifetime). Subsequent skip events for the same path drop to TRACE,
+/// keeping the log file readable when reconcile cycles repeatedly retry a
+/// folder whose path doesn't exist (e.g. an SD card that isn't mounted).
+fn warn_missing_folder_once(seen: &mut HashSet<PathBuf>, path: &std::path::Path) {
+    let key = path.to_path_buf();
+    if seen.insert(key) {
+        warn!(
+            path = %path.display(),
+            "Watch folder missing, skipping (will not warn again this launch unless the path reappears)"
+        );
+    } else {
+        trace!(path = %path.display(), "Watch folder still missing, skipping (throttled)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{AlbumMode, PostUpload, WatchMode, WatchedFolder};
+
+    fn make_folder(id: i64, path: &str, enabled: bool) -> WatchedFolder {
+        WatchedFolder {
+            id,
+            path: path.to_string(),
+            label: None,
+            enabled,
+            watch_mode: WatchMode::Native,
+            poll_interval_secs: 30,
+            album_mode: AlbumMode::None,
+            album_name: None,
+            include_patterns: None,
+            exclude_patterns: None,
+            post_upload: PostUpload::Keep,
+            ignore_online_files: true,
+            auto_added: false,
+            created_at: "2026-05-26T00:00:00Z".to_string(),
+            updated_at: "2026-05-26T00:00:00Z".to_string(),
+        }
+    }
+
+    /// Issue #49 regression test: a DB row whose path doesn't exist on disk
+    /// must not produce a drift signal when the engine's watched set already
+    /// matches the existing-only subset of enabled DB rows.
+    #[test]
+    fn missing_path_does_not_register_as_drift() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let existing = tmp.path().to_path_buf();
+        let canon = std::fs::canonicalize(&existing).unwrap_or(existing.clone());
+
+        let folders = vec![
+            make_folder(1, existing.to_string_lossy().as_ref(), true),
+            // Use a clearly-fictional path that won't accidentally exist.
+            make_folder(2, "C:\\does-not-exist-49\\fake\\Pictures", true),
+        ];
+
+        let mut engine_paths = HashSet::new();
+        engine_paths.insert(canon);
+
+        assert!(
+            compute_watch_drift(&folders, &engine_paths).is_none(),
+            "drift should be None when the only DB-vs-engine diff is a missing-path row"
+        );
+    }
+
+    /// Inverse of the above: a real new folder added to the DB still triggers
+    /// a drift signal so PR #25's Settings → Remove convergence keeps working.
+    #[test]
+    fn newly_added_real_folder_registers_as_drift() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let folders = vec![
+            make_folder(1, a.to_string_lossy().as_ref(), true),
+            make_folder(2, b.to_string_lossy().as_ref(), true),
+        ];
+
+        // Engine only watches `a`. Adding `b` to the DB should drift.
+        let mut engine_paths = HashSet::new();
+        engine_paths.insert(std::fs::canonicalize(&a).unwrap_or(a.clone()));
+
+        let drift = compute_watch_drift(&folders, &engine_paths).expect("real add should drift");
+        assert_eq!(drift.added.len(), 1);
+        assert_eq!(drift.removed.len(), 0);
+    }
+
+    /// Disabled rows in the DB must not register as drift even when the path
+    /// is fine — Settings → Disable should converge by removing the path from
+    /// the engine's set, not by leaving a phantom add.
+    #[test]
+    fn disabled_folder_is_treated_as_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p = tmp.path().to_path_buf();
+        let canon = std::fs::canonicalize(&p).unwrap_or(p.clone());
+
+        // DB has one enabled row pointing at `p`.
+        let enabled_only = vec![make_folder(1, p.to_string_lossy().as_ref(), true)];
+        let mut engine_paths = HashSet::new();
+        engine_paths.insert(canon.clone());
+        assert!(compute_watch_drift(&enabled_only, &engine_paths).is_none());
+
+        // Flip the row to disabled — drift now says "remove p".
+        let disabled = vec![make_folder(1, p.to_string_lossy().as_ref(), false)];
+        let drift = compute_watch_drift(&disabled, &engine_paths)
+            .expect("disabling a watched folder should drift");
+        assert_eq!(drift.removed.len(), 1);
+        assert_eq!(drift.added.len(), 0);
+    }
+
+    #[test]
+    fn warn_missing_folder_once_dedups_by_path() {
+        let mut seen = HashSet::new();
+        let p = std::path::Path::new("C:\\fake\\Pictures");
+        // First call: would emit WARN.
+        warn_missing_folder_once(&mut seen, p);
+        assert_eq!(seen.len(), 1);
+        // Second call same path: no-op (silent TRACE).
+        warn_missing_folder_once(&mut seen, p);
+        assert_eq!(seen.len(), 1);
+        // Different path: emits, set grows.
+        warn_missing_folder_once(&mut seen, std::path::Path::new("D:\\fake\\Videos"));
+        assert_eq!(seen.len(), 2);
+    }
 }
