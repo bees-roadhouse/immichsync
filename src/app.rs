@@ -526,9 +526,15 @@ impl App {
         if server_changed {
             info!("Server config changed, recreating client");
 
-            // Recreate the Immich client.
+            // Recreate the Immich client with the full upload config (bandwidth
+            // limit and inactivity timeout may have changed along with the server).
             if !self.config.server.url.is_empty() && !self.config.server.api_key.is_empty() {
-                match ImmichClient::new(&self.config.server.url, &self.config.server.api_key) {
+                match ImmichClient::with_bandwidth_limit(
+                    &self.config.server.url,
+                    &self.config.server.api_key,
+                    self.config.upload.bandwidth_limit_kbps,
+                    self.config.upload.timeout_secs,
+                ) {
                     Ok(c) => {
                         self.client = Some(c);
                         if let Some(ref mut tray) = self.tray {
