@@ -159,6 +159,17 @@ impl UploadPipeline {
         self.queue.get_stats().map_err(anyhow::Error::from)
     }
 
+    /// Signal the worker loop to stop without waiting for in-flight uploads.
+    ///
+    /// Used by the user-initiated Quit path: drop whatever is running, exit
+    /// fast. In-flight `"uploading"` rows are reset to `"pending"` by
+    /// `reset_stale_uploading` on the next launch, so nothing is lost ...
+    /// just retried.
+    pub fn signal_stop(&self) {
+        info!("Signalling upload pipeline to stop (no wait)");
+        self.worker.stop();
+    }
+
     /// Signal the worker loop to stop and wait for it to finish.
     ///
     /// After calling `stop()`, the pipeline should not be used again.
