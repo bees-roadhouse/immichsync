@@ -57,15 +57,25 @@ impl ImmichClient {
     /// `base_url` should be the server root without a trailing slash, e.g.
     /// `"https://photos.example.com"`. The `x-api-key` header is set as a
     /// default so every request inherits it automatically.
+    ///
+    /// Uses a 3600s inactivity (read) timeout; pass a timeout via
+    /// [`with_bandwidth_limit`] if you need a different value.
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Result<Self, ApiError> {
-        Self::with_bandwidth_limit(base_url, api_key, 0)
+        Self::with_bandwidth_limit(base_url, api_key, 0, 3600)
     }
 
-    /// Create a new client with an optional bandwidth limit (in KB/s, 0 = unlimited).
+    /// Create a new client with an optional bandwidth limit (in KB/s, 0 = unlimited)
+    /// and a configurable per-request inactivity timeout (in seconds).
+    ///
+    /// `timeout_secs` is the HTTP read (inactivity) timeout: how long to wait
+    /// with no response bytes before aborting. Size it for the slowest backend
+    /// you expect — a 50GB upload to an Orange Pi can take several minutes of
+    /// post-upload server processing before the first response byte arrives.
     pub fn with_bandwidth_limit(
         base_url: impl Into<String>,
         api_key: impl Into<String>,
         bandwidth_limit_kbps: u64,
+        timeout_secs: u64,
     ) -> Result<Self, ApiError> {
         let api_key = api_key.into();
         let base_url = base_url.into().trim_end_matches('/').to_string();
@@ -79,17 +89,23 @@ impl ImmichClient {
 
         // Timeouts/keep-alive tuned for streaming uploads of large files (50GB+ videos):
         // - No overall .timeout() — a 50GB upload at 10MB/s legitimately takes ~83 minutes.
-        // - read_timeout: 120s without any bytes flowing = dead connection, abort fast.
+        //   An overall request timeout would kill a healthy long-running transfer, so we
+        //   deliberately omit it. Only inactivity (read_timeout) is bounded.
+        // - read_timeout: configurable inactivity timeout (default 3600s). This is NOT a
+        //   transfer-duration limit — it fires only when NO response bytes arrive for this
+        //   long. A slow backend (Orange Pi / Rockchip SBC) can take many minutes checksumming
+        //   a 50GB file after the last upload byte is sent; the read_timeout must outlast that
+        //   post-upload processing window. 1 hour of silence = give up.
         // - connect_timeout: 30s to establish TCP+TLS is plenty on any non-pathological link.
         // - tcp_keepalive: 60s probes keep middleboxes (firewalls, NATs) from idle-closing
         //   the connection during long uploads. Without this, a quiet TCP stream is silently
-        //   reaped by a firewall and read_timeout takes the full 120s to notice.
+        //   reaped by a firewall and read_timeout takes the full timeout duration to notice.
         // - pool_idle_timeout: 120s caps how long an idle connection stays in the pool
         //   before a fresh one is opened on next use.
         let client = reqwest::Client::builder()
             .default_headers(default_headers)
             .connect_timeout(Duration::from_secs(30))
-            .read_timeout(Duration::from_secs(120))
+            .read_timeout(Duration::from_secs(timeout_secs))
             .tcp_keepalive(Duration::from_secs(60))
             .pool_idle_timeout(Duration::from_secs(120))
             .build()

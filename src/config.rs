@@ -123,7 +123,14 @@ pub struct UploadConfig {
     /// Maximum number of retry attempts before a queue entry is marked failed.
     pub max_retries: u32,
 
-    /// Per-request HTTP timeout in seconds.
+    /// Per-request inactivity (HTTP read) timeout in seconds.
+    ///
+    /// This is the maximum time to wait with no response bytes before aborting
+    /// a request. It is NOT an overall transfer-duration limit — a 50GB upload
+    /// at 10MB/s legitimately streams for ~83 minutes without triggering it.
+    /// The timeout fires only when the server stops sending bytes entirely,
+    /// e.g. during post-upload checksumming on a slow backend (Orange Pi /
+    /// Rockchip SBC). Default 3600s (1 hour) accommodates those cases.
     pub timeout_secs: u64,
 
     /// Number of days to retain files in `.immichsync-trash/` before
@@ -139,7 +146,7 @@ impl Default for UploadConfig {
             bandwidth_limit_kbps: 0,
             order: "newest_first".to_string(),
             max_retries: 5,
-            timeout_secs: 300,
+            timeout_secs: 3600,
             trash_retention_days: 14,
         }
     }
@@ -432,7 +439,7 @@ mod tests {
         assert_eq!(cfg.upload.bandwidth_limit_kbps, 0);
         assert_eq!(cfg.upload.order, "newest_first");
         assert_eq!(cfg.upload.max_retries, 5);
-        assert_eq!(cfg.upload.timeout_secs, 300);
+        assert_eq!(cfg.upload.timeout_secs, 3600);
         assert!(cfg.devices.auto_watch);
         assert!(cfg.devices.look_for_dcim);
         assert_eq!(cfg.devices.on_insert, "auto");
