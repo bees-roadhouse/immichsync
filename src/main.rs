@@ -84,6 +84,11 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Prune old log files against the retention cap once at startup. The
+    // main loop also re-runs this hourly so a long-running process stays
+    // under the cap across day boundaries. See platform::logs and #49.
+    platform::logs::prune_logs(&log_dir, platform::logs::DEFAULT_LOG_CAP_BYTES);
+
     // ── Subprocess window mode ──────────────────────────────────────────
     // When launched with `--window <type>`, run only that UI window and
     // exit.  Each subprocess gets its own winit EventLoop, avoiding the
