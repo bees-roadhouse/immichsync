@@ -228,8 +228,7 @@ impl App {
                 while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).into() {
                     if msg.message == WM_QUIT {
                         info!("WM_QUIT received");
-                        self.shutdown();
-                        return;
+                        self.shutdown_and_exit();
                     }
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
@@ -254,8 +253,7 @@ impl App {
             }
             if quit {
                 info!("Quit requested from tray");
-                self.shutdown();
-                return;
+                self.shutdown_and_exit();
             }
 
             // Check for config updates from the settings window.
@@ -953,9 +951,11 @@ impl App {
         });
     }
 
-    /// Stop all background work.
+    /// Stop all background work, waiting briefly for the upload worker to
+    /// quiesce. Used by the relaunch path so the new process can take
+    /// ownership of `state.db` without fighting a still-flushing writer.
     fn shutdown(&mut self) {
-        info!("Shutting down");
+        info!("Shutting down (graceful)");
 
         if let Some(ref mut engine) = self.watch_engine {
             engine.stop_all();
@@ -969,6 +969,32 @@ impl App {
         }
 
         info!("Shutdown complete");
+    }
+
+    /// Immediate-exit path for user-initiated Quit and WM_QUIT.
+    ///
+    /// Signals the watch engine and upload worker to stop but does NOT wait
+    /// for in-flight uploads. Calls `std::process::exit(0)` so the user sees
+    /// the tray disappear instantly instead of the 3s wait pipeline.stop()
+    /// would impose. In-flight `"uploading"` queue rows are recovered by
+    /// `reset_stale_uploading` on next launch — partial uploads will be
+    /// retried, no data is lost.
+    fn shutdown_and_exit(&mut self) -> ! {
+        info!("Immediate exit requested ... dropping in-flight work");
+
+        if let Some(ref mut engine) = self.watch_engine {
+            engine.stop_all();
+        }
+
+        if let Some(pipeline) = self.pipeline.take() {
+            pipeline.signal_stop();
+        }
+
+        // Skip destructors. The single-instance mutex, SQLite handles, and
+        // HTTP sockets are all reaped cleanly by the OS on process exit.
+        // SQLite's WAL mode + the queue's reset_stale_uploading on next
+        // launch make this safe.
+        std::process::exit(0);
     }
 }
 

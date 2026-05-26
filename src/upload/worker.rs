@@ -298,6 +298,31 @@ async fn process_item(
         "Processing upload queue entry"
     );
 
+    // Placeholder re-check: the file may have been evicted to the cloud
+    // between enqueue and now (OneDrive / SeaDrive can auto-evict under
+    // storage pressure). Opening the file for upload would trigger a full
+    // cloud hydration ... gigabytes of bandwidth + CPU for a file the
+    // watcher will re-skip on its next pass anyway. Mark the entry failed
+    // with a recognisable marker; the watcher's reconciliation loop will
+    // re-enqueue it once the file is local again.
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if crate::watch::filter::is_online_file(&meta) {
+            info!(
+                id = entry.id,
+                path = %entry.file_path,
+                "File became cloud placeholder; deferring upload until it's local again"
+            );
+            if let Err(e) = store.update_status(
+                entry.id,
+                "failed",
+                Some("file became a cloud placeholder; will re-enqueue when local"),
+            ) {
+                error!(id = entry.id, error = %e, "Failed to mark deferred entry");
+            }
+            return;
+        }
+    }
+
     // Mark as uploading.
     if let Err(e) = store.update_status(entry.id, "uploading", None) {
         error!(id = entry.id, error = %e, "Failed to mark entry as uploading");
