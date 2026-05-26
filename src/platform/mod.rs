@@ -25,8 +25,8 @@ pub const APP_USER_MODEL_ID: &str = "BeesRoadhouse.ImmichSync";
 
 pub use autostart::set_autostart;
 pub use install::{
-    install_exe, installed_exe_path, is_running_installed, migrate_legacy_data,
-    migrate_to_split_layout, relaunch_installed,
+    cleanup_legacy_install, install_exe, installed_exe_path, is_running_installed,
+    migrate_legacy_data, migrate_to_split_layout, relaunch_installed,
 };
 pub use shortcuts::{create_desktop_shortcut, create_start_menu_shortcut};
 pub use single_instance::SingleInstance;

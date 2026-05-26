@@ -41,6 +41,15 @@ fn main() -> anyhow::Result<()> {
         std::env::args().collect::<Vec<_>>()
     ));
 
+    // ── Legacy install cleanup ───────────────────────────────────────────
+    // 0.1.x → 0.2.0+ leftover detection. If a binary exists at a legacy path
+    // (%APPDATA%\ImmichSync\ or %APPDATA%\bees-roadhouse\immichsync\), kill
+    // any process running from it, remove the binary, and clear stale
+    // autostart / Apps & Features entries that point at the old location.
+    // Must run BEFORE migrate_to_split_layout so the migration doesn't fight
+    // a still-running v0.1.x for the state.db lock.
+    platform::cleanup_legacy_install();
+
     // ── Legacy data migration ────────────────────────────────────────────
     // Two-step migration covers every install we've shipped:
     //  1. Very-old %APPDATA%\ImmichSync\ (pre-namespace) → roaming config +

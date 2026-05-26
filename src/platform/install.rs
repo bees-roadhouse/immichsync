@@ -573,6 +573,321 @@ pub fn delete_uninstall_registry() -> Result<(), InstallError> {
     }
 }
 
+// ── Legacy install cleanup (0.1.x → 0.2.0+ upgrade) ─────────────────────────
+
+/// Directories where 0.1.x binaries lived. Used to detect leftover installs
+/// when 0.2.x starts up for the first time after a manual download upgrade.
+///
+/// Returned in descending order of "newer" so callers that want to act on the
+/// most recent leftover first can do so without re-sorting.
+pub fn legacy_install_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(base) = dirs::config_dir() {
+        // 0.1.x with bees-roadhouse namespace (later builds).
+        dirs.push(base.join("bees-roadhouse").join("immichsync"));
+        // Pre-namespace original layout (earliest builds).
+        dirs.push(base.join("ImmichSync"));
+    }
+    dirs
+}
+
+/// Returns the subset of legacy install dirs that currently contain a binary.
+pub fn detect_legacy_installs() -> Vec<PathBuf> {
+    legacy_install_dirs()
+        .into_iter()
+        .filter(|d| d.join("immichsync.exe").exists())
+        .collect()
+}
+
+/// Returns true if `candidate` lives under (or equals) any of `legacy_dirs`.
+///
+/// Pure function ... no filesystem access, exact-string normalization only.
+/// Both inputs are compared in lowercase to handle Windows' case-insensitive
+/// paths. Symlinks are not resolved (best effort).
+pub fn path_is_under_legacy(candidate: &std::path::Path, legacy_dirs: &[PathBuf]) -> bool {
+    let candidate_norm = candidate.to_string_lossy().to_lowercase();
+    legacy_dirs.iter().any(|d| {
+        let prefix = d.to_string_lossy().to_lowercase();
+        candidate_norm == prefix || candidate_norm.starts_with(&format!("{prefix}\\"))
+    })
+}
+
+/// Detect and clean up leftovers from any pre-0.2.0 install.
+///
+/// 0.1.x binaries live at one of two paths:
+/// - `%APPDATA%\ImmichSync\immichsync.exe` (pre-namespace)
+/// - `%APPDATA%\bees-roadhouse\immichsync\immichsync.exe` (later 0.1.x)
+///
+/// 0.2.0 moved the binary to `%LOCALAPPDATA%\Programs\immichsync\` but the
+/// in-app update path only triggers cleanup when a binary already exists at
+/// the new path. Manual upgrades via Releases download don't go through that
+/// path, leaving:
+/// - The old binary on disk.
+/// - A stale HKCU\...\Run\ImmichSync autostart entry pointing at it.
+/// - A stale Apps & Features Uninstall key with InstallLocation at the old dir.
+/// - Worst case: the old binary still running, holding `state.db` open while
+///   `migrate_to_split_layout` tries to move it.
+///
+/// This function is called from `main()` before the migrations run so file
+/// locks are released first.
+pub fn cleanup_legacy_install() {
+    let legacy_dirs = legacy_install_dirs();
+    let active = detect_legacy_installs();
+    if active.is_empty() {
+        debug!("No legacy install detected");
+        return;
+    }
+
+    info!(
+        count = active.len(),
+        "Legacy install detected, cleaning up before migration"
+    );
+
+    // Kill any other immichsync.exe processes so file locks release. The PID
+    // filter excludes ourselves; we don't care which path the other instances
+    // are running from ... by definition they're either v0.1.x at a legacy
+    // path (the case we're handling) or a stale v0.2.x that should also exit
+    // before we install/migrate.
+    kill_other_immichsync_processes();
+
+    // Brief wait for kernel to flush handles. taskkill returns when the
+    // process exit signal has been delivered, but locked files can linger
+    // a few hundred ms after exit on Windows.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Remove the binaries (and version.txt) so they can't auto-launch later.
+    for dir in &active {
+        let binary = dir.join("immichsync.exe");
+        if let Err(e) = std::fs::remove_file(&binary) {
+            warn!(path = %binary.display(), error = %e, "Failed to remove legacy binary");
+        } else {
+            info!(path = %binary.display(), "Removed legacy binary");
+        }
+        let version_file = dir.join("version.txt");
+        if version_file.exists() {
+            let _ = std::fs::remove_file(&version_file);
+        }
+    }
+
+    // Stale autostart / uninstall registry entries.
+    cleanup_stale_autostart(&legacy_dirs);
+    cleanup_stale_uninstall_key(&legacy_dirs);
+}
+
+/// Kill all immichsync.exe processes except ourselves.
+///
+/// Uses the same taskkill /FI "PID ne …" pattern as the install-update flow.
+/// Best-effort: failures (including "no tasks running" when there are none)
+/// are logged and ignored.
+fn kill_other_immichsync_processes() {
+    let our_pid = std::process::id();
+    let pid_filter = format!("PID ne {our_pid}");
+    match std::process::Command::new("taskkill")
+        .args(["/F", "/FI", &pid_filter, "/IM", "immichsync.exe"])
+        .output()
+    {
+        Ok(out) => {
+            debug!(
+                our_pid,
+                stdout = %String::from_utf8_lossy(&out.stdout).trim(),
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "Killed other immichsync.exe processes"
+            );
+        }
+        Err(e) => warn!(error = %e, "taskkill spawn failed"),
+    }
+}
+
+/// If the HKCU Run\ImmichSync value points at a legacy path, remove it.
+///
+/// We don't touch entries that point at the new install dir or anywhere else
+/// the user may have set up. Only legacy paths get cleared, so users who had
+/// autostart disabled stay disabled.
+fn cleanup_stale_autostart(legacy_dirs: &[PathBuf]) {
+    let Some(current) = read_autostart_value() else {
+        debug!("No autostart Run entry present");
+        return;
+    };
+    let path = std::path::Path::new(&current);
+    if !path_is_under_legacy(path, legacy_dirs) {
+        debug!(path = %current, "Autostart entry not in legacy path, leaving in place");
+        return;
+    }
+    info!(path = %current, "Removing stale autostart entry pointing at legacy path");
+    if let Err(e) = crate::platform::autostart::set_autostart(false) {
+        warn!(error = %e, "Failed to clear stale autostart entry");
+    }
+}
+
+/// If the Apps & Features Uninstall key's InstallLocation is a legacy dir,
+/// remove the whole subtree.
+fn cleanup_stale_uninstall_key(legacy_dirs: &[PathBuf]) {
+    let Some(install_location) = read_uninstall_install_location() else {
+        debug!("No Apps & Features Uninstall key present");
+        return;
+    };
+    let path = std::path::Path::new(&install_location);
+    if !path_is_under_legacy(path, legacy_dirs) {
+        debug!(
+            path = %install_location,
+            "Uninstall key InstallLocation not in legacy path, leaving in place"
+        );
+        return;
+    }
+    info!(
+        path = %install_location,
+        "Removing stale Apps & Features Uninstall key pointing at legacy path"
+    );
+    if let Err(e) = delete_uninstall_registry() {
+        warn!(error = %e, "Failed to clear stale Uninstall registry key");
+    }
+}
+
+/// Read the current `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\ImmichSync`
+/// value as a UTF-8 string. Returns `None` if the key/value doesn't exist or
+/// the read fails for any other reason.
+fn read_autostart_value() -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+    };
+
+    const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0";
+    const VALUE_NAME: &str = "ImmichSync\0";
+
+    let key_wide: Vec<u16> = RUN_KEY.encode_utf16().collect();
+    let value_wide: Vec<u16> = VALUE_NAME.encode_utf16().collect();
+
+    let mut hkey = HKEY::default();
+    if unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_wide.as_ptr()),
+            0,
+            KEY_READ,
+            &mut hkey,
+        )
+    }
+    .is_err()
+    {
+        return None;
+    }
+
+    let mut byte_len: u32 = 0;
+    let probe = unsafe {
+        RegQueryValueExW(
+            hkey,
+            PCWSTR(value_wide.as_ptr()),
+            None,
+            None,
+            None,
+            Some(&mut byte_len),
+        )
+    };
+    if probe.is_err() || byte_len == 0 {
+        let _ = unsafe { RegCloseKey(hkey) };
+        return None;
+    }
+
+    let mut buf = vec![0u8; byte_len as usize];
+    let r = unsafe {
+        RegQueryValueExW(
+            hkey,
+            PCWSTR(value_wide.as_ptr()),
+            None,
+            None,
+            Some(buf.as_mut_ptr()),
+            Some(&mut byte_len),
+        )
+    };
+    let _ = unsafe { RegCloseKey(hkey) };
+    if r.is_err() {
+        return None;
+    }
+
+    decode_utf16_reg_sz(&buf)
+}
+
+/// Read `HKCU\...\Uninstall\ImmichSync\InstallLocation`. Returns `None` on
+/// missing key, missing value, or any decode failure.
+fn read_uninstall_install_location() -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+    };
+
+    let subkey_wide: Vec<u16> = UNINSTALL_SUBKEY
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let value_wide: Vec<u16> = "InstallLocation\0".encode_utf16().collect();
+
+    let mut hkey = HKEY::default();
+    if unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey_wide.as_ptr()),
+            0,
+            KEY_READ,
+            &mut hkey,
+        )
+    }
+    .is_err()
+    {
+        return None;
+    }
+
+    let mut byte_len: u32 = 0;
+    let probe = unsafe {
+        RegQueryValueExW(
+            hkey,
+            PCWSTR(value_wide.as_ptr()),
+            None,
+            None,
+            None,
+            Some(&mut byte_len),
+        )
+    };
+    if probe.is_err() || byte_len == 0 {
+        let _ = unsafe { RegCloseKey(hkey) };
+        return None;
+    }
+
+    let mut buf = vec![0u8; byte_len as usize];
+    let r = unsafe {
+        RegQueryValueExW(
+            hkey,
+            PCWSTR(value_wide.as_ptr()),
+            None,
+            None,
+            Some(buf.as_mut_ptr()),
+            Some(&mut byte_len),
+        )
+    };
+    let _ = unsafe { RegCloseKey(hkey) };
+    if r.is_err() {
+        return None;
+    }
+
+    decode_utf16_reg_sz(&buf)
+}
+
+/// Decode a REG_SZ payload (UTF-16 LE, null-terminated, byte buffer) into
+/// a Rust String. Strips the trailing null. Returns None on length mismatch
+/// or invalid UTF-16.
+fn decode_utf16_reg_sz(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 2 || !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let words: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    // Strip trailing nulls.
+    let end = words.iter().position(|&w| w == 0).unwrap_or(words.len());
+    String::from_utf16(&words[..end]).ok()
+}
+
 /// Relaunch from the installed exe path, forwarding all command-line arguments.
 ///
 /// On success this function does **not** return — the current process exits.
@@ -829,6 +1144,104 @@ mod tests {
         assert_eq!(
             UNINSTALL_SUBKEY,
             "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\ImmichSync"
+        );
+    }
+
+    #[test]
+    fn path_is_under_legacy_matches_exact_and_descendants() {
+        let legacy = vec![
+            PathBuf::from("C:\\Users\\u\\AppData\\Roaming\\ImmichSync"),
+            PathBuf::from("C:\\Users\\u\\AppData\\Roaming\\bees-roadhouse\\immichsync"),
+        ];
+
+        // Exact match.
+        assert!(path_is_under_legacy(
+            std::path::Path::new("C:\\Users\\u\\AppData\\Roaming\\ImmichSync"),
+            &legacy
+        ));
+
+        // Descendant.
+        assert!(path_is_under_legacy(
+            std::path::Path::new("C:\\Users\\u\\AppData\\Roaming\\ImmichSync\\immichsync.exe"),
+            &legacy
+        ));
+        assert!(path_is_under_legacy(
+            std::path::Path::new(
+                "C:\\Users\\u\\AppData\\Roaming\\bees-roadhouse\\immichsync\\state.db"
+            ),
+            &legacy
+        ));
+
+        // Case-insensitive (Windows).
+        assert!(path_is_under_legacy(
+            std::path::Path::new("c:\\users\\U\\appdata\\roaming\\immichsync\\immichsync.exe"),
+            &legacy
+        ));
+
+        // New install location ... must NOT match.
+        assert!(!path_is_under_legacy(
+            std::path::Path::new(
+                "C:\\Users\\u\\AppData\\Local\\Programs\\immichsync\\immichsync.exe"
+            ),
+            &legacy
+        ));
+
+        // Sibling dir that shares a prefix string ... must NOT match (the
+        // backslash separator on the prefix guards against this).
+        assert!(!path_is_under_legacy(
+            std::path::Path::new("C:\\Users\\u\\AppData\\Roaming\\ImmichSyncBackup\\file.dat"),
+            &legacy
+        ));
+    }
+
+    #[test]
+    fn decode_utf16_reg_sz_handles_typical_values() {
+        // Encode "C:\\app" as UTF-16 LE + null terminator.
+        let s = "C:\\app";
+        let mut bytes: Vec<u8> = s.encode_utf16().flat_map(|w| w.to_le_bytes()).collect();
+        bytes.extend_from_slice(&[0, 0]); // null terminator
+        assert_eq!(decode_utf16_reg_sz(&bytes).as_deref(), Some(s));
+    }
+
+    #[test]
+    fn decode_utf16_reg_sz_strips_trailing_nulls() {
+        // "x" + two null words.
+        let bytes: Vec<u8> = "x"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .chain(std::iter::once(0))
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        assert_eq!(decode_utf16_reg_sz(&bytes).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn decode_utf16_reg_sz_rejects_odd_length() {
+        assert_eq!(decode_utf16_reg_sz(&[1, 2, 3]), None);
+        assert_eq!(decode_utf16_reg_sz(&[1]), None);
+        assert_eq!(decode_utf16_reg_sz(&[]), None);
+    }
+
+    #[test]
+    fn legacy_install_dirs_contains_both_known_layouts() {
+        let dirs = legacy_install_dirs();
+        // We can't assert the absolute path (depends on the runtime user),
+        // but we can assert each leaf matches the expected layout.
+        let names: Vec<String> = dirs
+            .iter()
+            .map(|d| d.display().to_string().to_lowercase())
+            .collect();
+        assert!(
+            names
+                .iter()
+                .any(|n| n.ends_with("\\immichsync") && !n.contains("bees-roadhouse")),
+            "Expected pre-namespace dir ending in \\ImmichSync, got: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|n| n.ends_with("\\bees-roadhouse\\immichsync")),
+            "Expected mixed-roaming dir ending in \\bees-roadhouse\\immichsync, got: {names:?}"
         );
     }
 }

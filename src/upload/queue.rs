@@ -212,6 +212,21 @@ impl UploadQueue {
         let file_size_i64 = file_size_u64 as i64;
         let file_mtime = mtime_secs(&meta);
 
+        // Placeholder re-check: the watcher's filter dropped cloud-placeholder
+        // files at discovery time, but a file can be evicted to the cloud
+        // *between* discovery and now (OneDrive/SeaDrive auto-evict under
+        // storage pressure, or a user manually toggles "free up space"). If
+        // we hash a placeholder, the read triggers a full cloud download
+        // ... gigabytes of bandwidth and CPU for a file we're just going
+        // to skip on the next watcher pass anyway.
+        if crate::watch::filter::is_online_file(&meta) {
+            info!(
+                path = %path_str,
+                "Skipping file that became a cloud placeholder after watcher discovery"
+            );
+            return Ok(None);
+        }
+
         // 1. Fast-path dedup ... canonicalise the path so the lookup matches
         // the form `record_upload` stored (no `\\?\` prefix). Free win when
         // the file's been uploaded before with the same size + mtime.
@@ -230,11 +245,8 @@ impl UploadQueue {
             return Ok(None);
         }
 
-        // 2. SHA-1 hash + content dedup. Reading the file here will trigger
-        // a cloud download for placeholder files ... which is fine because
-        // the watcher's filter already dropped placeholders by default, and
-        // any placeholder that reached here has either been already-materialised
-        // or the user explicitly opted in to uploading placeholders.
+        // 2. SHA-1 hash + content dedup. Safe to read at this point ... the
+        // placeholder re-check above already covered the watcher/queue race.
         let hash = hasher::hash_file(&path).map_err(|source| QueueError::Hash {
             path: path_str.clone(),
             source,
@@ -461,5 +473,45 @@ mod tests {
         let queue = UploadQueue::new(store, 2);
         let result = queue.process_file(PathBuf::from("/nonexistent/photo.jpg"), None);
         assert!(result.is_err());
+    }
+
+    /// Mark a file with FILE_ATTRIBUTE_OFFLINE so the placeholder re-check
+    /// sees it as a cloud placeholder. Mirror of the helper in filter::tests.
+    #[cfg(windows)]
+    fn mark_offline(path: &std::path::Path) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let current = windows::Win32::Storage::FileSystem::GetFileAttributesW(
+                windows::core::PCWSTR(wide.as_ptr()),
+            );
+            let combined = current | crate::watch::filter::FILE_ATTRIBUTE_OFFLINE;
+            windows::Win32::Storage::FileSystem::SetFileAttributesW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(combined),
+            )
+            .is_ok()
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_file_skips_cloud_placeholder() {
+        let store = Arc::new(MockStore::default());
+        let queue = UploadQueue::new(store.clone(), 2);
+        let tmp = make_temp_file();
+        assert!(mark_offline(tmp.path()), "Failed to mark file offline");
+
+        // Should be skipped (return Ok(None)) without hashing the file or
+        // enqueueing — that's the whole point of the re-check.
+        let id = queue.process_file(tmp.path().to_path_buf(), None).unwrap();
+        assert!(id.is_none(), "Placeholder file should not enqueue");
+
+        let stats = queue.get_stats().unwrap();
+        assert_eq!(stats.total, 0, "Placeholder must not produce a queue row");
     }
 }
