@@ -110,7 +110,23 @@ restart_fail_count == 3 ──> Failed (permanent; no further probes/restarts)
 | `Degraded` (any restart in progress) | `Error` (red) with "watcher degraded — auto-restart in progress" if idle; stays on `Syncing` if uploads are flowing |
 | `Failed` (any permanent failure) | `Error` (red) with "one or more watchers are offline" |
 
-This is complementary to the **DB-vs-engine reconcile pass** (every 2s): that one converges the watched-folder *set* against the DB; this one converges each watcher's *liveness* against reality.
+This is complementary to the **DB-vs-engine reconcile pass** (next section): that one converges the watched-folder *set* against the DB; this one converges each watcher's *liveness* against reality.
+
+### DB-vs-Engine Reconcile
+
+The Settings window runs as a separate subprocess and writes folder mutations (add / remove / enable / disable) directly to the DB. The main process only receives a config-update message when the subprocess exits, so between a click and a window-close the running `WatchEngine` would be unaware of the change. A folder removed via Settings would keep watching and uploading files until Save.
+
+To close that window, the main loop runs a reconcile pass **every 2 seconds**:
+
+1. Read the DB's enabled-folder set ... but filter to **enabled AND `path.exists()`**.
+2. Compare to `WatchEngine::watched_paths()`.
+3. If they differ, `stop_all()` + `start_watch_engine()` to converge.
+
+The `path.exists()` filter is load-bearing: `start_watch_engine` already skips non-existent paths (logs a warning and moves on). If the reconcile compared unfiltered DB paths against the post-skip engine set, a stale DB row pointing at a deleted directory would create perpetual artificial drift ... the reconcile would restart the engine every 2 seconds forever, re-scanning every other folder on each restart. This regressed in v0.2.2-rc and was fixed by computing the drift against the same predicate `start_watch_engine` uses.
+
+Missing-folder warnings are throttled: the `WARN Watch folder missing, skipping path=...` log fires once per (folder, app-launch) via a `HashSet<PathBuf>` on the App; subsequent skips for the same path drop to `TRACE`. Without throttling, that warning would print every 2 seconds for every stale DB row.
+
+
 
 ### File Filtering
 
@@ -459,6 +475,24 @@ Config::config_dir()     // %APPDATA%\bees-roadhouse\immichsync\
 Config::local_data_dir() // %LOCALAPPDATA%\bees-roadhouse\immichsync\
 Config::config_path()    // config_dir() + "config.toml"
 ```
+
+### Log Retention
+
+Logs use `tracing_appender::rolling::daily`, which rotates a new file per UTC day named `immichsync.log.YYYY-MM-DD` but never deletes old days on its own. Without a retention pass that's unbounded growth on a long-running install.
+
+`src/platform/logs.rs::prune_logs(dir, cap)` enforces a **1 GiB** total cap on `local_data_dir().join("logs")`:
+
+- Sums the size of every `immichsync.log.*` file in the directory.
+- If the total exceeds the cap, deletes files in **oldest-first** order (parsed from the `YYYY-MM-DD` suffix, falling back to `mtime` for any unparseable name) until the total drops back under the cap.
+- **Never deletes the currently-open file** (today's UTC date). If today alone exceeds the cap, emits a `WARN` and leaves everything in place ... that's a signal worth keeping diagnosable.
+
+Runs once on app startup (right after the tracing subscriber comes up) and again hourly from the main loop. Logs the cleanup action at `INFO`:
+
+```
+Log retention: pruned N file(s) totalling X MiB; current total Y MiB / 1024 MiB cap
+```
+
+The 1 GiB cap is conservative; in normal operation each day's log is a few MiB. The cap exists to bound runaway scenarios (the v0.2.2-rc reconcile-loop regression generated ~10 K lines / ~1.7 MiB in two hours), not to manage steady-state.
 
 ### Legacy Migrations
 
