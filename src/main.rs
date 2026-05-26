@@ -299,6 +299,7 @@ fn main() -> anyhow::Result<()> {
             &config.server.url,
             &config.server.api_key,
             config.upload.bandwidth_limit_kbps,
+            config.upload.timeout_secs,
         ) {
             Ok(c) => {
                 info!(url = %config.server.url, "Immich client created");
