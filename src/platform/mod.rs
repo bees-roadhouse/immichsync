@@ -7,6 +7,7 @@ pub mod autostart;
 pub mod encryption;
 pub mod install;
 pub mod known_folders;
+pub mod logs;
 pub mod shortcuts;
 pub mod shutdown;
 pub mod single_instance;
