@@ -79,6 +79,8 @@ The binary lands in `target/release/immichsync.exe`.
 
 Settings are stored in `%APPDATA%\bees-roadhouse\immichsync\config.toml` (roaming, machine-portable). You can edit this directly or use the Settings UI. Machine-local state (SQLite upload queue, logs) lives separately in `%LOCALAPPDATA%\bees-roadhouse\immichsync\` so it doesn't get synced across machines on enterprise roaming profiles.
 
+Logs rotate daily under `%LOCALAPPDATA%\bees-roadhouse\immichsync\logs\immichsync.log.YYYY-MM-DD`. The retention cap is 1 GiB total; older logs are pruned automatically on startup and hourly. The current day's file is never deleted.
+
 ```toml
 [server]
 url = "https://immich.example.com"
