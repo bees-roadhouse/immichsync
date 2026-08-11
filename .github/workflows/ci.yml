@@ -5,13 +5,13 @@ name: CI
 # CI fires on pull_request only. Work branches don't trigger builds on
 # direct push — engineers test locally before opening a PR. Once a PR is
 # open, every commit pushed to it re-triggers CI via pull_request:synchronize.
-# After the PR squash-merges, the development branch's new SHA represents
+# After the PR squash-merges, main's new SHA represents
 # the same source tree as the PR head; we don't rebuild it. The PR's last
-# successful build is the canonical "current development" artifact.
+# successful build is the canonical "current main" artifact.
 #
-# Direct pushes to development bypass CI entirely (and per branch policy,
+# Direct pushes to main bypass CI entirely (and per branch policy,
 # shouldn't happen — PRs only). Release publishes are handled by the
-# separate release.yml workflow on push to release / v* tag.
+# separate release.yml workflow on a v* tag push.
 #
 # Artifact naming uses the PR's head ref (the work branch name) and the
 # head commit SHA. Format:
@@ -19,7 +19,7 @@ name: CI
 
 on:
   pull_request:
-    branches: [development, release]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
