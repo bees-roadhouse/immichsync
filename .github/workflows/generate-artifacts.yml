@@ -2,14 +2,14 @@ name: Generate Repo Artifacts
 
 # PR-driven SBOM + STRUCTURE regeneration.
 #
-# Runs on every PR targeting development or release. Regenerates SBOM.md
+# Runs on every PR targeting main. Regenerates SBOM.md
 # and STRUCTURE.md from the PR's head commit, and if anything changed,
 # commits + pushes the update directly onto the PR's head branch using
 # the workflow's GITHUB_TOKEN.
 #
 # Why PR-driven (not post-merge):
 #   - The PR that's about to merge carries the artifact update with it ...
-#     development is always in sync without a separate "chore: regenerate"
+#     main is always in sync without a separate "chore: regenerate"
 #     PR chasing it.
 #   - No need for `can_approve_pull_request_reviews` org-level permission
 #     just to open a regen PR ... the workflow pushes directly to the PR
@@ -31,7 +31,7 @@ name: Generate Repo Artifacts
 
 on:
   pull_request:
-    branches: [development, release]
+    branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore:
       - 'SBOM.md'
