@@ -2,12 +2,12 @@
 name = "immichsync"
 version = "0.2.3"
 edition = "2021"
-description = "Windows system tray app that syncs photos/videos to Immich"
+description = "Windows and macOS tray app that syncs photos/videos to Immich"
 license = "GPL-3.0-only"
 readme = "README.md"
 repository = "https://github.com/bees-roadhouse/immichsync"
 homepage = "https://github.com/bees-roadhouse/immichsync"
-keywords = ["immich", "windows", "tray", "sync", "photos"]
+keywords = ["immich", "windows", "macos", "tray", "photos"]
 categories = ["multimedia::images", "command-line-utilities"]
 authors = ["Bee's Roadhouse"]
 
@@ -29,25 +29,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-
-# Windows APIs
-windows = { version = "0.58", features = [
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_Storage_FileSystem",
-    "Win32_System_IO",
-    "Win32_UI_Shell",
-    "Win32_Devices_DeviceAndDriverInstallation",
-    "Win32_Foundation",
-    "Win32_Security_Cryptography",
-    # single_instance.rs  — CreateMutexW
-    "Win32_System_Threading",
-    # autostart.rs        — RegOpenKeyExW, RegSetValueExW, RegDeleteValueW, etc.
-    "Win32_System_Registry",
-    # known_folders.rs    — CoTaskMemFree (frees PWSTR from SHGetKnownFolderPath)
-    "Win32_System_Com",
-    # shortcuts.rs        — IPropertyStore, PROPERTYKEY (AppUserModelID on .lnk)
-    "Win32_UI_Shell_PropertiesSystem",
-] }
 
 # System tray
 tray-icon = "0.19"
@@ -87,9 +68,6 @@ async-trait = "0.1"
 # Folder picker dialog
 rfd = "0.15"
 
-# Windows toast notifications
-winrt-notification = "0.5"
-
 # Open URLs in browser
 open = "5"
 
@@ -101,6 +79,41 @@ tokio-util = { version = "0.7", features = ["io"] }
 
 # Stream combinators (for throttled upload bodies)
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# ── Platform-specific ───────────────────────────────────────────────
+# Everything OS-specific is reached only through src/platform/ (see
+# docs/adr/0001-macos-platform-seam.md).
+
+[target.'cfg(windows)'.dependencies]
+# Windows APIs
+windows = { version = "0.58", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_UI_Shell",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    # single_instance.rs  — CreateMutexW
+    "Win32_System_Threading",
+    # autostart.rs        — RegOpenKeyExW, RegSetValueExW, RegDeleteValueW, etc.
+    "Win32_System_Registry",
+    # known_folders.rs    — CoTaskMemFree (frees PWSTR from SHGetKnownFolderPath)
+    "Win32_System_Com",
+    # shortcuts.rs        — IPropertyStore, PROPERTYKEY (AppUserModelID on .lnk)
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+
+# Windows toast notifications
+winrt-notification = "0.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# NSApplication pump for the menu-bar app (same majors tray-icon/winit pull in)
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDate", "NSRunLoop", "NSString"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder", "NSRunningApplication"] }
+# flock (single instance), signal (graceful SIGTERM/SIGINT)
+libc = "0.2"
 
 # Temp files in tests
 [dev-dependencies]

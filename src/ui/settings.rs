@@ -29,6 +29,8 @@ use crate::watch::filter::{parse_patterns_json, patterns_to_json};
 /// so the `App` can apply changes at runtime.
 pub fn show_settings(config: Config, result_tx: Option<Sender<Config>>) {
     let options = eframe::NativeOptions {
+        // Windows only: macOS windows run on their subprocess's main thread.
+        #[cfg(windows)]
         event_loop_builder: Some(Box::new(|builder| {
             use winit::platform::windows::EventLoopBuilderExtWindows;
             builder.with_any_thread(true);

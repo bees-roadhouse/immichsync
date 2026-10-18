@@ -10,6 +10,8 @@ const STRIPE_LINK: &str = "https://buy.stripe.com/8x214n0IjaoL0zwcsj4AU00";
 /// create its event loop off the main thread.
 pub fn show_about() {
     let options = eframe::NativeOptions {
+        // Windows only: macOS windows run on their subprocess's main thread.
+        #[cfg(windows)]
         event_loop_builder: Some(Box::new(|builder| {
             use winit::platform::windows::EventLoopBuilderExtWindows;
             builder.with_any_thread(true);

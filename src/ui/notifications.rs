@@ -1,6 +1,9 @@
-// Windows toast notifications via winrt-notification.
+// Desktop notifications: Windows toasts via winrt-notification. On macOS
+// they are logged until UserNotifications lands with the app bundle (#62).
 
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(windows)]
+use tracing::warn;
 
 use crate::config::Config;
 
@@ -55,6 +58,7 @@ impl Notifications {
     fn show_toast(&self, title: &str, body: &str) {
         debug!(title, body, "Showing toast notification");
 
+        #[cfg(windows)]
         if let Err(e) = winrt_notification::Toast::new(crate::platform::APP_USER_MODEL_ID)
             .title(title)
             .text1(body)
@@ -62,5 +66,12 @@ impl Notifications {
         {
             warn!(error = %e, "Failed to show toast notification");
         }
+
+        #[cfg(not(windows))]
+        tracing::info!(
+            title,
+            body,
+            "Notification (not shown: macOS notifications are #62)"
+        );
     }
 }

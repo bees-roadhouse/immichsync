@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -420,6 +420,7 @@ pub fn apply_update(new_exe_path: &std::path::Path, new_version: &str) -> Result
 /// Delete leftover `.exe.old` from a previous update.
 ///
 /// Call early in startup, before anything else needs the exe.
+#[cfg(windows)]
 pub fn cleanup_old_exe() {
     let Ok(current_exe) = std::env::current_exe() else {
         return;
@@ -429,7 +430,9 @@ pub fn cleanup_old_exe() {
     if old_exe.exists() {
         match std::fs::remove_file(&old_exe) {
             Ok(()) => info!(path = %old_exe.display(), "Cleaned up old exe"),
-            Err(e) => warn!(path = %old_exe.display(), error = %e, "Failed to clean up old exe"),
+            Err(e) => {
+                tracing::warn!(path = %old_exe.display(), error = %e, "Failed to clean up old exe")
+            }
         }
     }
 }
