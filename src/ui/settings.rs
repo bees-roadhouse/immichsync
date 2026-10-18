@@ -530,7 +530,7 @@ impl SettingsApp {
         ui.separator();
         ui.add_space(8.0);
 
-        ui.checkbox(&mut self.autostart, "Start with Windows");
+        ui.checkbox(&mut self.autostart, crate::platform::AUTOSTART_LABEL);
         ui.checkbox(&mut self.minimize_to_tray, "Minimize to system tray");
         ui.checkbox(&mut self.show_notifications, "Show notifications");
         ui.checkbox(
