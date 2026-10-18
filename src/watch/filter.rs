@@ -683,4 +683,32 @@ mod tests {
         let meta = std::fs::metadata(f.path()).unwrap();
         assert!(!super::is_online_file(&meta), "plain file is not dataless");
     }
+
+    /// Against a real dataless file, which only a File Provider can make:
+    /// `IMMICHSYNC_DATALESS_SAMPLE=<path> cargo test -- --ignored real_dataless`
+    /// (find one with `find ~/Library/Mobile\ Documents -flags +dataless`).
+    /// Also checks that the stat didn't download it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn real_dataless_file_is_skipped_without_download() {
+        use std::os::macos::fs::MetadataExt;
+        let path = std::path::PathBuf::from(
+            std::env::var("IMMICHSYNC_DATALESS_SAMPLE").expect("set IMMICHSYNC_DATALESS_SAMPLE"),
+        );
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(super::is_online_file(&meta), "sample is not dataless");
+        assert!(!FileFilter::new().should_include(&path));
+        assert!(
+            FileFilter::new()
+                .with_ignore_online_files(false)
+                .should_include(&path)
+                || meta.len() < DEFAULT_MIN_SIZE
+        );
+        let after = std::fs::metadata(&path).unwrap();
+        assert!(
+            super::is_dataless_flags(after.st_flags()),
+            "file was materialised"
+        );
+    }
 }
