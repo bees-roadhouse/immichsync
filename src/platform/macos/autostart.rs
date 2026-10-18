@@ -2,7 +2,7 @@
 //
 // The real version registers `SMAppService.mainApp`, which needs a signed
 // `.app` bundle, with a `~/Library/LaunchAgents` plist fallback (#60). Until
-// then the setting is accepted and logged so the shared UI keeps working.
+// then enabling it returns `Unsupported`, which callers log as a warning.
 
 use thiserror::Error;
 
@@ -12,10 +12,10 @@ pub enum AutostartError {
     Unsupported,
 }
 
-/// Accept the setting without acting on it.
+/// Disabling is a no-op (nothing is ever registered); enabling is unsupported.
 pub fn set_autostart(enabled: bool) -> Result<(), AutostartError> {
     if enabled {
-        tracing::info!("Start at login requested; not implemented on macOS yet (#60)");
+        return Err(AutostartError::Unsupported);
     }
     Ok(())
 }

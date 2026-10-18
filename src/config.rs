@@ -331,6 +331,7 @@ impl Config {
     /// This is where the installed `immichsync.exe` (and `version.txt`)
     /// lives. Matches the per-user pattern used by VSCode, Slack, Discord,
     /// and other major Windows apps that ship without admin elevation.
+    #[cfg(windows)]
     pub fn install_dir() -> Result<PathBuf, ConfigError> {
         let base = dirs::data_local_dir().ok_or(ConfigError::NoDataDir)?;
         let dir = base.join("Programs").join("immichsync");
@@ -559,6 +560,7 @@ url = "https://photos.example.com"
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn install_dir_under_local_appdata_programs() {
         let dir = Config::install_dir().expect("install_dir");
