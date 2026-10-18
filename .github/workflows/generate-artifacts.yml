@@ -53,7 +53,8 @@ jobs:
   generate:
     name: Regenerate SBOM and STRUCTURE
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Long enough to wait out the parent's CI runs (see the last step).
+    timeout-minutes: 60
     if: github.event.pull_request.head.repo.full_name == github.repository
 
     steps:
@@ -144,53 +145,81 @@ jobs:
           git commit -m "chore: regenerate SBOM and STRUCTURE"
           git push origin HEAD:${{ github.head_ref }}
           NEW_SHA=$(git rev-parse HEAD)
+          PARENT_SHA=$(git rev-parse HEAD~1)
           echo "Pushed regenerated artifacts to PR branch ${{ github.head_ref }} as ${NEW_SHA}."
           echo "pushed=true" >> "$GITHUB_OUTPUT"
           echo "new_sha=${NEW_SHA}" >> "$GITHUB_OUTPUT"
+          echo "parent_sha=${PARENT_SHA}" >> "$GITHUB_OUTPUT"
 
       # When the artifact regen pushes a new commit to the PR branch, GitHub's
       # security model prevents that GITHUB_TOKEN push from re-triggering any
-      # workflows (loop prevention). The result is that the PR's CURRENT HEAD
-      # (the artifact commit) has no check_runs at all, and any required status
-      # checks (per the repo-level ruleset) are evaluated against the current
-      # HEAD ... so the PR is permanently blocked at "waiting for checks".
+      # workflows (loop prevention). The PR's CURRENT HEAD (the artifact
+      # commit) then has no check runs at all, and the required checks (repo
+      # ruleset 16845497) are evaluated against that HEAD, so the PR would be
+      # blocked forever at "waiting for checks".
       #
-      # We work around this by EXPLICITLY registering both required check_runs
-      # against the new HEAD SHA via the Checks API. The fiction is small and
-      # documented: the artifact-only commit differs from its parent solely in
-      # SBOM.md + STRUCTURE.md, which don't affect the Rust build. The parent
-      # commit's "Build & test" run passed; therefore the artifact commit
-      # trivially passes too. "Regenerate SBOM and STRUCTURE" passed (this very
-      # job) on the parent; ditto. We just have to tell the Checks API.
+      # So we register the required checks on the new HEAD ourselves, carrying
+      # over the PARENT commit's real results. The artifact commit differs
+      # from its parent only in SBOM.md + STRUCTURE.md, which don't affect the
+      # build, so the parent's CI verdict is the verdict for this commit too.
+      # The step waits for each parent run to finish and copies its actual
+      # conclusion. It never stamps a pass it hasn't seen (#87: it used to
+      # hard-code success while the real run was still going). "Regenerate
+      # SBOM and STRUCTURE" is this job, so it is success.
       #
       # Long-term fix: issue #23 (GitHub App migration). App-token pushes
-      # naturally re-trigger workflows, and the GitHub App can be added as a
-      # bypass actor on the ruleset, removing this workaround.
+      # naturally re-trigger workflows, removing this workaround.
       - name: Register check runs on new HEAD
         if: steps.push.outputs.pushed == 'true'
         uses: actions/github-script@v7
+        env:
+          PARENT_SHA: ${{ steps.push.outputs.parent_sha }}
+          NEW_SHA: ${{ steps.push.outputs.new_sha }}
         with:
           script: |
-            const newSha = '${{ steps.push.outputs.new_sha }}';
-            const shortSha = newSha.substring(0, 7);
-            const names = ['Build & test', 'Regenerate SBOM and STRUCTURE'];
-            for (const name of names) {
-              await github.rest.checks.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                name,
-                head_sha: newSha,
-                status: 'completed',
-                conclusion: 'success',
-                output: {
-                  title: `${name} (inherited from parent commit)`,
-                  summary: [
-                    `This check is registered programmatically against artifact-regen commit \`${shortSha}\`.`,
-                    ``,
-                    `The original CI run for "${name}" succeeded against the parent commit; this commit only changes \`SBOM.md\` and \`STRUCTURE.md\`, which don't affect the Rust build or any of the regen logic.`,
-                    ``,
-                    `Background: GITHUB_TOKEN-driven pushes cannot retrigger workflows in the same repo, so without this explicit check registration the PR would block on "waiting for ${name}" forever. See \`.github/workflows/generate-artifacts.yml\` for the rationale and bees-roadhouse/immichsync#23 for the long-term GitHub App migration that removes the workaround.`,
-                  ].join('\n'),
-                },
+            const { owner, repo } = context.repo;
+            const parentSha = process.env.PARENT_SHA;
+            const newSha = process.env.NEW_SHA;
+            const short = (sha) => sha.substring(0, 7);
+            // CI checks whose real result we carry over. Keep in step with
+            // the job names in ci.yml and the required checks in the ruleset.
+            const ciChecks = ['Build & test', 'Build & test (macOS)'];
+            const deadline = Date.now() + 50 * 60 * 1000;
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+            async function latestRun(name) {
+              const { data } = await github.rest.checks.listForRef({
+                owner, repo, ref: parentSha, check_name: name, filter: 'latest',
               });
+              return data.check_runs.sort((a, b) => b.id - a.id)[0];
+            }
+
+            async function stamp(name, conclusion, title, summary) {
+              await github.rest.checks.create({
+                owner, repo, name, head_sha: newSha,
+                status: 'completed', conclusion,
+                output: { title, summary },
+              });
+              core.info(`${name}: ${conclusion} on ${short(newSha)}`);
+            }
+
+            const why = `Background: GITHUB_TOKEN pushes cannot retrigger workflows, so this check is registered against artifact-regen commit \`${short(newSha)}\`, which changes only \`SBOM.md\` and \`STRUCTURE.md\`. See \`.github/workflows/generate-artifacts.yml\`, #87 and #23.`;
+
+            await stamp('Regenerate SBOM and STRUCTURE', 'success',
+              'Regenerate SBOM and STRUCTURE (this job)', why);
+
+            for (const name of ciChecks) {
+              let run = await latestRun(name);
+              while ((!run || run.status !== 'completed') && Date.now() < deadline) {
+                core.info(`${name}: waiting for the parent run on ${short(parentSha)} (${run ? run.status : 'not started'})`);
+                await sleep(30 * 1000);
+                run = await latestRun(name);
+              }
+              if (!run || run.status !== 'completed') {
+                await stamp(name, 'failure', `${name}: no finished run on the parent commit`,
+                  `No completed "${name}" run was found on parent \`${short(parentSha)}\` within 50 minutes, so no result can be carried over. Re-run CI (push an empty commit) to get a real one.\n\n${why}`);
+                continue;
+              }
+              await stamp(name, run.conclusion, `${name}: ${run.conclusion} (from parent ${short(parentSha)})`,
+                `Carried over from the real run on parent \`${short(parentSha)}\`: ${run.html_url}\n\n${why}`);
             }
