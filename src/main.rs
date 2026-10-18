@@ -98,7 +98,7 @@ fn main() -> anyhow::Result<()> {
     // `--window install` would try to show the install dialog recursively.
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 2 && args[1] == "--window" {
-        debug_log(&format!("Subprocess mode: --window {}", &args[2]));
+        debug_log(&format!("Subprocess mode: --window {}", args[2]));
         return run_window_subprocess(&args[2]);
     }
 
