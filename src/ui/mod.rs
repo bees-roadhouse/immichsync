@@ -3,6 +3,7 @@
 
 pub mod about;
 pub mod first_run;
+#[cfg(windows)]
 pub mod install;
 pub mod notifications;
 pub mod settings;

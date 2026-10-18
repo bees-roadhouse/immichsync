@@ -184,6 +184,19 @@ impl FileFilter {
             }
         };
 
+        // Never reach inside an Apple Photos library package: its
+        // originals/derivatives tree is Photos' private store, and watching
+        // ~/Pictures (the macOS default) would otherwise upload thumbnails.
+        // PhotoKit is the supported way in (#66).
+        if path.components().any(|c| {
+            c.as_os_str()
+                .to_str()
+                .is_some_and(|s| s.to_ascii_lowercase().ends_with(".photoslibrary"))
+        }) {
+            debug!("Excluding (inside a Photos library): {:?}", path);
+            return false;
+        }
+
         // Exact-name exclusion list
         if self.excluded_names.contains(file_name) {
             debug!("Excluding by name: {:?}", path);
@@ -384,6 +397,29 @@ mod tests {
         let p = dir.path().join("Thumbs.db");
         std::fs::write(&p, vec![0u8; 2048]).unwrap();
         assert!(!filter.should_include(&p), "Thumbs.db should be excluded");
+    }
+
+    #[test]
+    fn files_inside_a_photos_library_are_excluded() {
+        let filter = FileFilter::new();
+        let dir = tempfile::tempdir().unwrap();
+        let inside = dir
+            .path()
+            .join("Photos Library.photoslibrary")
+            .join("originals")
+            .join("A");
+        std::fs::create_dir_all(&inside).unwrap();
+        let p = inside.join("IMG_0001.heic");
+        std::fs::write(&p, vec![0u8; 2048]).unwrap();
+        assert!(
+            !filter.should_include(&p),
+            "Photos library internals must be skipped"
+        );
+
+        // The same file outside the package is a normal photo.
+        let outside = dir.path().join("IMG_0001.heic");
+        std::fs::write(&outside, vec![0u8; 2048]).unwrap();
+        assert!(filter.should_include(&outside));
     }
 
     #[test]

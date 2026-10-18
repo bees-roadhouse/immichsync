@@ -1,8 +1,10 @@
 // Application state and lifecycle management.
 //
 // `App` wires together the upload pipeline, watch engine, system tray, and
-// settings UI.  The main loop is a native Win32 message pump — simpler and
-// more reliable for a tray-only app than running a full winit event loop.
+// settings UI.  The main loop polls everything every 50 ms and drains the
+// OS event queue (Win32 messages / AppKit events) through
+// `platform::event_loop::pump` — simpler and more reliable for a tray-only
+// app than running a full winit event loop.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -11,9 +13,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tracing::{info, trace, warn};
-use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, WM_QUIT,
-};
 
 use crate::api::ImmichClient;
 use crate::config::Config;
@@ -174,7 +173,9 @@ impl App {
             }
         }
 
-        // Create system tray (must be on main thread).
+        // Create system tray (must be on main thread, after the platform's
+        // app object exists — NSApplication on macOS).
+        crate::platform::event_loop::init();
         let (tray, tray_rx) =
             TrayApp::new().map_err(|e| anyhow::anyhow!("Failed to create tray: {}", e))?;
         self.tray = Some(tray);
@@ -216,7 +217,7 @@ impl App {
         self.start_watch_engine()?;
 
         // Schedule the first automatic update check after a startup delay.
-        if self.config.advanced.check_for_updates {
+        if crate::platform::SELF_UPDATE_SUPPORTED && self.config.advanced.check_for_updates {
             self.schedule_update_check(true);
         }
 
@@ -225,25 +226,18 @@ impl App {
 
     /// Run the main message loop. Blocks until the user selects Quit.
     ///
-    /// Uses a native Win32 message pump so tray-icon's hidden window
-    /// receives all its messages correctly (right-click menu, etc.).
+    /// Drains the OS event queue each tick (`platform::event_loop::pump`) so
+    /// the tray icon's menu works (Win32 messages / AppKit events).
     pub fn run(&mut self) {
         info!("Entering main message loop");
 
         loop {
-            // Pump all pending Windows messages. This is what makes the
-            // tray icon's context menu work — tray-icon creates a hidden
-            // window that needs message dispatch to show the popup menu.
-            unsafe {
-                let mut msg = MSG::default();
-                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).into() {
-                    if msg.message == WM_QUIT {
-                        info!("WM_QUIT received");
-                        self.shutdown_and_exit();
-                    }
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
+            // Pump all pending OS events. This is what makes the tray
+            // icon's context menu work — on Windows tray-icon's hidden
+            // window needs message dispatch, on macOS the NSStatusItem
+            // needs AppKit events. `true` means the OS asked us to quit.
+            if crate::platform::event_loop::pump() {
+                self.shutdown_and_exit();
             }
 
             // Process tray menu actions. Collect first to avoid
@@ -284,7 +278,8 @@ impl App {
             let check_interval = updater::check_interval_from_hours(
                 self.config.advanced.update_check_interval_hours,
             );
-            if self.config.advanced.check_for_updates
+            if crate::platform::SELF_UPDATE_SUPPORTED
+                && self.config.advanced.check_for_updates
                 && self.last_update_check.elapsed() >= check_interval
             {
                 self.schedule_update_check(false);
@@ -808,6 +803,10 @@ impl App {
     ///
     /// If `with_delay` is true, waits `STARTUP_DELAY` before checking.
     fn schedule_update_check(&mut self, with_delay: bool) {
+        if !crate::platform::SELF_UPDATE_SUPPORTED {
+            info!("Self-update is not supported on this platform yet (#63); skipping check");
+            return;
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         self.update_rx = Some(rx);
         self.last_update_check = Instant::now();

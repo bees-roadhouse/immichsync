@@ -10,6 +10,8 @@ use crate::db::DbStore;
 /// Open the trash log viewer (blocking the calling thread).
 pub fn show_trash_log(db: Arc<DbStore>) {
     let options = eframe::NativeOptions {
+        // Windows only: macOS windows run on their subprocess's main thread.
+        #[cfg(windows)]
         event_loop_builder: Some(Box::new(|builder| {
             use winit::platform::windows::EventLoopBuilderExtWindows;
             builder.with_any_thread(true);

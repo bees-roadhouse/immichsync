@@ -93,6 +93,17 @@ pub struct ServerConfig {
     pub device_id: String,
 }
 
+/// Environment variable that supplies the API key for this process only.
+///
+/// For dev and test runs (`IMMICHSYNC_API_KEY="$(op read …)" immichsync`):
+/// the key is used in memory and never written to `config.toml`, so a secret
+/// read at run time stays off disk. Window subprocesses inherit it.
+pub const API_KEY_ENV: &str = "IMMICHSYNC_API_KEY";
+
+fn env_api_key() -> Option<String> {
+    std::env::var(API_KEY_ENV).ok().filter(|k| !k.is_empty())
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         let hostname = hostname::get()
@@ -348,6 +359,16 @@ impl Config {
     pub fn load() -> Result<Self, ConfigError> {
         let path = Self::config_path()?;
 
+        let mut config = Self::load_from_disk(&path)?;
+        if let Some(key) = env_api_key() {
+            debug!("Using API key from {API_KEY_ENV} (not persisted)");
+            config.server.api_key = key;
+        }
+        Ok(config)
+    }
+
+    fn load_from_disk(path: &std::path::Path) -> Result<Self, ConfigError> {
+        let path = path.to_path_buf();
         if !path.exists() {
             info!("Config file not found, using defaults");
             return Ok(Self::default());
@@ -392,6 +413,12 @@ impl Config {
 
         // Clone and encrypt the API key before serializing.
         let mut config_to_save = self.clone();
+
+        // A key supplied through API_KEY_ENV is never persisted: keep
+        // whatever the file already held instead.
+        if env_api_key().is_some_and(|k| k == config_to_save.server.api_key) {
+            config_to_save.server.api_key = Self::stored_api_key(&path);
+        }
         if !config_to_save.server.api_key.is_empty()
             && !crate::platform::encryption::is_encrypted(&config_to_save.server.api_key)
         {
@@ -413,6 +440,14 @@ impl Config {
             source,
         })?;
 
+        // Owner-only on Unix: until the Keychain slice (#61) the macOS build
+        // keeps the API key in this file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+        }
+
         fs::rename(&tmp_path, &path).map_err(|source| ConfigError::Rename {
             path: path.clone(),
             source,
@@ -420,6 +455,16 @@ impl Config {
 
         debug!(path = %path.display(), "Saved config to disk");
         Ok(())
+    }
+
+    /// The `api_key` value exactly as stored in the file (possibly `enc:`),
+    /// or empty when there is no file or no key.
+    fn stored_api_key(path: &std::path::Path) -> String {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|s| toml::from_str::<Self>(&s).ok())
+            .map(|c| c.server.api_key)
+            .unwrap_or_default()
     }
 }
 
@@ -527,9 +572,11 @@ url = "https://photos.example.com"
         assert!(dir.ends_with("Programs\\immichsync") || dir.ends_with("Programs/immichsync"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn paths_are_distinct() {
         // The whole point of the split: these three dirs are not the same.
+        // (macOS has one Application Support dir for both; see below.)
         let cfg = Config::config_dir().expect("config_dir");
         let local = Config::local_data_dir().expect("local_data_dir");
         let install = Config::install_dir().expect("install_dir");
@@ -538,6 +585,19 @@ url = "https://photos.example.com"
         assert_ne!(
             local, install,
             "local_data_dir must differ from install_dir"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_config_and_state_share_application_support() {
+        let cfg = Config::config_dir().expect("config_dir");
+        let local = Config::local_data_dir().expect("local_data_dir");
+        assert_eq!(cfg, local);
+        assert!(
+            cfg.ends_with("Library/Application Support/bees-roadhouse/immichsync"),
+            "unexpected config_dir {}",
+            cfg.display()
         );
     }
 

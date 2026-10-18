@@ -48,6 +48,7 @@ fn main() -> anyhow::Result<()> {
     // autostart / Apps & Features entries that point at the old location.
     // Must run BEFORE migrate_to_split_layout so the migration doesn't fight
     // a still-running v0.1.x for the state.db lock.
+    #[cfg(windows)]
     platform::cleanup_legacy_install();
 
     // ── Legacy data migration ────────────────────────────────────────────
@@ -58,16 +59,19 @@ fn main() -> anyhow::Result<()> {
     //     in roaming) → Windows-standard split: binary in
     //     %LOCALAPPDATA%\Programs\immichsync\, config stays in roaming,
     //     DB + logs move to %LOCALAPPDATA%\bees-roadhouse\immichsync\.
-    if let Err(e) = platform::migrate_legacy_data() {
-        // Non-fatal: log to stderr since tracing isn't up yet.
-        eprintln!("Warning: legacy data migration failed: {e}");
-    }
-    if let Err(e) = platform::migrate_to_split_layout() {
-        eprintln!("Warning: split-layout migration failed: {e}");
-    }
+    #[cfg(windows)]
+    {
+        if let Err(e) = platform::migrate_legacy_data() {
+            // Non-fatal: log to stderr since tracing isn't up yet.
+            eprintln!("Warning: legacy data migration failed: {e}");
+        }
+        if let Err(e) = platform::migrate_to_split_layout() {
+            eprintln!("Warning: split-layout migration failed: {e}");
+        }
 
-    // Clean up leftover .exe.old from a previous self-update.
-    updater::cleanup_old_exe();
+        // Clean up leftover .exe.old from a previous self-update.
+        updater::cleanup_old_exe();
+    }
 
     // ── Logging ──────────────────────────────────────────────────────────
     let log_dir = config::Config::local_data_dir()?.join("logs");
@@ -107,6 +111,7 @@ fn main() -> anyhow::Result<()> {
     // uninstall ImmichSync`. Removes the binary + shortcuts + autostart +
     // Uninstall registry block. Preserves user data (config.toml + DB +
     // logs) so reinstall picks up where the user left off.
+    #[cfg(windows)]
     if args.iter().any(|a| a == "--uninstall") {
         let silent = args.iter().any(|a| a == "--silent");
         debug_log(&format!("Uninstall mode: silent={silent}"));
@@ -125,112 +130,11 @@ fn main() -> anyhow::Result<()> {
     //
     // We call AllowSetForegroundWindow before spawning so the subprocess
     // can bring its window to the foreground on Windows.
-    let current_exe_path = std::env::current_exe().unwrap_or_default();
-    debug_log(&format!(
-        "Install check: current_exe={}",
-        current_exe_path.display()
-    ));
-    match platform::is_running_installed() {
-        Ok(false) => {
-            debug_log("is_running_installed=false");
-            // Check if user previously chose portable mode.
-            let portable = config::Config::load()
-                .map(|c| c.ui.portable_mode)
-                .unwrap_or(false);
-
-            if portable {
-                debug_log("Portable mode, skipping install");
-                info!("Portable mode enabled, skipping install");
-            } else {
-                let installed_exe = platform::installed_exe_path().ok();
-                let installed_exists = installed_exe.as_ref().is_some_and(|p| p.exists());
-                debug_log(&format!(
-                    "installed_exe={:?}, exists={installed_exists}",
-                    installed_exe
-                ));
-
-                if installed_exists {
-                    // Determine if the installed copy needs updating.
-                    let installed_ver = platform::install::installed_version();
-                    let update_info = match &installed_ver {
-                        None => Some((
-                            String::from("unknown"),
-                            platform::install::running_version().to_string(),
-                        )),
-                        Some(_) => platform::install::is_update_available(),
-                    };
-                    debug_log(&format!(
-                        "installed_ver={installed_ver:?}, update_info={update_info:?}"
-                    ));
-
-                    if let Some((old_ver, new_ver)) = update_info {
-                        info!(
-                            from = %old_ver, to = %new_ver,
-                            "Newer version running, spawning install-update dialog"
-                        );
-                        debug_log(&format!(
-                            "Spawning install-update dialog: {old_ver} -> {new_ver}"
-                        ));
-                        match spawn_install_dialog(&[
-                            "--window",
-                            "install-update",
-                            "--old-version",
-                            &old_ver,
-                        ]) {
-                            Some(0) => {
-                                // The subprocess already relaunched from the installed path
-                                // and killed the old instance + parent. Just exit.
-                                debug_log("Install dialog returned 0 (installed), exiting");
-                                info!("Update complete, subprocess handled relaunch");
-                                return Ok(());
-                            }
-                            other => {
-                                debug_log(&format!(
-                                    "Install dialog returned {other:?}, continuing"
-                                ));
-                                info!("User declined update, continuing from current location");
-                            }
-                        }
-                    } else {
-                        // Same version already installed — silently relaunch.
-                        debug_log("Same version installed, relaunching");
-                        info!("Same version already installed, relaunching from installed path");
-                        if let Err(e) = platform::relaunch_installed() {
-                            debug_log(&format!("Relaunch failed: {e}"));
-                            tracing::warn!(error = %e, "Relaunch failed, continuing from current location");
-                        }
-                    }
-                } else {
-                    // No installed copy — show fresh install dialog.
-                    debug_log("No installed exe, spawning fresh install dialog");
-                    info!("Not running from installed path, spawning install dialog");
-                    match spawn_install_dialog(&["--window", "install"]) {
-                        Some(0) => {
-                            // The subprocess already relaunched from the installed path.
-                            debug_log("Install dialog returned 0 (installed), exiting");
-                            info!("Install complete, subprocess handled relaunch");
-                            return Ok(());
-                        }
-                        other => {
-                            debug_log(&format!(
-                                "Install dialog returned {other:?}, continuing portable"
-                            ));
-                            info!("User chose portable mode, continuing from current location");
-                        }
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            debug_log(&format!("is_running_installed error: {e}"));
-            tracing::warn!(error = %e, "Could not check install status, continuing");
-        }
-        Ok(true) => {
-            debug_log("is_running_installed=true, checking for updates");
-            // Running from installed location — check for updates before starting the tray app.
-            info!("Running from installed path, checking for updates");
-            check_for_update_on_startup();
-        }
+    //
+    // macOS has no self-install: the bundle in Applications is the install.
+    #[cfg(windows)]
+    if install_or_relaunch() {
+        return Ok(());
     }
 
     info!("ImmichSync starting");
@@ -334,6 +238,122 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Show the install/update dialog or relaunch from the installed copy when
+/// this binary isn't the installed one; check for updates when it is.
+/// Returns `true` when this process should exit (a subprocess relaunched).
+#[cfg(windows)]
+fn install_or_relaunch() -> bool {
+    let current_exe_path = std::env::current_exe().unwrap_or_default();
+    debug_log(&format!(
+        "Install check: current_exe={}",
+        current_exe_path.display()
+    ));
+    match platform::is_running_installed() {
+        Ok(false) => {
+            debug_log("is_running_installed=false");
+            // Check if user previously chose portable mode.
+            let portable = config::Config::load()
+                .map(|c| c.ui.portable_mode)
+                .unwrap_or(false);
+
+            if portable {
+                debug_log("Portable mode, skipping install");
+                info!("Portable mode enabled, skipping install");
+            } else {
+                let installed_exe = platform::installed_exe_path().ok();
+                let installed_exists = installed_exe.as_ref().is_some_and(|p| p.exists());
+                debug_log(&format!(
+                    "installed_exe={:?}, exists={installed_exists}",
+                    installed_exe
+                ));
+
+                if installed_exists {
+                    // Determine if the installed copy needs updating.
+                    let installed_ver = platform::install::installed_version();
+                    let update_info = match &installed_ver {
+                        None => Some((
+                            String::from("unknown"),
+                            platform::install::running_version().to_string(),
+                        )),
+                        Some(_) => platform::install::is_update_available(),
+                    };
+                    debug_log(&format!(
+                        "installed_ver={installed_ver:?}, update_info={update_info:?}"
+                    ));
+
+                    if let Some((old_ver, new_ver)) = update_info {
+                        info!(
+                            from = %old_ver, to = %new_ver,
+                            "Newer version running, spawning install-update dialog"
+                        );
+                        debug_log(&format!(
+                            "Spawning install-update dialog: {old_ver} -> {new_ver}"
+                        ));
+                        match spawn_install_dialog(&[
+                            "--window",
+                            "install-update",
+                            "--old-version",
+                            &old_ver,
+                        ]) {
+                            Some(0) => {
+                                // The subprocess already relaunched from the installed path
+                                // and killed the old instance + parent. Just exit.
+                                debug_log("Install dialog returned 0 (installed), exiting");
+                                info!("Update complete, subprocess handled relaunch");
+                                return true;
+                            }
+                            other => {
+                                debug_log(&format!(
+                                    "Install dialog returned {other:?}, continuing"
+                                ));
+                                info!("User declined update, continuing from current location");
+                            }
+                        }
+                    } else {
+                        // Same version already installed — silently relaunch.
+                        debug_log("Same version installed, relaunching");
+                        info!("Same version already installed, relaunching from installed path");
+                        if let Err(e) = platform::relaunch_installed() {
+                            debug_log(&format!("Relaunch failed: {e}"));
+                            tracing::warn!(error = %e, "Relaunch failed, continuing from current location");
+                        }
+                    }
+                } else {
+                    // No installed copy — show fresh install dialog.
+                    debug_log("No installed exe, spawning fresh install dialog");
+                    info!("Not running from installed path, spawning install dialog");
+                    match spawn_install_dialog(&["--window", "install"]) {
+                        Some(0) => {
+                            // The subprocess already relaunched from the installed path.
+                            debug_log("Install dialog returned 0 (installed), exiting");
+                            info!("Install complete, subprocess handled relaunch");
+                            return true;
+                        }
+                        other => {
+                            debug_log(&format!(
+                                "Install dialog returned {other:?}, continuing portable"
+                            ));
+                            info!("User chose portable mode, continuing from current location");
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            debug_log(&format!("is_running_installed error: {e}"));
+            tracing::warn!(error = %e, "Could not check install status, continuing");
+        }
+        Ok(true) => {
+            debug_log("is_running_installed=true, checking for updates");
+            // Running from installed location — check for updates before starting the tray app.
+            info!("Running from installed path, checking for updates");
+            check_for_update_on_startup();
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
 /// Blocking update check at startup (before the tray app starts).
 ///
 /// Runs a quick GitHub API check. If an update is available, serializes the
@@ -432,6 +452,7 @@ fn check_for_update_on_startup() {
     }
 }
 
+#[cfg(windows)]
 /// Spawn a subprocess dialog with foreground window rights.
 ///
 /// Calls `AllowSetForegroundWindow(ASFW_ANY)` so the child process can
@@ -482,10 +503,12 @@ fn spawn_install_dialog(args: &[&str]) -> Option<i32> {
 /// limitation that only allows one EventLoop per process lifetime.
 fn run_window_subprocess(window_type: &str) -> anyhow::Result<()> {
     match window_type {
+        #[cfg(windows)]
         "install" => {
             info!("Subprocess: running install dialog");
             ui::install::run_install_dialog_subprocess(false, None);
         }
+        #[cfg(windows)]
         "install-update" => {
             info!("Subprocess: running update dialog");
             // Parse --old-version from remaining args.
