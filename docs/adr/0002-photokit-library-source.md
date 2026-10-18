@@ -1,6 +1,6 @@
 # 0002 — Apple Photos library as a second watch source (PhotoKit)
 
-- **Status:** proposed (2026-10-18)
+- **Status:** accepted (2026-10-18). Nate accepted all four recommendations; see *Decisions* at the end.
 - **Decided upstream:** Nate, 2026-10-18, via Pia: "both", meaning folder sync *and* the Photos library. Folder sync came first (#59–#64). This note shapes the library half before any code is written (#66).
 - **Builds on:** [0001](0001-macos-platform-seam.md) (the platform seam and the `.app` bundle, #63).
 
@@ -81,9 +81,9 @@ PhotoKit ──(enumerate / change token)──► PhotosSource ──(export or
 4. **Live Photos:** pair export and upload with `livePhotoVideoId`; verify linking on pics.trh.
 5. **Settings polish:** status lines, Limited-library selection, Open Privacy Settings, tray counts.
 
-## Open questions for Nate
+## Decisions (Nate, 2026-10-18, via Pia: "Accept all (Recommended)")
 
-1. iCloud originals: **download by default** (recommended), or skip?
-2. Originals only (recommended), or also upload the edited version as a separate asset?
-3. Hidden photos and shared-library items: excluded by default (recommended). Any reason to include them?
-4. Map Photos albums to Immich albums? Not in these slices; it's a natural sixth.
+1. **iCloud originals: download by default.** `photos.icloud_originals = "download"`; `skip` stays available as a setting.
+2. **Originals only.** Edited renders are not uploaded.
+3. **Hidden and shared-library items excluded** by default.
+4. **Photos → Immich album mapping: later.** A possible sixth slice, not in this plan.
