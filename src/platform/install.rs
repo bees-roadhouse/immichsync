@@ -880,8 +880,10 @@ fn decode_utf16_reg_sz(bytes: &[u8]) -> Option<String> {
         return None;
     }
     let words: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     // Strip trailing nulls.
     let end = words.iter().position(|&w| w == 0).unwrap_or(words.len());

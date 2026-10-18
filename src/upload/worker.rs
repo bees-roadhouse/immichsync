@@ -71,6 +71,9 @@ pub struct BulkCheckResult {
 /// without a real server.
 ///
 /// The concrete implementation lives in `src/api/assets.rs`.
+// async-trait's generated signatures stack #[must_use] on a boxed future,
+// which clippy 1.99's double_must_use flags; the code is the macro's.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait AssetUploader: Send + Sync {
     /// Upload a single file as a new asset.
