@@ -29,19 +29,38 @@ pub enum AutostartError {
 
     #[error("could not write or remove the LaunchAgent: {0}")]
     LaunchAgent(std::io::Error),
+
+    #[error("could not remove the login item: {0}")]
+    Unregister(String),
 }
 
 /// Enable or disable starting ImmichSync at login.
 pub fn set_autostart(enabled: bool) -> Result<(), AutostartError> {
     let exe = std::env::current_exe().map_err(AutostartError::ExePath)?;
     let agents = launch_agents_dir()?;
+    apply(enabled, &exe, &agents, set_main_app_service)
+}
 
-    if is_bundled(&exe) {
-        match set_main_app_service(enabled) {
+/// The decision logic, with SMAppService passed in so tests can fail it.
+fn apply(
+    enabled: bool,
+    exe: &Path,
+    agents: &Path,
+    main_app_service: impl Fn(bool) -> Result<(), String>,
+) -> Result<(), AutostartError> {
+    if is_bundled(exe) {
+        match main_app_service(enabled) {
             Ok(()) => {
                 // SMAppService owns it now; drop any dev-build agent.
-                remove_launch_agent(&agents)?;
+                remove_launch_agent(agents)?;
                 return Ok(());
+            }
+            // Disabling must not report success while the login item is
+            // still registered: the user would think it's off. Clear any
+            // agent anyway, then surface the failure.
+            Err(e) if !enabled => {
+                remove_launch_agent(agents)?;
+                return Err(AutostartError::Unregister(e));
             }
             Err(e) => warn!(
                 error = %e,
@@ -51,13 +70,13 @@ pub fn set_autostart(enabled: bool) -> Result<(), AutostartError> {
     } else if enabled {
         // A bare binary can't use SMAppService. Make sure a bundle's earlier
         // registration doesn't linger alongside the agent.
-        let _ = set_main_app_service(false);
+        let _ = main_app_service(false);
     }
 
     if enabled {
-        write_launch_agent(&agents, &exe)
+        write_launch_agent(agents, exe)
     } else {
-        remove_launch_agent(&agents)
+        remove_launch_agent(agents)
     }
 }
 
@@ -214,5 +233,35 @@ mod tests {
         assert!(!path.exists());
         // Removing again is not an error.
         remove_launch_agent(&agents).unwrap();
+    }
+
+    const BUNDLED: &str = "/Applications/ImmichSync.app/Contents/MacOS/immichsync";
+
+    #[test]
+    fn bundled_disable_failure_is_an_error_and_clears_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("LaunchAgents");
+        write_launch_agent(&agents, Path::new(BUNDLED)).unwrap();
+
+        let r = apply(false, Path::new(BUNDLED), &agents, |_| Err("denied".into()));
+        assert!(matches!(r, Err(AutostartError::Unregister(ref m)) if m == "denied"));
+        assert!(!launch_agent_path(&agents).exists());
+    }
+
+    #[test]
+    fn bundled_enable_failure_falls_back_to_an_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("LaunchAgents");
+        apply(true, Path::new(BUNDLED), &agents, |_| Err("nope".into())).unwrap();
+        assert!(launch_agent_path(&agents).exists());
+    }
+
+    #[test]
+    fn bundled_success_removes_a_stale_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("LaunchAgents");
+        write_launch_agent(&agents, Path::new(BUNDLED)).unwrap();
+        apply(true, Path::new(BUNDLED), &agents, |_| Ok(())).unwrap();
+        assert!(!launch_agent_path(&agents).exists());
     }
 }

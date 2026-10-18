@@ -694,6 +694,17 @@ impl SettingsApp {
         // Toggle autostart.
         if let Err(e) = crate::platform::set_autostart(self.autostart) {
             tracing::warn!(error = %e, "Failed to set autostart");
+            // Say so: a silently failed "off" leaves the app starting at
+            // login while the checkbox says it won't.
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Warning)
+                .set_title("ImmichSync")
+                .set_description(format!(
+                    "Couldn't change \"{}\": {e}",
+                    crate::platform::AUTOSTART_LABEL
+                ))
+                .set_buttons(rfd::MessageButtons::Ok)
+                .show();
         }
 
         // Notify the running app of the new config so it can apply changes.
