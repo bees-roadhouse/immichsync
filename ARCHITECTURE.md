@@ -410,6 +410,8 @@ Five tabs:
 
 ## Platform Integration
 
+Everything below describes Windows. macOS support sits behind the same `src/platform/` seam, selected by `cfg(target_os)`; the Windows → macOS map and the slice plan are in [docs/adr/0001-macos-platform-seam.md](docs/adr/0001-macos-platform-seam.md).
+
 ### Single Instance
 
 Named mutex (`Global\ImmichSync`) ensures only one instance runs. If a second launch is attempted, it activates the existing instance's settings window.
