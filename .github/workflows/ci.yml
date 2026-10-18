@@ -82,6 +82,7 @@ jobs:
         # Gating after the v0.2.0 cargo fmt sweep (issue #8).
         # Run `cargo fmt --all` locally before opening a PR; CI fails otherwise.
         run: cargo fmt --all -- --check
+
   build-and-test-macos:
     # macOS (Apple Silicon) twin of the Windows job. A separate job, not a
     # matrix leg, so the required "Build & test" check keeps its name.
