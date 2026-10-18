@@ -91,19 +91,20 @@ cargo test
 
 Follows the DevOps book standards: [Branching Strategy](https://kb.beesroadhouse.com/books/developer-operations-devops/page/branching-strategy), [Change Taxonomy](https://kb.beesroadhouse.com/books/developer-operations-devops/page/change-taxonomy), [PR Merge Strategy](https://kb.beesroadhouse.com/books/developer-operations-devops/page/pr-merge-strategy), [Issue Workflow](https://kb.beesroadhouse.com/books/developer-operations-devops/page/issue-workflow).
 
-- `development` is the default branch (always shippable). All changes land via PR — the org `Default Branch Protection` ruleset (id 15744970) requires thread resolution and rejects direct pushes with `GH013`. Approving review is not currently required (solo-developer org; CI is the gate). Re-enable the review count when collaborators arrive.
-- `release` is also PR-protected by the org `Release Branch Protection` ruleset (id 15553415), which targets `refs/heads/release`, `refs/heads/release/*`, and `refs/heads/release-*`. Same review policy (0 required) and thread-resolution requirement.
-- Work branches: `feature/`, `improvement/`, `refactor/`, `bug/`.
-- One discrete change per PR; rebase onto `development` before merge.
-- **Squash-and-merge** for work-branch → `development`. **Merge commit** for `development` → `release` (squashing the release transition breaks ancestor relationship).
-- `BREAKING:` prefix in PR title forces a major version bump regardless of type.
+- `main` is the only long-lived branch, and it is production (org migrated 2026-07-05; Branching Strategy rewritten 2026-07-25). All changes land via PR. The org `Default Branch Protection` ruleset (id 15744970) requires thread resolution and rejects direct pushes with `GH013`. An approving review is not required (solo-developer org; CI is the gate). Re-enable the review count when collaborators arrive.
+- Every change starts as an issue with one `type:` label, one `category:` label and one state label (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). A decision ticket carries `wayfinder:*` and no type.
+- Work branches off `main`: `feature/`, `improvement/`, `refactor/`, `bug/` plus a slug. A branch that answers a question rather than landing code is `prototype/<name>` or `research/<name>`. It never merges, and its verdict goes on the issue.
+- One issue, one PR to `main`, closing it with `Closes #n`. The body carries Why, Summary, Evidence, Merge Danger, and what was deliberately not done. Rebase onto `main` before merge. **Squash-and-merge**, then delete the branch. There is no integration branch, even for a wide refactor.
+- `BREAKING:` prefix in the PR title forces a major version bump regardless of type.
 - Standard PR-create incantation (auto-merge once required checks pass):
   ```bash
-  gh pr create --base development --head <branch> --title "..." --body "..."
+  gh pr create --base main --head <branch> --title "..." --body "..."
   gh pr merge --auto --squash --delete-branch
   ```
-  Use `--admin --squash --delete-branch` instead for the documented "small touchups" OrganizationAdmin bypass (docs typos, link fixes, version-bump-only PRs). See [Branching Strategy](https://kb.beesroadhouse.com/books/developer-operations-devops/page/branching-strategy) for the full policy.
-- Required status checks on this repo (per repo-level ruleset id 16845497): `Build & test` (ci.yml) AND `Regenerate SBOM and STRUCTURE` (generate-artifacts.yml).
+  Use `--admin --squash --delete-branch` instead for the documented "small touchups" OrganizationAdmin bypass (docs typos, link fixes, version-bump-only PRs). See [Branching Strategy](https://kb.beesroadhouse.com/books/developer-operations-devops/page/branching-strategy).
+- Required status checks (repo ruleset id 16845497): `Build & test` (ci.yml, Windows) and `Regenerate SBOM and STRUCTURE` (generate-artifacts.yml). `Build & test (macOS)` joins once the macOS CI job lands. Caveat until #23: after it pushes a regen commit, generate-artifacts stamps `Build & test: success` on the new HEAD without waiting for the real run, so judge a PR by the run on the commit before the regen.
+- Pushing changes under `.github/workflows/` needs the `workflow` scope on the `gh` token; without it, GitHub rejects the push.
+- Releases: `release.yml` still triggers on the retired `release` branch and on `v*` tags. Until that is retargeted, cut a release by pushing a `v*` tag on `main`.
 
 ### Two-Tier Labels
 
