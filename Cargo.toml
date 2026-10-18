@@ -112,6 +112,8 @@ winrt-notification = "0.5"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDate", "NSRunLoop", "NSString"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder", "NSRunningApplication"] }
+# API key in the login Keychain (already in the tree via native-tls)
+security-framework = "3"
 # flock (single instance), signal (graceful SIGTERM/SIGINT)
 libc = "0.2"
 

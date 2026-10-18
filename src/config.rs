@@ -441,8 +441,8 @@ impl Config {
             source,
         })?;
 
-        // Owner-only on Unix: until the Keychain slice (#61) the macOS build
-        // keeps the API key in this file.
+        // Owner-only on Unix. The macOS key lives in the Keychain, but if a
+        // Keychain write fails, save() falls back to plaintext in this file.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
