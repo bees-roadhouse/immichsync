@@ -4,7 +4,7 @@
 //   1. Welcome
 //   2. Server Config + Test Connection
 //   3. Folder Setup (pick watch folder)
-//   4. Autostart (start with Windows?)
+//   4. Autostart (start with Windows / at login?)
 //   5. Done
 //
 // Returns `Some(Config)` if the user completes the wizard, `None` if cancelled.
@@ -232,12 +232,12 @@ impl WizardApp {
     }
 
     fn show_autostart(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Start with Windows");
+        ui.heading(crate::platform::AUTOSTART_LABEL);
         ui.add_space(8.0);
         ui.label("ImmichSync can start automatically when you sign in.");
         ui.add_space(16.0);
 
-        ui.checkbox(&mut self.enable_autostart, "Start ImmichSync with Windows");
+        ui.checkbox(&mut self.enable_autostart, crate::platform::AUTOSTART_LABEL);
 
         ui.add_space(8.0);
         ui.label("You can change this later in Settings.");
@@ -273,6 +273,15 @@ impl WizardApp {
                 // Save config.
                 if let Err(e) = self.config.save() {
                     tracing::error!(error = %e, "Failed to save config from wizard");
+                    // Stay on this page: closing would leave the app
+                    // unconfigured with no hint why.
+                    rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Error)
+                        .set_title("ImmichSync")
+                        .set_description(format!("Setup could not be saved: {e}"))
+                        .set_buttons(rfd::MessageButtons::Ok)
+                        .show();
+                    return;
                 }
 
                 // Set or clear the autostart registry key.
