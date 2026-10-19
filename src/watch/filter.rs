@@ -35,7 +35,7 @@ pub(crate) const CLOUD_PLACEHOLDER_MASK: u32 =
 /// 1. Exclusion name list (exact filename matches like Thumbs.db)
 /// 2. Extension allowlist (image + video extensions by default)
 /// 3. Minimum file size
-/// 4. Cloud-placeholder check (Windows recall attributes) when enabled
+/// 4. Cloud-placeholder check (Windows recall attributes, macOS `SF_DATALESS`) when enabled
 /// 5. Custom exclude glob patterns (per-folder overrides)
 /// 6. Custom include glob patterns (if any are set, path must match at least one)
 #[derive(Debug, Clone)]
@@ -50,9 +50,9 @@ pub struct FileFilter {
     include_patterns: Vec<Pattern>,
     /// Custom glob patterns for exclusion (file is dropped if it matches any)
     exclude_patterns: Vec<Pattern>,
-    /// When `true`, files marked with Windows cloud-placeholder attributes
-    /// (OneDrive Files On-Demand, iCloud, Google Drive, SeaDrive, etc.) are
-    /// dropped before any read. Default `true` — opening a placeholder
+    /// When `true`, cloud placeholders (Windows recall attributes, macOS
+    /// dataless files: OneDrive Files On-Demand, iCloud Drive, Google Drive,
+    /// SeaDrive, etc.) are dropped before any read. Default `true` — opening a placeholder
     /// triggers a cloud download as a side effect.
     ignore_online_files: bool,
 }
@@ -99,7 +99,7 @@ impl FileFilter {
         }
     }
 
-    /// Override whether files with Windows cloud-placeholder attributes are
+    /// Override whether cloud placeholders (Windows attributes, macOS dataless) are
     /// skipped. Default is `true`. Set to `false` to upload placeholders too
     /// (the file read will trigger a cloud download for each file).
     pub fn with_ignore_online_files(mut self, ignore: bool) -> Self {
@@ -231,13 +231,8 @@ impl FileFilter {
                     return false;
                 }
 
-                #[cfg(windows)]
                 if self.ignore_online_files && is_online_file(&meta) {
-                    debug!(
-                        "Excluding (cloud-placeholder / online file, attrs=0x{:x}): {:?}",
-                        std::os::windows::fs::MetadataExt::file_attributes(&meta),
-                        path
-                    );
+                    debug!("Excluding (cloud-placeholder / online file): {:?}", path);
                     return false;
                 }
             }
@@ -334,8 +329,28 @@ pub fn is_online_file(meta: &std::fs::Metadata) -> bool {
     (meta.file_attributes() & CLOUD_PLACEHOLDER_MASK) != 0
 }
 
-/// Stub for non-Windows targets: nothing is ever an online file.
-#[cfg(not(windows))]
+/// macOS: `true` for a File Provider "dataless" file (iCloud Drive with
+/// Optimise Mac Storage, Google Drive, Dropbox, OneDrive on macOS ...). Its
+/// contents live only in the cloud, and reading it triggers a download.
+/// Reads only `st_flags` from the cached stat.
+#[cfg(target_os = "macos")]
+pub fn is_online_file(meta: &std::fs::Metadata) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    is_dataless_flags(meta.st_flags())
+}
+
+/// `SF_DATALESS` from `<sys/stat.h>`: the file is a placeholder whose data
+/// must be materialised by its File Provider before it can be read.
+#[cfg(target_os = "macos")]
+pub(crate) const SF_DATALESS: u32 = 0x4000_0000;
+
+#[cfg(target_os = "macos")]
+fn is_dataless_flags(st_flags: u32) -> bool {
+    st_flags & SF_DATALESS != 0
+}
+
+/// Stub for other targets: nothing is ever an online file.
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn is_online_file(_meta: &std::fs::Metadata) -> bool {
     false
 }
@@ -651,6 +666,49 @@ mod tests {
         assert!(
             super::is_online_file(&meta),
             "File flagged FILE_ATTRIBUTE_OFFLINE should be detected as online"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dataless_flag_marks_a_file_online() {
+        // A real dataless file needs a File Provider to create, so test the
+        // flag logic directly and a plain file end to end.
+        assert!(super::is_dataless_flags(super::SF_DATALESS));
+        assert!(super::is_dataless_flags(super::SF_DATALESS | 0x8000)); // + UF_HIDDEN
+        assert!(!super::is_dataless_flags(0));
+        assert!(!super::is_dataless_flags(0x8000));
+
+        let f = make_temp_file_with_size("jpg", 4096);
+        let meta = std::fs::metadata(f.path()).unwrap();
+        assert!(!super::is_online_file(&meta), "plain file is not dataless");
+    }
+
+    /// Against a real dataless file, which only a File Provider can make:
+    /// `IMMICHSYNC_DATALESS_SAMPLE=<path> cargo test -- --ignored real_dataless`
+    /// (find one with `find ~/Library/Mobile\ Documents -flags +dataless`).
+    /// Also checks that the stat didn't download it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn real_dataless_file_is_skipped_without_download() {
+        use std::os::macos::fs::MetadataExt;
+        let path = std::path::PathBuf::from(
+            std::env::var("IMMICHSYNC_DATALESS_SAMPLE").expect("set IMMICHSYNC_DATALESS_SAMPLE"),
+        );
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(super::is_online_file(&meta), "sample is not dataless");
+        assert!(!FileFilter::new().should_include(&path));
+        assert!(
+            FileFilter::new()
+                .with_ignore_online_files(false)
+                .should_include(&path)
+                || meta.len() < DEFAULT_MIN_SIZE
+        );
+        let after = std::fs::metadata(&path).unwrap();
+        assert!(
+            super::is_dataless_flags(after.st_flags()),
+            "file was materialised"
         );
     }
 }
