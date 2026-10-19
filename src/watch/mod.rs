@@ -3,6 +3,8 @@
 pub mod filter;
 pub mod folder;
 pub mod network;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub mod photos;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

@@ -174,6 +174,27 @@ impl QueueStatus {
     }
 }
 
+/// Where a queue entry's bytes come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueSource {
+    /// A file in a watched folder; `file_path` is the file.
+    Folder,
+    /// An asset in the Apple Photos library, exported to a temp file when a
+    /// worker picks the entry up; `photos_local_id` names it and
+    /// `file_path` is only a label (`photos:<localIdentifier>`).
+    Photos,
+}
+
+impl QueueSource {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "photos" => QueueSource::Photos,
+            _ => QueueSource::Folder,
+        }
+    }
+}
+
 // ─── Row structs ─────────────────────────────────────────────────────────────
 
 /// A folder being monitored for new media files.
@@ -224,6 +245,9 @@ pub struct QueueEntry {
     pub error_message: Option<String>,
     pub queued_at: String,
     pub completed_at: Option<String>,
+    pub source: QueueSource,
+    /// `PHAsset.localIdentifier` when `source == Photos`.
+    pub photos_local_id: Option<String>,
 }
 
 /// Aggregated counts of queue entries by status.
@@ -243,6 +267,21 @@ pub struct Database {
 }
 
 impl Database {
+    /// A fresh in-memory database with migrations run, for tests in other
+    /// modules.
+    #[cfg(test)]
+    pub(crate) fn open_in_memory() -> Result<Self, DbError> {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|source| DbError::Pragma {
+                pragma: "foreign_keys",
+                source,
+            })?;
+        let mut db = Self { conn };
+        db.run_migrations()?;
+        Ok(db)
+    }
+
     /// Open (or create) the state database, enable WAL mode, and run any
     /// pending schema migrations.
     pub fn open() -> Result<Self, DbError> {
@@ -311,6 +350,12 @@ impl Database {
             self.migrate_v3()?;
             self.set_schema_version(3)?;
             info!("Applied schema migration v3");
+        }
+
+        if current_version < 4 {
+            self.migrate_v4()?;
+            self.set_schema_version(4)?;
+            info!("Applied schema migration v4");
         }
 
         Ok(())
@@ -411,6 +456,37 @@ impl Database {
             )
             .map_err(|e| DbError::Migration {
                 version: 3,
+                source: e,
+            })
+    }
+
+    /// The Photos library source (docs/adr/0002-photokit-library-source.md):
+    /// queue entries can name a PhotoKit asset instead of a file, and
+    /// `photos_assets` remembers what each asset's resources became on the
+    /// server. A Live Photo is two rows under one `local_id`.
+    fn migrate_v4(&self) -> Result<(), DbError> {
+        self.conn
+            .execute_batch(
+                "ALTER TABLE upload_queue
+                    ADD COLUMN source TEXT NOT NULL DEFAULT 'folder';
+
+                 ALTER TABLE upload_queue
+                    ADD COLUMN photos_local_id TEXT;
+
+                 CREATE INDEX IF NOT EXISTS idx_queue_photos_local_id
+                    ON upload_queue(photos_local_id);
+
+                 CREATE TABLE IF NOT EXISTS photos_assets (
+                    local_id         TEXT NOT NULL,
+                    resource         TEXT NOT NULL,
+                    sha1             TEXT,
+                    immich_asset_id  TEXT,
+                    modified_at      TEXT,
+                    PRIMARY KEY (local_id, resource)
+                 );",
+            )
+            .map_err(|e| DbError::Migration {
+                version: 4,
                 source: e,
             })
     }
@@ -685,6 +761,52 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Queue a Photos library asset. `file_path` holds a label, not a path.
+    pub fn enqueue_photos(&self, local_id: &str) -> Result<i64, DbError> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO upload_queue
+                (file_path, status, retry_count, queued_at, source, photos_local_id)
+             VALUES (?1, 'pending', 0, ?2, 'photos', ?3)",
+            params![format!("photos:{local_id}"), now, local_id],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// `true` if this Photos asset is already queued (in any state) or
+    /// recorded in `photos_assets`, so the source doesn't enqueue it again.
+    /// A deferred (iCloud-only) entry counts: retrying those is slice 3.
+    pub fn photos_asset_seen(&self, local_id: &str) -> Result<bool, DbError> {
+        let seen: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM upload_queue WHERE photos_local_id = ?1)
+                 OR EXISTS (SELECT 1 FROM photos_assets WHERE local_id = ?1)",
+            params![local_id],
+            |r| r.get(0),
+        )?;
+        Ok(seen)
+    }
+
+    /// Record what one resource of a Photos asset became on the server.
+    pub fn record_photos_asset(
+        &self,
+        local_id: &str,
+        resource: &str,
+        sha1: &str,
+        immich_asset_id: &str,
+        modified_at: Option<&str>,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO photos_assets (local_id, resource, sha1, immich_asset_id, modified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (local_id, resource) DO UPDATE SET
+                sha1 = excluded.sha1,
+                immich_asset_id = excluded.immich_asset_id,
+                modified_at = excluded.modified_at",
+            params![local_id, resource, sha1, immich_asset_id, modified_at],
+        )?;
+        Ok(())
+    }
+
     /// Claim up to `limit` pending queue entries, atomically marking them
     /// `uploading`.  Returns the claimed entries.
     pub fn dequeue_pending(&self, limit: i64) -> Result<Vec<QueueEntry>, DbError> {
@@ -695,7 +817,8 @@ impl Database {
         let entries: Vec<QueueEntry> = {
             let mut stmt = tx.prepare(
                 "SELECT id, file_path, file_hash, file_size, folder_id, status,
-                        retry_count, error_message, queued_at, completed_at
+                        retry_count, error_message, queued_at, completed_at,
+                        source, photos_local_id
                  FROM upload_queue
                  WHERE status = 'pending'
                  ORDER BY queued_at DESC
@@ -809,7 +932,8 @@ impl Database {
     pub fn get_recent_queue_entries(&self, limit: i64) -> Result<Vec<QueueEntry>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, file_path, file_hash, file_size, folder_id, status,
-                    retry_count, error_message, queued_at, completed_at
+                    retry_count, error_message, queued_at, completed_at,
+                    source, photos_local_id
              FROM upload_queue
              ORDER BY id DESC
              LIMIT ?1",
@@ -872,6 +996,8 @@ fn map_queue_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueEntry> {
         error_message: row.get(7)?,
         queued_at: row.get(8)?,
         completed_at: row.get(9)?,
+        source: QueueSource::from_str(&row.get::<_, String>(10)?),
+        photos_local_id: row.get(11)?,
     })
 }
 
@@ -938,8 +1064,33 @@ impl crate::upload::queue::QueueStore for DbStore {
                         .map(|dt| dt.with_timezone(&Utc))
                         .ok()
                 }),
+                source: e.source,
+                photos_local_id: e.photos_local_id,
             })
             .collect())
+    }
+
+    fn enqueue_photos(&self, local_id: &str) -> anyhow::Result<i64> {
+        let db = self.db.lock().unwrap();
+        Ok(db.enqueue_photos(local_id)?)
+    }
+
+    fn photos_asset_seen(&self, local_id: &str) -> anyhow::Result<bool> {
+        let db = self.db.lock().unwrap();
+        Ok(db.photos_asset_seen(local_id)?)
+    }
+
+    fn record_photos_asset(
+        &self,
+        local_id: &str,
+        resource: &str,
+        sha1: &str,
+        immich_asset_id: &str,
+        modified_at: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let db = self.db.lock().unwrap();
+        db.record_photos_asset(local_id, resource, sha1, immich_asset_id, modified_at)?;
+        Ok(())
     }
 
     fn update_status(&self, id: i64, status: &str, error: Option<&str>) -> anyhow::Result<()> {
@@ -1180,6 +1331,81 @@ mod tests {
     }
 
     // ── upload_queue ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn v4_photos_entries_round_trip_and_folder_entries_default() {
+        let db = open_test_db();
+        assert_eq!(db.get_schema_version().unwrap(), 4);
+
+        db.enqueue("/photos/a.jpg", Some("h"), Some(1), None)
+            .unwrap();
+        db.enqueue_photos("ABC-123/L0/001").unwrap();
+
+        let mut entries = db.dequeue_pending(10).unwrap();
+        entries.sort_by_key(|e| e.id);
+        assert_eq!(entries[0].source, QueueSource::Folder);
+        assert_eq!(entries[0].photos_local_id, None);
+        assert_eq!(entries[1].source, QueueSource::Photos);
+        assert_eq!(
+            entries[1].photos_local_id.as_deref(),
+            Some("ABC-123/L0/001")
+        );
+        assert_eq!(entries[1].file_path, "photos:ABC-123/L0/001");
+    }
+
+    #[test]
+    fn v3_database_with_queued_rows_upgrades_to_v4_as_folder_entries() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut db = Database { conn };
+        db.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+        db.migrate_v1().unwrap();
+        db.migrate_v2().unwrap();
+        db.migrate_v3().unwrap();
+        db.set_schema_version(3).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO upload_queue (file_path, status, retry_count, queued_at)
+                 VALUES ('/old/a.jpg', 'pending', 0, '2026-10-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        db.run_migrations().unwrap();
+
+        assert_eq!(db.get_schema_version().unwrap(), 4);
+        let e = db.dequeue_pending(10).unwrap().pop().unwrap();
+        assert_eq!(e.file_path, "/old/a.jpg");
+        assert_eq!(e.source, QueueSource::Folder);
+        assert_eq!(e.photos_local_id, None);
+    }
+
+    #[test]
+    fn photos_asset_seen_covers_queue_and_photos_assets() {
+        let db = open_test_db();
+        assert!(!db.photos_asset_seen("A").unwrap());
+        db.enqueue_photos("A").unwrap();
+        assert!(db.photos_asset_seen("A").unwrap());
+
+        assert!(!db.photos_asset_seen("B").unwrap());
+        db.record_photos_asset("B", "photo", "sha", "imm-1", None)
+            .unwrap();
+        db.record_photos_asset("B", "photo", "sha2", "imm-2", Some("2026-10-18T00:00:00Z"))
+            .unwrap();
+        assert!(db.photos_asset_seen("B").unwrap());
+        let (sha, imm): (String, String) = db
+            .conn
+            .query_row(
+                "SELECT sha1, immich_asset_id FROM photos_assets WHERE local_id = 'B'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((sha.as_str(), imm.as_str()), ("sha2", "imm-2"));
+    }
 
     #[test]
     fn enqueue_and_dequeue() {

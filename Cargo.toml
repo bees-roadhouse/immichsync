@@ -110,13 +110,16 @@ winrt-notification = "0.5"
 [target.'cfg(target_os = "macos")'.dependencies]
 # NSApplication pump for the menu-bar app (same majors tray-icon/winit pull in)
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSDate", "NSError", "NSRunLoop", "NSString", "NSUUID"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSBundle", "NSDate", "NSError", "NSRunLoop", "NSSortDescriptor", "NSString", "NSURL", "NSUUID"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder", "NSRunningApplication"] }
 # API key in the login Keychain (already in the tree via native-tls)
 security-framework = "3"
 # Notification Center (bundled builds only)
 objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "block2", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationTrigger", "UNUserNotificationCenter"] }
 block2 = "0.6"
+# Photos library source (docs/adr/0002-photokit-library-source.md): read-only
+# use of PhotoKit. No PHAssetChangeRequest anywhere; review greps for it.
+objc2-photos = { version = "0.3", default-features = false, features = ["std", "block2", "PHAsset", "PHAssetResource", "PHAssetResourceManager", "PHError", "PHFetchOptions", "PHFetchResult", "PHObject", "PHPhotoLibrary", "PhotosTypes"] }
 # flock (single instance), signal (graceful SIGTERM/SIGINT)
 libc = "0.2"
 

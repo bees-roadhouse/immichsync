@@ -185,8 +185,22 @@ impl App {
         if let Some(ref client) = self.client {
             let uploader: Arc<dyn AssetUploader> = Arc::new(client.clone());
             let store: Arc<dyn QueueStore> = self.db.clone();
+            #[allow(unused_mut)]
             let mut pipeline =
                 UploadPipeline::new(store, &self.config.server, &self.config.upload, uploader);
+
+            // Photos library entries are exported by PhotoKit (ADR 0002).
+            // The source is attached whether or not the library is enabled,
+            // so entries already queued still settle if it's turned off.
+            #[cfg(target_os = "macos")]
+            {
+                let album = Some(self.config.photos.album_name.trim().to_string())
+                    .filter(|a| !a.is_empty());
+                pipeline = pipeline.with_library(crate::upload::worker::LibrarySource {
+                    exporter: Arc::new(crate::platform::photos::PhotoKitExporter),
+                    album,
+                });
+            }
 
             // Pipeline spawns tokio tasks — enter the runtime context.
             let _guard = self.runtime.enter();
@@ -215,6 +229,10 @@ impl App {
 
         // Set up the watch engine and bridge task.
         self.start_watch_engine()?;
+
+        // Photos library: queue the newest assets if it's on and access was
+        // already granted. Never prompts; the prompt belongs to Settings.
+        self.queue_photos_library();
 
         // Schedule the first automatic update check after a startup delay.
         if crate::platform::SELF_UPDATE_SUPPORTED && self.config.advanced.check_for_updates {
@@ -530,8 +548,13 @@ impl App {
         let server_changed = new_config.server.url != self.config.server.url
             || new_config.server.api_key != self.config.server.api_key;
 
+        let photos_turned_on = new_config.photos.enabled && !self.config.photos.enabled;
+
         // Apply the new config.
         self.config = new_config;
+        if photos_turned_on {
+            self.queue_photos_library();
+        }
         self.notifications = crate::ui::notifications::Notifications::new(&self.config);
 
         if server_changed {
@@ -574,6 +597,33 @@ impl App {
 
         if let Err(e) = self.start_watch_engine() {
             warn!(error = %e, "Failed to restart watch engine after config update");
+        }
+    }
+
+    /// Queue the newest Photos library assets on a background thread (the
+    /// PhotoKit fetch blocks). A no-op unless the library is enabled, the
+    /// pipeline exists, and access is already granted, so it never raises
+    /// the permission prompt. Tracer: capped at `TRACER_CAP` (#80).
+    fn queue_photos_library(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            use crate::platform::photos;
+            if !self.config.photos.enabled || self.pipeline.is_none() {
+                return;
+            }
+            let access = photos::access();
+            if !access.can_read() {
+                info!(
+                    ?access,
+                    "Photos library enabled but not readable; nothing queued"
+                );
+                return;
+            }
+            let store: Arc<dyn QueueStore> = self.db.clone();
+            std::thread::spawn(move || {
+                let ids = photos::newest_asset_ids(crate::watch::photos::TRACER_CAP);
+                crate::watch::photos::enqueue_new(store.as_ref(), &ids);
+            });
         }
     }
 

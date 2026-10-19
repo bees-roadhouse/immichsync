@@ -11,5 +11,6 @@ pub mod event_loop;
 pub mod install;
 pub mod known_folders;
 pub mod notify;
+pub mod photos;
 pub mod shutdown;
 pub mod single_instance;
