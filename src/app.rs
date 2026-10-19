@@ -184,8 +184,10 @@ impl App {
             // Clean up expired trash files on startup.
             if let Ok(folders) = db.get_folders() {
                 crate::upload::worker::cleanup_trash(
+                    &db,
                     &folders,
                     self.config.upload.trash_retention_days,
+                    chrono::Utc::now(),
                 );
             }
         }
@@ -343,8 +345,10 @@ impl App {
                 let db = self.db.inner().lock().unwrap();
                 if let Ok(folders) = db.get_folders() {
                     crate::upload::worker::cleanup_trash(
+                        &db,
                         &folders,
                         self.config.upload.trash_retention_days,
+                        chrono::Utc::now(),
                     );
                 }
             }

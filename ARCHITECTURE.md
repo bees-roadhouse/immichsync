@@ -313,6 +313,14 @@ CREATE TABLE config (
     value TEXT NOT NULL
 );
 
+-- v6: when each file entered .immichsync-trash/. Retention counts from this,
+-- never from the file's mtime (a move keeps it). First sighting by the sweep
+-- is recorded, so retention can run late by one sweep, never early (#110).
+CREATE TABLE trash_entries (
+    trash_path TEXT PRIMARY KEY,
+    trashed_at TEXT NOT NULL
+);
+
 CREATE INDEX idx_uploaded_hash ON uploaded_files(file_hash);
 CREATE INDEX idx_uploaded_path ON uploaded_files(file_path);
 CREATE INDEX idx_uploaded_path_size_mtime                                              -- v3 fast-path dedup
