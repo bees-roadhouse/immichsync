@@ -201,7 +201,17 @@ pub fn swap(bundle: &Path, new_app: &Path) -> Result<(), BundleError> {
     std::fs::rename(bundle, &old)?;
     if let Err(e) = std::fs::rename(new_app, bundle) {
         warn!(error = %e, "Moving the new bundle in failed; restoring the old one");
-        std::fs::rename(&old, bundle)?;
+        if let Err(restore) = std::fs::rename(&old, bundle) {
+            // Both renames failed: the app is only at the parked path. Say
+            // exactly where, so the user (or support) can move it back.
+            tracing::error!(
+                error = %restore,
+                parked = %old.display(),
+                expected = %bundle.display(),
+                "Could not restore the app after a failed update; it is at the parked path"
+            );
+            return Err(restore.into());
+        }
         return Err(e.into());
     }
     let staging = staging_dir(bundle);

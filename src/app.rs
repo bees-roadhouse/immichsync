@@ -213,6 +213,12 @@ impl App {
         // already granted. Never prompts; the prompt belongs to Settings.
         self.queue_photos_library();
 
+        // An update applied with its restart deferred (Later at startup, or
+        // a quit before restarting): offer the restart, don't re-download.
+        if let Some(version) = updater::pending_restart_version() {
+            self.mark_update_ready(Some(&version));
+        }
+
         // Schedule the first automatic update check after a startup delay.
         if crate::platform::SELF_UPDATE_SUPPORTED && self.config.advanced.check_for_updates {
             self.schedule_update_check(true);
@@ -648,6 +654,20 @@ impl App {
                     self.shutdown();
                     updater::relaunch_self();
                 }
+            }
+            TrayAction::UpdateAppliedRestart => {
+                info!("Update applied from the dialog; restarting gracefully");
+                self.update_ready = true;
+                self.shutdown();
+                updater::relaunch_self();
+            }
+            TrayAction::UpdateAppliedLater => {
+                let version = self
+                    .pending_update
+                    .as_ref()
+                    .map(|i| i.new_version.clone())
+                    .or_else(updater::pending_restart_version);
+                self.mark_update_ready(version.as_deref());
             }
             TrayAction::Quit => {
                 // Handled in run() directly.
@@ -1212,6 +1232,9 @@ impl App {
 
         let flag = self.window_open.update.clone();
         let info_path_str = info_path.display().to_string();
+        // The relaunch happens on the main loop, after shutdown(), never on
+        // this thread (#127).
+        let actions = self.tray.as_ref().map(|t| t.action_sender());
 
         std::thread::spawn(move || {
             let exe = match crate::platform::install::installed_exe_path() {
@@ -1233,10 +1256,9 @@ impl App {
             {
                 Ok(status) => {
                     info!(?status, "Update dialog subprocess exited");
-                    if status.code() == Some(0) {
-                        // Update was applied — relaunch.
-                        info!("Update applied, relaunching");
-                        updater::relaunch_self();
+                    let action = action_for_update_dialog_exit(status.code());
+                    if let (Some(action), Some(tx)) = (action, actions.as_ref()) {
+                        let _ = tx.send(action);
                     }
                 }
                 Err(e) => {
@@ -1245,6 +1267,15 @@ impl App {
             }
             flag.store(false, Ordering::SeqCst);
         });
+    }
+
+    /// An update is on disk and waits for a restart: show Restart to Update.
+    fn mark_update_ready(&mut self, version: Option<&str>) {
+        info!(?version, "Update applied; restart deferred");
+        self.update_ready = true;
+        if let Some(ref mut tray) = self.tray {
+            tray.set_restart_to_update(Some(version.unwrap_or("new version")));
+        }
     }
 
     /// Stop all background work, waiting briefly for the upload worker to
@@ -1519,6 +1550,17 @@ fn update_check_skip_reason(
     }
 }
 
+/// What the main loop should do after the update dialog exits. Only
+/// Restart Now restarts; Later and a window close after applying offer
+/// Restart to Update; anything else changed nothing (#127).
+fn action_for_update_dialog_exit(code: Option<i32>) -> Option<TrayAction> {
+    match code {
+        Some(crate::ui::update::EXIT_RESTART_NOW) => Some(TrayAction::UpdateAppliedRestart),
+        Some(crate::ui::update::EXIT_APPLIED_LATER) => Some(TrayAction::UpdateAppliedLater),
+        _ => None,
+    }
+}
+
 /// Find the watched folder that contains `file_path` by walking up the
 /// directory tree and checking against the canonical folder map.
 fn resolve_folder_id(
@@ -1655,6 +1697,20 @@ mod tests {
         assert!(update_check_skip_reason(true, true, false).is_some());
         assert!(update_check_skip_reason(true, false, true).is_some());
         assert!(update_check_skip_reason(false, false, false).is_some());
+    }
+
+    #[test]
+    fn only_restart_now_restarts_after_the_update_dialog() {
+        assert!(matches!(
+            action_for_update_dialog_exit(Some(0)),
+            Some(TrayAction::UpdateAppliedRestart)
+        ));
+        assert!(matches!(
+            action_for_update_dialog_exit(Some(2)),
+            Some(TrayAction::UpdateAppliedLater)
+        ));
+        assert!(action_for_update_dialog_exit(Some(1)).is_none());
+        assert!(action_for_update_dialog_exit(None).is_none());
     }
 
     #[test]

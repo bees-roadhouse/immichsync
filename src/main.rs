@@ -448,10 +448,16 @@ fn check_for_update_on_startup() {
                 .args(["--window", "update", "--update-info", &info_path_str])
                 .status()
             {
-                Ok(status) if status.code() == Some(0) => {
-                    // Update was applied — relaunch self.
+                Ok(status) if status.code() == Some(ui::update::EXIT_RESTART_NOW) => {
+                    // Update was applied — relaunch self. Nothing else is
+                    // running yet, so there's nothing to shut down.
                     info!("Startup update applied, relaunching");
                     updater::relaunch_self();
+                }
+                Ok(status) if status.code() == Some(ui::update::EXIT_APPLIED_LATER) => {
+                    // The tray app notices the newer version on disk and
+                    // offers Restart to Update (App::init, #127).
+                    info!("Startup update applied, restart deferred");
                 }
                 Ok(status) => {
                     info!(code = ?status.code(), "User skipped startup update, continuing to tray app");
