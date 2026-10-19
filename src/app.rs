@@ -1169,6 +1169,7 @@ impl App {
             Ok(version) => {
                 info!(version = %version, "Background update downloaded and applied");
                 self.update_ready = true;
+                updater::note_update_applied();
 
                 // Update tray menu to show "Restart to Update".
                 if let Some(ref mut tray) = self.tray {
@@ -1273,6 +1274,10 @@ impl App {
     fn mark_update_ready(&mut self, version: Option<&str>) {
         info!(?version, "Update applied; restart deferred");
         self.update_ready = true;
+        // Windows (Settings, logs) keep running the previous image until the
+        // restart; the dialog applied this update in another process, so
+        // this process's flag isn't set yet (#128).
+        updater::note_update_applied();
         if let Some(ref mut tray) = self.tray {
             tray.set_restart_to_update(Some(version.unwrap_or("new version")));
         }
@@ -1503,6 +1508,9 @@ fn spawn_window_subprocess(
             }
         },
     };
+    // After an update is applied, windows run the previous image until the
+    // restart, so they match the running tray (#128).
+    let exe = updater::window_exe(exe);
 
     std::thread::spawn(move || {
         info!(window_type, "Spawning window subprocess");
