@@ -21,9 +21,14 @@ use objc2_photos::{PHAsset, PHAssetChangeRequest, PHPhotoLibrary, PHPhotosError}
 /// How long to wait for the user to answer the confirmation.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
-/// Move these assets to Recently Deleted, after macOS's confirmation.
+/// Move a verified batch to Recently Deleted, after macOS's confirmation.
 /// `Ok(true)` deleted, `Ok(false)` the user declined. Blocks until answered.
-pub(super) fn delete_assets(local_ids: &[String]) -> anyhow::Result<bool> {
+/// Takes a `VerifiedBatch`, which only `watch::photos::delete::execute` can
+/// build, so nothing else can reach this.
+pub(super) fn delete_assets(
+    batch: &crate::watch::photos::delete::VerifiedBatch,
+) -> anyhow::Result<bool> {
+    let local_ids = batch.local_ids();
     if local_ids.is_empty() {
         return Ok(true);
     }

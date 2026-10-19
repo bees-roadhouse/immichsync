@@ -281,13 +281,6 @@ impl crate::watch::photos::delete::ServerAssets for ImmichClient {
         &self,
         immich_asset_id: &str,
     ) -> anyhow::Result<Option<crate::watch::photos::delete::ServerAsset>> {
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct AssetDto {
-            checksum: String,
-            #[serde(default)]
-            is_trashed: bool,
-        }
         let response = self
             .client
             .get(self.url(&format!("/api/assets/{immich_asset_id}")))
@@ -302,11 +295,11 @@ impl crate::watch::photos::delete::ServerAssets for ImmichClient {
         if !response.status().is_success() {
             return Err(Self::map_status_error(response).await.into());
         }
-        let dto: AssetDto = response.json().await?;
-        Ok(Some(crate::watch::photos::delete::ServerAsset {
-            checksum_b64: dto.checksum,
-            trashed: dto.is_trashed,
-        }))
+        // Both fields required: no `isTrashed` is not "not trashed".
+        let body = response.text().await?;
+        Ok(Some(crate::watch::photos::delete::parse_server_asset(
+            &body,
+        )?))
     }
 }
 

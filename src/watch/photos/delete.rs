@@ -34,6 +34,9 @@ pub struct AssetFacts {
     pub is_video: bool,
     /// A Live Photo (has a paired video).
     pub is_live: bool,
+    /// Edited in Photos. Only originals go to Immich, so deleting it would
+    /// lose the edit.
+    pub has_adjustments: bool,
 }
 
 /// One uploaded resource, as recorded in `photos_assets`.
@@ -58,6 +61,7 @@ pub struct ServerAsset {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keep {
     Burst,
+    Edited,
     NotUserLibrary,
     Favorite,
     InAlbum,
@@ -92,6 +96,10 @@ pub fn decide(
     // Bursts: only the pick is uploaded, so the unit is never fully in Immich.
     if facts.is_burst {
         return Err(Keep::Burst);
+    }
+    // Only originals go to Immich; deleting an edited photo loses the edit.
+    if facts.has_adjustments {
+        return Err(Keep::Edited);
     }
     if !facts.user_library {
         return Err(Keep::NotUserLibrary);
@@ -200,13 +208,45 @@ async fn eligible(
     Ok((yes, kept))
 }
 
+/// Assets that passed the rules and the server check in `execute`, and
+/// were logged, ready to delete. It can only be built inside this module
+/// (private field, no public constructor), so the delete path, which takes
+/// one, can't be reached by anything but `execute`: a bypass doesn't compile
+/// (Pia's review on #142).
+#[derive(Debug)]
+pub struct VerifiedBatch {
+    ids: Vec<String>,
+}
+
+impl VerifiedBatch {
+    pub fn local_ids(&self) -> &[String] {
+        &self.ids
+    }
+}
+
 /// The library side: facts for the rules, and the one write path.
 pub trait DeleteLibrary {
     /// Facts for the assets still in the library (missing ones are left out).
     fn facts(&self, local_ids: &[String]) -> Vec<AssetFacts>;
-    /// Move these assets to Recently Deleted. macOS asks the user first;
+    /// Move a verified batch to Recently Deleted. macOS asks the user first;
     /// `Ok(false)` means they declined.
-    fn delete_assets(&self, local_ids: &[String]) -> anyhow::Result<bool>;
+    fn delete_assets(&self, batch: &VerifiedBatch) -> anyhow::Result<bool>;
+}
+
+/// Parse `GET /api/assets/{id}`. Both fields are required: an answer
+/// without `isTrashed` is not "not trashed" (fail closed).
+pub fn parse_server_asset(body: &str) -> anyhow::Result<ServerAsset> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct AssetDto {
+        checksum: String,
+        is_trashed: bool,
+    }
+    let dto: AssetDto = serde_json::from_str(body)?;
+    Ok(ServerAsset {
+        checksum_b64: dto.checksum,
+        trashed: dto.is_trashed,
+    })
 }
 
 /// The server side: one asset's state, `None` if it doesn't exist.
@@ -279,31 +319,37 @@ pub async fn execute(
         return Ok(DeleteOutcome::Nothing);
     }
     yes.truncate(MAX_BATCH);
-    let ids: Vec<String> = yes.iter().map(|(id, _, _)| id.clone()).collect();
 
-    let result = library.delete_assets(&ids);
+    // Log first: if the log can't be written, nothing is deleted.
+    let entries: Vec<(String, String)> = yes
+        .iter()
+        .map(|(id, immich, _)| (id.clone(), immich.join(",")))
+        .collect();
+    let rows = store.begin_photos_deletion(&entries)?;
+    let batch = VerifiedBatch {
+        ids: yes.into_iter().map(|(id, _, _)| id).collect(),
+    };
+
+    let result = library.delete_assets(&batch);
     let outcome = match &result {
         Ok(true) => "deleted".to_string(),
         Ok(false) => "declined".to_string(),
         Err(e) => format!("failed: {e:#}"),
     };
-    for (id, immich, _) in &yes {
-        store.record_photos_deletion(id, &immich.join(","), &outcome)?;
-    }
+    // A failure here leaves the rows `pending`: the attempt is still on record.
+    store.finish_photos_deletion(&rows, &outcome)?;
+    let n = batch.ids.len();
     match result {
         Ok(true) => {
             tracing::info!(
-                count = ids.len(),
+                count = n,
                 "Deleted photos from the library (to Recently Deleted)"
             );
-            Ok(DeleteOutcome::Deleted(ids.len()))
+            Ok(DeleteOutcome::Deleted(n))
         }
         Ok(false) => {
-            tracing::info!(
-                count = ids.len(),
-                "Photo deletion declined at the macOS prompt"
-            );
-            Ok(DeleteOutcome::Declined(ids.len()))
+            tracing::info!(count = n, "Photo deletion declined at the macOS prompt");
+            Ok(DeleteOutcome::Declined(n))
         }
         Err(e) => Err(e),
     }
@@ -339,6 +385,7 @@ mod tests {
             user_library: true,
             is_video: false,
             is_live: false,
+            has_adjustments: false,
         }
     }
 
@@ -417,6 +464,95 @@ mod tests {
     }
 
     #[test]
+    fn an_edited_photo_is_kept_because_immich_only_has_the_original() {
+        let edited = AssetFacts {
+            has_adjustments: true,
+            ..old_photo("E")
+        };
+        assert_eq!(
+            decide(&edited, &[rec("photo", "aa", "imm-1")], &armed(), now()),
+            Err(Keep::Edited)
+        );
+    }
+
+    #[test]
+    fn a_server_answer_without_the_trashed_flag_fails_closed() {
+        let ok =
+            parse_server_asset(r#"{"checksum":"qZk+NkcGgWq6PiVxeFDCbJzQ2J0=","isTrashed":false}"#)
+                .unwrap();
+        assert_eq!(
+            ok,
+            ServerAsset {
+                checksum_b64: "qZk+NkcGgWq6PiVxeFDCbJzQ2J0=".into(),
+                trashed: false
+            }
+        );
+        assert!(parse_server_asset(r#"{"checksum":"qZk+NkcGgWq6PiVxeFDCbJzQ2J0="}"#).is_err());
+        assert!(parse_server_asset(r#"{"isTrashed":false}"#).is_err());
+    }
+
+    /// A store whose delete log can't be written.
+    struct UnloggableStore(DbStore);
+    impl QueueStore for UnloggableStore {
+        fn enqueue(&self, e: crate::upload::queue::NewQueueEntry) -> anyhow::Result<i64> {
+            self.0.enqueue(e)
+        }
+        fn dequeue_pending(
+            &self,
+            n: usize,
+        ) -> anyhow::Result<Vec<crate::upload::queue::QueueEntry>> {
+            self.0.dequeue_pending(n)
+        }
+        fn update_status(&self, id: i64, s: &str, e: Option<&str>) -> anyhow::Result<()> {
+            self.0.update_status(id, s, e)
+        }
+        fn mark_completed(&self, id: i64, a: Option<&str>) -> anyhow::Result<()> {
+            self.0.mark_completed(id, a)
+        }
+        fn is_file_uploaded(&self, h: &str) -> anyhow::Result<bool> {
+            self.0.is_file_uploaded(h)
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn record_upload(
+            &self,
+            p: &str,
+            h: &str,
+            s: u64,
+            m: i64,
+            a: &str,
+            d: &str,
+            u: &str,
+        ) -> anyhow::Result<()> {
+            self.0.record_upload(p, h, s, m, a, d, u)
+        }
+        fn get_queue_stats(&self) -> anyhow::Result<crate::upload::queue::QueueStats> {
+            self.0.get_queue_stats()
+        }
+        fn photos_uploaded_resources(&self) -> anyhow::Result<Vec<(String, Recorded)>> {
+            self.0.photos_uploaded_resources()
+        }
+        fn begin_photos_deletion(&self, _batch: &[(String, String)]) -> anyhow::Result<Vec<i64>> {
+            anyhow::bail!("disk full")
+        }
+    }
+
+    /// The log is written before anything is deleted; if it can't be, the
+    /// batch stops and nothing is deleted (Pia's review on #142).
+    #[tokio::test]
+    async fn a_delete_log_that_cant_be_written_stops_the_batch() {
+        let (store, lib, server) = world();
+        let store = UnloggableStore(store);
+        let ids = vec!["A".to_string()];
+        assert!(execute(&ids, &armed(), &store, &lib, &server, now())
+            .await
+            .is_err());
+        assert!(
+            lib.deleted.lock().unwrap().is_empty(),
+            "nothing deleted without a log"
+        );
+    }
+
+    #[test]
     fn a_live_photo_needs_both_resources_and_a_video_needs_its_video() {
         let cfg = armed();
         let live = AssetFacts {
@@ -482,8 +618,11 @@ mod tests {
                 .filter_map(|id| self.facts.get(id).cloned())
                 .collect()
         }
-        fn delete_assets(&self, local_ids: &[String]) -> anyhow::Result<bool> {
-            self.deleted.lock().unwrap().push(local_ids.to_vec());
+        fn delete_assets(&self, batch: &VerifiedBatch) -> anyhow::Result<bool> {
+            self.deleted
+                .lock()
+                .unwrap()
+                .push(batch.local_ids().to_vec());
             Ok(!self.decline)
         }
     }

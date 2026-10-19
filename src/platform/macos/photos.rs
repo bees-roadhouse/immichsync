@@ -377,15 +377,19 @@ impl crate::watch::photos::delete::DeleteLibrary for PhotoKitDeleteLibrary {
                     user_library: a.sourceType().contains(PHAssetSourceType::TypeUserLibrary),
                     is_video: a.mediaType() == PHAssetMediaType::Video,
                     is_live: paired_video_resource(&a).is_some(),
+                    has_adjustments: a.hasAdjustments(),
                 });
             }
         }
         out
     }
 
-    fn delete_assets(&self, local_ids: &[String]) -> anyhow::Result<bool> {
+    fn delete_assets(
+        &self,
+        batch: &crate::watch::photos::delete::VerifiedBatch,
+    ) -> anyhow::Result<bool> {
         require_access()?;
-        super::photos_delete::delete_assets(local_ids)
+        autoreleasepool(|_| super::photos_delete::delete_assets(batch))
     }
 }
 
@@ -754,7 +758,11 @@ mod tests {
     /// exactly one file, `photos_delete.rs`. Its `delete_assets` may be
     /// called only by `PhotoKitDeleteLibrary` here, whose trait method may be
     /// called only by `watch::photos::delete`. Comments naming the rule are
-    /// fine.
+    /// fine. The grep is the backstop; the real gate is the type: both
+    /// delete paths take a `VerifiedBatch`, which only
+    /// `watch::photos::delete::execute` can build, so a bypass (`&ids`,
+    /// UFCS, a struct literal, reaching `photos_delete` from outside) doesn't
+    /// compile.
     #[test]
     fn nothing_but_photos_delete_can_change_the_photos_library() {
         fn walk(dir: &std::path::Path, files: &mut Vec<(String, String)>) {

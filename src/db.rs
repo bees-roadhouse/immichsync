@@ -286,7 +286,8 @@ pub struct PhotosDeletion {
     pub local_id: String,
     /// Comma-separated Immich ids of the asset's verified resources.
     pub immich_asset_ids: String,
-    /// `deleted`, `declined`, or `failed: …`.
+    /// `pending` (logged, delete not yet answered), `deleted`, `declined`,
+    /// or `failed: …`.
     pub outcome: String,
     pub at: String,
 }
@@ -841,18 +842,35 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::Query)
     }
 
-    /// Log one delete attempt: `deleted`, `declined` or `failed: …`.
-    pub fn record_photos_deletion(
-        &self,
-        local_id: &str,
-        immich_asset_ids: &str,
-        outcome: &str,
-    ) -> Result<(), DbError> {
-        self.conn.execute(
-            "INSERT INTO photos_deletions (local_id, immich_asset_ids, outcome, at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![local_id, immich_asset_ids, outcome, Utc::now().to_rfc3339()],
-        )?;
+    /// Write one `pending` row per `(local_id, immich ids)`, in one
+    /// transaction (all or none), before anything is deleted. Returns their
+    /// ids for `finish_photos_deletion`.
+    pub fn begin_photos_deletion(&self, batch: &[(String, String)]) -> Result<Vec<i64>, DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let now = Utc::now().to_rfc3339();
+        let mut ids = Vec::with_capacity(batch.len());
+        for (local_id, immich) in batch {
+            self.conn.execute(
+                "INSERT INTO photos_deletions (local_id, immich_asset_ids, outcome, at)
+                 VALUES (?1, ?2, 'pending', ?3)",
+                params![local_id, immich, now],
+            )?;
+            ids.push(self.conn.last_insert_rowid());
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    /// Record how a batch ended: `deleted`, `declined` or `failed: …`.
+    pub fn finish_photos_deletion(&self, rows: &[i64], outcome: &str) -> Result<(), DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        for id in rows {
+            self.conn.execute(
+                "UPDATE photos_deletions SET outcome = ?1 WHERE id = ?2",
+                params![outcome, id],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1379,14 +1397,14 @@ impl crate::upload::queue::QueueStore for DbStore {
         Ok(db.photos_uploaded_resources()?)
     }
 
-    fn record_photos_deletion(
-        &self,
-        local_id: &str,
-        immich_asset_ids: &str,
-        outcome: &str,
-    ) -> anyhow::Result<()> {
+    fn begin_photos_deletion(&self, batch: &[(String, String)]) -> anyhow::Result<Vec<i64>> {
         let db = self.db.lock().unwrap();
-        db.record_photos_deletion(local_id, immich_asset_ids, outcome)?;
+        Ok(db.begin_photos_deletion(batch)?)
+    }
+
+    fn finish_photos_deletion(&self, rows: &[i64], outcome: &str) -> anyhow::Result<()> {
+        let db = self.db.lock().unwrap();
+        db.finish_photos_deletion(rows, outcome)?;
         Ok(())
     }
 

@@ -55,14 +55,15 @@ pub trait QueueStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Log one delete-from-Photos attempt (#116).
-    fn record_photos_deletion(
-        &self,
-        _local_id: &str,
-        _immich_asset_ids: &str,
-        _outcome: &str,
-    ) -> anyhow::Result<()> {
-        Ok(())
+    /// Write one `pending` delete-log row per `(local_id, immich ids)`, all
+    /// or none, before anything is deleted (#116). Returns the row ids.
+    fn begin_photos_deletion(&self, _batch: &[(String, String)]) -> anyhow::Result<Vec<i64>> {
+        anyhow::bail!("this store has no delete log")
+    }
+
+    /// Set the outcome on rows from `begin_photos_deletion`.
+    fn finish_photos_deletion(&self, _rows: &[i64], _outcome: &str) -> anyhow::Result<()> {
+        anyhow::bail!("this store has no delete log")
     }
 
     /// Return iCloud-deferred Photos entries to pending (#82).

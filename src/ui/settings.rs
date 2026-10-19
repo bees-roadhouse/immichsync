@@ -1102,6 +1102,7 @@ fn kept_summary(kept: &[(String, crate::watch::photos::delete::Keep)]) -> String
         (Keep::Favorite, "favourite", "favourites"),
         (Keep::InAlbum, "in an album", "in albums"),
         (Keep::Burst, "burst", "bursts"),
+        (Keep::Edited, "edited", "edited"),
         (
             Keep::NotUserLibrary,
             "not in your own library",
@@ -1277,6 +1278,7 @@ impl PhotosTabState {
                 ui.label("days");
             });
             ui.checkbox(&mut d.keep_favorites, "Keep favourites");
+            ui.small("Edited photos are always kept: Immich has only the original.");
             ui.checkbox(&mut d.keep_in_albums, "Keep photos that are in an album");
             ui.small(
                 "Only photos Immich has with a matching checksum, checked again right before deleting. \
