@@ -734,7 +734,19 @@ impl SettingsApp {
 
 impl SettingsApp {
     fn add_folder(&mut self, path: PathBuf) {
-        let path_str = path.display().to_string();
+        // Store the canonical form, like everything that reads files (#99).
+        let path_str = match crate::watch::paths::normalize_folder(&path.to_string_lossy()) {
+            Ok(p) => p,
+            Err(e) => {
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("ImmichSync")
+                    .set_description(format!("Can't watch this folder: {e}"))
+                    .set_buttons(rfd::MessageButtons::Ok)
+                    .show();
+                return;
+            }
+        };
 
         // Check for duplicate.
         if self.folders.iter().any(|f| f.path == path_str) {

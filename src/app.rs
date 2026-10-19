@@ -366,32 +366,43 @@ impl App {
         // Load watched folders from the database.
         {
             let db = self.db.inner().lock().unwrap();
+            // Rows from before #99 may hold `~`, odd case or a symlink.
+            let m = db.canonicalize_folder_paths();
+            if m.changed > 0 || m.collisions > 0 {
+                info!(
+                    changed = m.changed,
+                    duplicates = m.collisions,
+                    "Canonicalised watched-folder paths"
+                );
+            }
             let folders = db.get_folders()?;
 
             if folders.is_empty() {
                 drop(db);
                 // First run: add the user's Pictures folder as a default.
-                if let Ok(pictures) = crate::platform::known_folders::get_pictures_folder() {
-                    if pictures.exists() {
-                        info!(path = %pictures.display(), "Adding default Pictures folder");
-                        let db = self.db.inner().lock().unwrap();
-                        if let Ok(id) =
-                            db.add_folder(&pictures.display().to_string(), Some("Pictures"), true)
-                        {
-                            // Default Pictures folder has no per-folder patterns.
-                            let filter = FileFilter::new();
-                            let canon = std::fs::canonicalize(&pictures)
-                                .unwrap_or_else(|_| pictures.clone());
-                            if let Err(e) = engine.add_folder(
-                                pictures,
-                                filter,
-                                false,
-                                self.runtime.handle().clone(),
-                            ) {
-                                warn!("Failed to add Pictures watcher: {}", e);
-                            } else {
-                                path_to_folder_id.insert(canon, id);
-                            }
+                if let Some(pictures) = crate::platform::known_folders::get_pictures_folder()
+                    .ok()
+                    .and_then(|p| crate::watch::paths::normalize_folder(&p.to_string_lossy()).ok())
+                    .map(std::path::PathBuf::from)
+                {
+                    info!(path = %pictures.display(), "Adding default Pictures folder");
+                    let db = self.db.inner().lock().unwrap();
+                    if let Ok(id) =
+                        db.add_folder(&pictures.display().to_string(), Some("Pictures"), true)
+                    {
+                        // Default Pictures folder has no per-folder patterns.
+                        let filter = FileFilter::new();
+                        let canon =
+                            std::fs::canonicalize(&pictures).unwrap_or_else(|_| pictures.clone());
+                        if let Err(e) = engine.add_folder(
+                            pictures,
+                            filter,
+                            false,
+                            self.runtime.handle().clone(),
+                        ) {
+                            warn!("Failed to add Pictures watcher: {}", e);
+                        } else {
+                            path_to_folder_id.insert(canon, id);
                         }
                     }
                 }
