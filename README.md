@@ -23,7 +23,7 @@ Immich has 84K+ GitHub stars and a thriving community, but no official desktop s
 - **SHA-1 deduplication** — matches Immich's internal checksum, saves bandwidth
 - **Album auto-creation** — organize by folder name, date, or custom album
 - **EXIF-aware** — extracts photo dates for accurate timestamps
-- **Encrypted API key storage** — secured via Windows DPAPI
+- **Encrypted API key storage** — Windows DPAPI, or the macOS Keychain
 - **System tray** — status icons, pause/resume, upload progress
 - **Settings UI** — clean configuration window built with egui
 - **Auto-start** — optional Windows startup via registry
@@ -50,7 +50,9 @@ Uninstall removes the binary, shortcuts, autostart entry, and the Apps & Feature
 
 Apple Silicon, macOS 13 or newer. Releases carry `ImmichSync-<version>-macos-arm64.zip`. Unzip it and move `ImmichSync.app` to Applications. Until the Developer ID signing lands, the app is ad-hoc signed: the first time, right-click → **Open** to get past Gatekeeper. It runs as a menu-bar icon with no Dock icon. Settings, the upload queue and logs live in `~/Library/Application Support/bees-roadhouse/immichsync/`.
 
-Not yet on macOS: start at login, Keychain storage of the API key (it sits in a mode-0600 `config.toml` for now), notifications, and self-update. See [#57](https://github.com/bees-roadhouse/immichsync/issues/57).
+The API key is kept in your login Keychain (`config.toml` holds only a `keychain:` marker), and upload and error notifications go to Notification Center. Because the build is ad-hoc signed, macOS asks once after each update whether ImmichSync may use its Keychain item; choose **Always Allow**.
+
+Not yet on macOS: start at login and self-update. See [#57](https://github.com/bees-roadhouse/immichsync/issues/57).
 
 To build the bundle yourself: `packaging/macos/make-app.sh` (writes `target/macos/ImmichSync.app` and a zip).
 

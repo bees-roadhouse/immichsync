@@ -2407,6 +2407,7 @@ dependencies = [
  "reqwest",
  "rfd",
  "rusqlite",
+ "security-framework",
  "semver",
  "serde",
  "serde_json",
