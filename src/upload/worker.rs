@@ -217,7 +217,50 @@ pub enum LibraryExportError {
 /// Exports Photos library originals. Blocking: the worker calls it from
 /// `spawn_blocking`. The macOS implementation is `platform::photos`.
 pub trait LibraryExporter: Send + Sync {
-    fn export_original(&self, local_id: &str) -> Result<LibraryExport, LibraryExportError>;
+    /// Export the asset's original. With `allow_network` false only a copy
+    /// already on this Mac is used (iCloud-only gives `CloudOnly`); with it
+    /// true PhotoKit downloads the original from iCloud first (#82).
+    fn export_original(
+        &self,
+        local_id: &str,
+        allow_network: bool,
+    ) -> Result<LibraryExport, LibraryExportError>;
+}
+
+/// Pauses exports while the temp volume is short of space (#82).
+#[derive(Clone)]
+pub struct DiskGuard {
+    /// Free bytes on the volume exports are written to; `None` = unknown
+    /// (the guard then doesn't hold anything up).
+    pub free_bytes: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
+    /// Exports wait while free space is below this.
+    pub floor: u64,
+    /// How often a paused export re-checks.
+    pub recheck: Duration,
+}
+
+impl DiskGuard {
+    /// ADR 0002: keep at least 2 GiB free.
+    pub const DEFAULT_FLOOR: u64 = 2 * 1024 * 1024 * 1024;
+}
+
+impl Default for DiskGuard {
+    fn default() -> Self {
+        Self {
+            free_bytes: Arc::new(|| None),
+            floor: Self::DEFAULT_FLOOR,
+            recheck: Duration::from_secs(30),
+        }
+    }
+}
+
+impl std::fmt::Debug for DiskGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiskGuard")
+            .field("floor", &self.floor)
+            .field("recheck", &self.recheck)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What the worker needs to upload `source = photos` entries.
@@ -228,6 +271,12 @@ pub struct LibrarySource {
     /// Serialises album placement, so two workers placing photos from the
     /// same new Photos album create one Immich album, not two.
     pub album_lock: tokio::sync::Mutex<()>,
+    /// iCloud-only originals: download or defer (#82).
+    pub icloud: crate::config::ICloudOriginals,
+    /// One iCloud download at a time, held until its upload settles, so at
+    /// most one downloaded original sits in temp.
+    pub download_lock: tokio::sync::Mutex<()>,
+    pub disk: DiskGuard,
 }
 
 impl LibrarySource {
@@ -237,7 +286,22 @@ impl LibrarySource {
             exporter,
             albums,
             album_lock: tokio::sync::Mutex::new(()),
+            icloud: crate::config::ICloudOriginals::Download,
+            download_lock: tokio::sync::Mutex::new(()),
+            disk: DiskGuard::default(),
         }
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn with_icloud(mut self, icloud: crate::config::ICloudOriginals) -> Self {
+        self.icloud = icloud;
+        self
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn with_disk_guard(mut self, disk: DiskGuard) -> Self {
+        self.disk = disk;
+        self
     }
 }
 
@@ -245,6 +309,8 @@ impl std::fmt::Debug for LibrarySource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LibrarySource")
             .field("albums", &self.albums)
+            .field("icloud", &self.icloud)
+            .field("disk", &self.disk)
             .finish_non_exhaustive()
     }
 }
@@ -812,14 +878,23 @@ async fn process_library_item(
         return;
     }
 
-    let exporter = library.exporter.clone();
-    let id_for_export = local_id.clone();
-    let exported =
-        tokio::task::spawn_blocking(move || exporter.export_original(&id_for_export)).await;
+    // A local copy first; iCloud-only originals are then downloaded one at a
+    // time (held until this entry's upload settles) or deferred, per policy.
+    wait_for_disk(&library.disk).await;
+    let mut exported = export_for_upload(&library, &local_id, false).await;
+    let mut _download_slot = None;
+    if matches!(exported, Ok(Err(LibraryExportError::CloudOnly)))
+        && library.icloud == crate::config::ICloudOriginals::Download
+    {
+        _download_slot = Some(library.download_lock.lock().await);
+        wait_for_disk(&library.disk).await;
+        info!(id = entry.id, %local_id, "Downloading the original from iCloud");
+        exported = export_for_upload(&library, &local_id, true).await;
+    }
     let export = match exported {
         Ok(Ok(x)) => x,
         Ok(Err(LibraryExportError::CloudOnly)) => {
-            info!(id = entry.id, %local_id, "Photos original is only in iCloud; skipped (download is a later slice)");
+            info!(id = entry.id, %local_id, "Photos original is only in iCloud; deferred until it's local");
             let _ = store.update_status(
                 entry.id,
                 "failed",
@@ -991,6 +1066,39 @@ async fn process_library_item(
             fail_or_retry(&entry, store.as_ref(), config, &e.to_string()).await
         }
     }
+}
+
+/// Wait while the export volume is short of space (#82). Logs once per wait.
+async fn wait_for_disk(disk: &DiskGuard) {
+    let mut logged = false;
+    while let Some(free) = (disk.free_bytes)() {
+        if free >= disk.floor {
+            break;
+        }
+        if !logged {
+            warn!(
+                free,
+                floor = disk.floor,
+                "Low disk space; Photos exports paused"
+            );
+            logged = true;
+        }
+        sleep(disk.recheck).await;
+    }
+    if logged {
+        info!("Disk space recovered; Photos exports resumed");
+    }
+}
+
+/// Run one export on a blocking thread.
+async fn export_for_upload(
+    library: &LibrarySource,
+    local_id: &str,
+    allow_network: bool,
+) -> Result<Result<LibraryExport, LibraryExportError>, tokio::task::JoinError> {
+    let exporter = library.exporter.clone();
+    let id = local_id.to_string();
+    tokio::task::spawn_blocking(move || exporter.export_original(&id, allow_network)).await
 }
 
 /// Make sure a Live Photo's motion video is on the server and return its
@@ -1814,7 +1922,10 @@ mod tests {
     /// Exports a fixed outcome, writing a real temp file on success.
     struct FakeExporter {
         dir: std::path::PathBuf,
-        outcome: fn() -> Option<LibraryExportError>,
+        /// Called with `allow_network`; `Some` fails the export.
+        outcome: fn(bool) -> Option<LibraryExportError>,
+        /// `allow_network` of each export call.
+        calls: Mutex<Vec<bool>>,
         exported: Mutex<Vec<std::path::PathBuf>>,
         albums: fn() -> Vec<LibraryAlbum>,
         /// Export a Live Photo: a still plus `IMG_0001.MOV`.
@@ -1822,8 +1933,13 @@ mod tests {
     }
 
     impl LibraryExporter for FakeExporter {
-        fn export_original(&self, local_id: &str) -> Result<LibraryExport, LibraryExportError> {
-            if let Some(e) = (self.outcome)() {
+        fn export_original(
+            &self,
+            local_id: &str,
+            allow_network: bool,
+        ) -> Result<LibraryExport, LibraryExportError> {
+            self.calls.lock().unwrap().push(allow_network);
+            if let Some(e) = (self.outcome)(allow_network) {
                 return Err(e);
             }
             let sub = self.dir.join(local_id.replace('/', "_"));
@@ -1960,7 +2076,7 @@ mod tests {
 
     struct NoExport;
     impl LibraryExporter for NoExport {
-        fn export_original(&self, _: &str) -> Result<LibraryExport, LibraryExportError> {
+        fn export_original(&self, _: &str, _: bool) -> Result<LibraryExport, LibraryExportError> {
             Err(LibraryExportError::Gone)
         }
     }
@@ -1984,10 +2100,224 @@ mod tests {
 
     // ── Tests ─────────────────────────────────────────────────────────────
 
+    /// iCloud-only unless the network is allowed.
+    fn icloud_exporter(dir: &Path) -> Arc<FakeExporter> {
+        Arc::new(FakeExporter {
+            dir: dir.to_path_buf(),
+            outcome: |net| (!net).then_some(LibraryExportError::CloudOnly),
+            calls: Mutex::new(Vec::new()),
+            exported: Mutex::new(Vec::new()),
+            albums: Vec::new,
+            paired: false,
+        })
+    }
+
+    fn icloud_config(
+        exporter: Arc<FakeExporter>,
+        icloud: crate::config::ICloudOriginals,
+        disk: DiskGuard,
+    ) -> WorkerConfig {
+        let mut config = library_config(exporter.clone());
+        config.library = Some(Arc::new(
+            LibrarySource::new(exporter, AlbumPolicy::default())
+                .with_icloud(icloud)
+                .with_disk_guard(disk),
+        ));
+        config
+    }
+
+    #[tokio::test]
+    async fn download_policy_fetches_an_icloud_only_original_and_uploads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let exporter = icloud_exporter(dir.path());
+        let store = Arc::new(MockStore::default());
+        let uploader = Arc::new(RecordingUploader::default());
+        let config = icloud_config(
+            exporter.clone(),
+            crate::config::ICloudOriginals::Download,
+            DiskGuard::default(),
+        );
+
+        let done = run_one_photos_entry(&store, uploader.clone(), &config, "CLOUD").await;
+
+        assert_eq!(done.status, "completed", "{:?}", done.error_message);
+        assert_eq!(
+            *exporter.calls.lock().unwrap(),
+            vec![false, true],
+            "local first, then download"
+        );
+        assert_eq!(uploader.uploads.lock().unwrap().len(), 1);
+        assert!(!exporter.exported.lock().unwrap()[0].exists());
+    }
+
+    #[tokio::test]
+    async fn skip_policy_defers_without_touching_the_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let exporter = icloud_exporter(dir.path());
+        let store = Arc::new(MockStore::default());
+        let uploader = Arc::new(RecordingUploader::default());
+        let config = icloud_config(
+            exporter.clone(),
+            crate::config::ICloudOriginals::Skip,
+            DiskGuard::default(),
+        );
+
+        let done = run_one_photos_entry(&store, uploader.clone(), &config, "CLOUD").await;
+
+        assert_eq!(done.status, "failed");
+        assert!(done.error_message.unwrap().starts_with("deferred:"));
+        assert_eq!(*exporter.calls.lock().unwrap(), vec![false]);
+        assert!(uploader.uploads.lock().unwrap().is_empty());
+    }
+
+    /// Downloads one at a time: two iCloud-only entries processed together
+    /// never download at once.
+    #[tokio::test]
+    async fn icloud_downloads_never_overlap() {
+        struct SlowCloud {
+            dir: std::path::PathBuf,
+            in_flight: std::sync::atomic::AtomicUsize,
+            max_in_flight: std::sync::atomic::AtomicUsize,
+        }
+        impl LibraryExporter for SlowCloud {
+            fn export_original(
+                &self,
+                local_id: &str,
+                allow_network: bool,
+            ) -> Result<LibraryExport, LibraryExportError> {
+                use std::sync::atomic::Ordering::SeqCst;
+                if !allow_network {
+                    return Err(LibraryExportError::CloudOnly);
+                }
+                let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+                self.max_in_flight.fetch_max(now, SeqCst);
+                std::thread::sleep(Duration::from_millis(50));
+                self.in_flight.fetch_sub(1, SeqCst);
+                let sub = self.dir.join(local_id);
+                std::fs::create_dir_all(&sub).unwrap();
+                let path = sub.join("IMG.HEIC");
+                std::fs::write(&path, local_id).unwrap();
+                Ok(LibraryExport {
+                    path,
+                    resource: "photo",
+                    created_at: Utc::now(),
+                    modified_at: Utc::now(),
+                    albums: Vec::new(),
+                    paired_video: None,
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cloud = Arc::new(SlowCloud {
+            dir: dir.path().to_path_buf(),
+            in_flight: Default::default(),
+            max_in_flight: Default::default(),
+        });
+        let store = Arc::new(MockStore::default());
+        let mut config = library_config(Arc::new(FakeExporter {
+            dir: dir.path().to_path_buf(),
+            outcome: |_| None,
+            calls: Mutex::new(Vec::new()),
+            exported: Mutex::new(Vec::new()),
+            albums: Vec::new,
+            paired: false,
+        }));
+        config.library = Some(Arc::new(LibrarySource::new(
+            cloud.clone(),
+            AlbumPolicy::default(),
+        )));
+        let config = Arc::new(config);
+
+        store.enqueue_photos("A").unwrap();
+        store.enqueue_photos("B").unwrap();
+        let entries = store.dequeue_pending(2).unwrap();
+        let tasks: Vec<_> = entries
+            .into_iter()
+            .map(|e| {
+                let (store, config) = (store.clone(), config.clone());
+                tokio::spawn(async move {
+                    process_item(e, store, Arc::new(RecordingUploader::default()), &config).await
+                })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(
+            cloud
+                .max_in_flight
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn exports_wait_while_the_disk_is_below_the_floor() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let dir = tempfile::tempdir().unwrap();
+        let exporter = Arc::new(FakeExporter {
+            dir: dir.path().to_path_buf(),
+            // Fails the test if called before space was reported.
+            outcome: |_| None,
+            calls: Mutex::new(Vec::new()),
+            exported: Mutex::new(Vec::new()),
+            albums: Vec::new,
+            paired: false,
+        });
+        let checks = Arc::new(AtomicUsize::new(0));
+        let space_ok = Arc::new(AtomicBool::new(false));
+        let disk = DiskGuard {
+            free_bytes: {
+                let (checks, space_ok) = (checks.clone(), space_ok.clone());
+                Arc::new(move || {
+                    // Low for the first three checks, then plenty.
+                    let n = checks.fetch_add(1, SeqCst);
+                    let ok = n >= 3;
+                    space_ok.store(ok, SeqCst);
+                    Some(if ok {
+                        10 * DiskGuard::DEFAULT_FLOOR
+                    } else {
+                        1024
+                    })
+                })
+            },
+            floor: DiskGuard::DEFAULT_FLOOR,
+            recheck: Duration::from_millis(5),
+        };
+        let store = Arc::new(MockStore::default());
+        let config = icloud_config(
+            exporter.clone(),
+            crate::config::ICloudOriginals::Download,
+            disk,
+        );
+
+        let done = run_one_photos_entry(
+            &store,
+            Arc::new(RecordingUploader::default()),
+            &config,
+            "LOCAL",
+        )
+        .await;
+
+        assert_eq!(done.status, "completed");
+        assert!(
+            checks.load(SeqCst) >= 4,
+            "it waited: {} checks",
+            checks.load(SeqCst)
+        );
+        assert!(space_ok.load(SeqCst));
+        assert_eq!(
+            exporter.calls.lock().unwrap().len(),
+            1,
+            "exported once, after the wait"
+        );
+    }
+
     fn live_exporter(dir: &Path) -> Arc<FakeExporter> {
         Arc::new(FakeExporter {
             dir: dir.to_path_buf(),
-            outcome: || None,
+            outcome: |_| None,
+            calls: Mutex::new(Vec::new()),
             exported: Mutex::new(Vec::new()),
             albums: || vec![album("C1", "Hawaii")],
             paired: true,
@@ -2257,7 +2587,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let exporter = Arc::new(FakeExporter {
             dir: dir.path().to_path_buf(),
-            outcome: || None,
+            outcome: |_| None,
+            calls: Mutex::new(Vec::new()),
             exported: Mutex::new(Vec::new()),
             albums: || vec![album("C1", "Hawaii")],
             paired: false,
@@ -2308,7 +2639,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let exporter = Arc::new(FakeExporter {
             dir: dir.path().to_path_buf(),
-            outcome: || None,
+            outcome: |_| None,
+            calls: Mutex::new(Vec::new()),
             exported: Mutex::new(Vec::new()),
             albums: Vec::new,
             paired: false,
@@ -2353,7 +2685,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let exporter = Arc::new(FakeExporter {
             dir: dir.path().to_path_buf(),
-            outcome: || None,
+            outcome: |_| None,
+            calls: Mutex::new(Vec::new()),
             exported: Mutex::new(Vec::new()),
             albums: Vec::new,
             paired: false,
@@ -2384,7 +2717,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let exporter = Arc::new(FakeExporter {
             dir: dir.path().to_path_buf(),
-            outcome: || None,
+            outcome: |_| None,
+            calls: Mutex::new(Vec::new()),
             exported: Mutex::new(Vec::new()),
             albums: Vec::new,
             paired: false,
@@ -2415,7 +2749,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let exporter = Arc::new(FakeExporter {
             dir: dir.path().to_path_buf(),
-            outcome: || Some(LibraryExportError::CloudOnly),
+            outcome: |_| Some(LibraryExportError::CloudOnly),
+            calls: Mutex::new(Vec::new()),
             exported: Mutex::new(Vec::new()),
             albums: Vec::new,
             paired: false,

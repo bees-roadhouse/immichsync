@@ -48,6 +48,12 @@ pub trait QueueStore: Send + Sync {
         anyhow::bail!("this store has no Photos library support")
     }
 
+    /// Return iCloud-deferred Photos entries to pending (#82).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn requeue_deferred_photos(&self) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+
     /// The stored Photos change token (#81); `None` = enumerate everything.
     fn photos_change_token(&self) -> anyhow::Result<Option<Vec<u8>>> {
         Ok(None)

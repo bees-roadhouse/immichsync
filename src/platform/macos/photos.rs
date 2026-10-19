@@ -384,6 +384,20 @@ pub fn watch_changes(tx: mpsc::Sender<()>) -> Option<ChangeWatch> {
 /// How long one export may take before it is treated as failed. Local
 /// originals are disk copies; large videos still take a while.
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// An iCloud download of a large video can take much longer (#82).
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// Free bytes on the volume exports are written to (`$TMPDIR`), for the
+/// disk guard (#82). `None` if it can't be read.
+pub fn temp_free_bytes() -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(std::env::temp_dir().as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_bavail as u64 * st.f_frsize as u64)
+}
 
 /// The original resource of an asset: `.photo` for images, `.video` for
 /// videos. Never the rendered edit (`.fullSizePhoto`); ADR 0002 §Originals.
@@ -465,7 +479,11 @@ fn sweep(root: &std::path::Path) -> usize {
 pub struct PhotoKitExporter;
 
 impl LibraryExporter for PhotoKitExporter {
-    fn export_original(&self, local_id: &str) -> Result<LibraryExport, LibraryExportError> {
+    fn export_original(
+        &self,
+        local_id: &str,
+        allow_network: bool,
+    ) -> Result<LibraryExport, LibraryExportError> {
         if !access().can_read() {
             return Err(LibraryExportError::Other(anyhow!(
                 "Photos library access is not granted"
@@ -492,7 +510,7 @@ impl LibraryExporter for PhotoKitExporter {
 
         let name = safe_file_name(&unsafe { resource.originalFilename() }.to_string());
         let path = dir.join(&name);
-        if let Err(e) = write_resource(&resource, &path) {
+        if let Err(e) = write_resource(&resource, &path, allow_network) {
             cleanup(&dir);
             return Err(e);
         }
@@ -507,7 +525,7 @@ impl LibraryExporter for PhotoKitExporter {
                     vname = format!("motion-{vname}");
                 }
                 let vpath = dir.join(vname);
-                if let Err(e) = write_resource(&video, &vpath) {
+                if let Err(e) = write_resource(&video, &vpath, allow_network) {
                     cleanup(&dir);
                     return Err(e);
                 }
@@ -527,14 +545,20 @@ impl LibraryExporter for PhotoKitExporter {
     }
 }
 
-/// Write one resource's bytes to `path`, local copies only.
+/// Write one resource's bytes to `path`. Without `allow_network` only a copy
+/// already on this Mac is used; with it PhotoKit downloads from iCloud.
 fn write_resource(
     resource: &PHAssetResource,
     path: &std::path::Path,
+    allow_network: bool,
 ) -> Result<(), LibraryExportError> {
     let options = unsafe { PHAssetResourceRequestOptions::new() };
-    // Local originals only for now; iCloud downloads are #82.
-    unsafe { options.setNetworkAccessAllowed(false) };
+    unsafe { options.setNetworkAccessAllowed(allow_network) };
+    let timeout = if allow_network {
+        DOWNLOAD_TIMEOUT
+    } else {
+        EXPORT_TIMEOUT
+    };
 
     let (tx, rx) = mpsc::channel::<Option<(isize, String)>>();
     let done = RcBlock::new(move |err: *mut NSError| {
@@ -553,7 +577,7 @@ fn write_resource(
             );
     }
 
-    match rx.recv_timeout(EXPORT_TIMEOUT) {
+    match rx.recv_timeout(timeout) {
         Ok(None) => Ok(()),
         Ok(Some((code, _))) if code == PHPhotosError::NetworkAccessRequired.0 => {
             Err(LibraryExportError::CloudOnly)
@@ -565,7 +589,7 @@ fn write_resource(
         // directory, which makes it fail harmlessly rather than land.
         Err(_) => Err(LibraryExportError::Other(anyhow!(
             "export timed out after {}s",
-            EXPORT_TIMEOUT.as_secs()
+            timeout.as_secs()
         ))),
     }
 }
@@ -609,6 +633,12 @@ mod tests {
         assert!(!bytes.is_empty());
         assert!(unarchive(&bytes).is_some());
         assert!(unarchive(b"not an archive").is_none());
+    }
+
+    #[test]
+    fn temp_free_bytes_reads_the_temp_volume() {
+        let free = temp_free_bytes().expect("statvfs on $TMPDIR");
+        assert!(free > 0);
     }
 
     #[test]
