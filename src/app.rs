@@ -93,6 +93,9 @@ pub struct App {
 #[derive(Clone)]
 pub struct WindowOpenTracker {
     pub settings: Arc<AtomicBool>,
+    /// PID of the open Settings subprocess (0 when none), so a second
+    /// Settings click can bring it to the front (#102).
+    pub settings_pid: Arc<std::sync::atomic::AtomicU32>,
     pub about: Arc<AtomicBool>,
     pub upload_log: Arc<AtomicBool>,
     pub trash_log: Arc<AtomicBool>,
@@ -103,6 +106,7 @@ impl WindowOpenTracker {
     fn new() -> Self {
         Self {
             settings: Arc::new(AtomicBool::new(false)),
+            settings_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             about: Arc::new(AtomicBool::new(false)),
             upload_log: Arc::new(AtomicBool::new(false)),
             trash_log: Arc::new(AtomicBool::new(false)),
@@ -562,13 +566,23 @@ impl App {
             }
             TrayAction::OpenSettings => {
                 if self.window_open.settings.swap(true, Ordering::SeqCst) {
-                    info!("Settings window already open, ignoring");
+                    let pid = self.window_open.settings_pid.load(Ordering::SeqCst);
+                    info!(
+                        pid,
+                        "Settings window already open; bringing it to the front"
+                    );
+                    crate::platform::focus_window(pid, crate::ui::settings::WINDOW_TITLE);
                     return;
                 }
                 let (tx, rx) = std::sync::mpsc::channel();
                 self.settings_rx = Some(rx);
                 let flag = self.window_open.settings.clone();
-                spawn_window_subprocess("settings", flag, Some(tx));
+                spawn_window_subprocess(
+                    "settings",
+                    flag,
+                    Some(self.window_open.settings_pid.clone()),
+                    Some(tx),
+                );
             }
             TrayAction::UploadNow => {
                 // Re-run the scan of every watched folder (the same restart
@@ -583,7 +597,7 @@ impl App {
                     return;
                 }
                 let flag = self.window_open.about.clone();
-                spawn_window_subprocess("about", flag, None);
+                spawn_window_subprocess("about", flag, None, None);
             }
             TrayAction::ViewLog => {
                 if self.window_open.upload_log.swap(true, Ordering::SeqCst) {
@@ -591,7 +605,7 @@ impl App {
                     return;
                 }
                 let flag = self.window_open.upload_log.clone();
-                spawn_window_subprocess("log", flag, None);
+                spawn_window_subprocess("log", flag, None, None);
             }
             TrayAction::ViewTrash => {
                 if self.window_open.trash_log.swap(true, Ordering::SeqCst) {
@@ -599,7 +613,7 @@ impl App {
                     return;
                 }
                 let flag = self.window_open.trash_log.clone();
-                spawn_window_subprocess("trash-log", flag, None);
+                spawn_window_subprocess("trash-log", flag, None, None);
             }
             TrayAction::RetryKeychain => {
                 // Re-read config.toml on a worker thread: the Keychain read
@@ -1493,6 +1507,7 @@ async fn initial_scan(
 fn spawn_window_subprocess(
     window_type: &'static str,
     open_flag: Arc<AtomicBool>,
+    pid_slot: Option<Arc<std::sync::atomic::AtomicU32>>,
     config_tx: Option<std::sync::mpsc::Sender<crate::config::Config>>,
 ) {
     // Prefer the installed exe path so subprocesses always run from the
@@ -1514,10 +1529,19 @@ fn spawn_window_subprocess(
 
     std::thread::spawn(move || {
         info!(window_type, "Spawning window subprocess");
-        match std::process::Command::new(&exe)
+        let status = std::process::Command::new(&exe)
             .args(["--window", window_type])
-            .status()
-        {
+            .spawn()
+            .and_then(|mut child| {
+                if let Some(ref slot) = pid_slot {
+                    slot.store(child.id(), Ordering::SeqCst);
+                }
+                child.wait()
+            });
+        if let Some(ref slot) = pid_slot {
+            slot.store(0, Ordering::SeqCst);
+        }
+        match status {
             Ok(status) => {
                 info!(window_type, ?status, "Window subprocess exited");
                 // For settings, reload config from disk after the subprocess exits.
