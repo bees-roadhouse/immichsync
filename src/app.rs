@@ -258,11 +258,25 @@ impl App {
                 self.shutdown_and_exit();
             }
 
-            // Check for config updates from the settings window.
-            if let Some(ref rx) = self.settings_rx {
-                if let Ok(new_config) = rx.try_recv() {
+            // Check for config updates from the settings window or a
+            // Keychain retry. Cleared once it lands, so `is_some()` means a
+            // reload is in flight.
+            let reload = self.settings_rx.as_ref().map(|rx| rx.try_recv());
+            match reload {
+                Some(Ok(new_config)) => {
+                    self.settings_rx = None;
                     self.apply_new_config(new_config);
                 }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    // The reload failed (logged where it ran): keep what we
+                    // have, and offer Retry again if the key is still unreadable.
+                    self.settings_rx = None;
+                    let unreadable = self.config.server.unreadable_key.is_some();
+                    if let Some(ref mut tray) = self.tray {
+                        tray.set_key_unreadable(unreadable);
+                    }
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => {}
             }
 
             // Poll for update check results.
@@ -589,7 +603,16 @@ impl App {
                     info!("Settings is open; it reloads the config on close");
                     return;
                 }
+                if self.settings_rx.is_some() {
+                    info!("A config reload is already in flight; ignoring Retry");
+                    return;
+                }
                 info!("Retrying the stored API key");
+                // Greyed out until the reload lands, so clicks while macOS's
+                // prompt is up don't stack Keychain reads (#130 review).
+                if let Some(ref mut tray) = self.tray {
+                    tray.set_key_unreadable(false);
+                }
                 let (tx, rx) = std::sync::mpsc::channel();
                 self.settings_rx = Some(rx);
                 std::thread::spawn(move || match Config::load() {
