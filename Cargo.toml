@@ -1,6 +1,6 @@
 [package]
 name = "immichsync"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 description = "Windows and macOS tray app that syncs photos/videos to Immich"
 license = "GPL-3.0-only"
