@@ -112,6 +112,29 @@ pub trait AssetUploader: Send + Sync {
         Ok(())
     }
 
+    /// Upload the still of a Live Photo, linked to its already-uploaded
+    /// motion video (`livePhotoVideoId`). The default (for mocks that don't
+    /// care) is a plain upload.
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_live_still(
+        &self,
+        file_path: &Path,
+        device_asset_id: &str,
+        device_id: &str,
+        created_at: DateTime<Utc>,
+        modified_at: DateTime<Utc>,
+        _live_photo_video_id: &str,
+    ) -> anyhow::Result<UploadResult> {
+        self.upload_asset(
+            file_path,
+            device_asset_id,
+            device_id,
+            created_at,
+            modified_at,
+        )
+        .await
+    }
+
     /// Rename an album by id.
     async fn rename_mirror_album(
         &self,
@@ -163,6 +186,10 @@ pub struct LibraryExport {
     pub resource: &'static str,
     pub created_at: DateTime<Utc>,
     pub modified_at: DateTime<Utc>,
+    /// For a Live Photo: its original paired video (`.pairedVideo`), in the
+    /// same per-export directory. Uploaded first; the still links to it
+    /// with `livePhotoVideoId` (#83).
+    pub paired_video: Option<std::path::PathBuf>,
     /// The Photos user albums this asset is in (smart and shared albums are
     /// never listed). Mirrored to Immich when album sync is on (#115).
     pub albums: Vec<LibraryAlbum>,
@@ -255,16 +282,18 @@ pub fn photos_device_asset_id(local_id: &str, resource: &str) -> String {
 
 /// Deletes the exported temp file (and its per-export directory) on drop,
 /// however the entry ends.
-struct TempExport(std::path::PathBuf);
+struct TempExport(Vec<std::path::PathBuf>);
 
 impl Drop for TempExport {
     fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(&self.0) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!(path = %self.0.display(), error = %e, "Failed to delete exported temp file");
+        for path in &self.0 {
+            if let Err(e) = std::fs::remove_file(path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!(path = %path.display(), error = %e, "Failed to delete exported temp file");
+                }
             }
         }
-        if let Some(dir) = self.0.parent() {
+        for dir in self.0.iter().filter_map(|p| p.parent()) {
             let _ = std::fs::remove_dir(dir);
         }
     }
@@ -903,7 +932,11 @@ async fn process_library_item(
     // Deletes the export however this ends. Dropped explicitly before any
     // retry backoff, so a private original never waits in temp; the retry
     // exports again.
-    let cleanup = TempExport(export.path.clone());
+    let cleanup = TempExport(
+        std::iter::once(export.path.clone())
+            .chain(export.paired_video.clone())
+            .collect(),
+    );
     let label = format!("photos:{local_id}/{}", export.resource);
 
     let hash = match crate::upload::hasher::hash_file(&export.path) {
@@ -942,16 +975,64 @@ async fn process_library_item(
         return;
     }
 
+    // A Live Photo's motion video goes up first; the still links to it, and
+    // is never marked done before it (#83). Only now, once the still is known
+    // not to be in Immich already: a video uploaded for a still that's
+    // already there would sit unlinked in the timeline.
+    let live_video_id = match export.paired_video.as_deref() {
+        None => None,
+        Some(video) => {
+            match upload_paired_video(
+                &local_id,
+                video,
+                &export,
+                store.as_ref(),
+                uploader.as_ref(),
+                config,
+            )
+            .await
+            {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    drop(cleanup);
+                    return fail_or_retry(
+                        &entry,
+                        store.as_ref(),
+                        config,
+                        &format!("Live Photo video: {e:#}"),
+                    )
+                    .await;
+                }
+            }
+        }
+    };
+
     let device_asset_id = photos_device_asset_id(&local_id, export.resource);
-    let result = uploader
-        .upload_asset(
-            &export.path,
-            &device_asset_id,
-            &config.device_id,
-            export.created_at,
-            export.modified_at,
-        )
-        .await;
+    let result = match live_video_id.as_deref() {
+        Some(video_id) => {
+            uploader
+                .upload_live_still(
+                    &export.path,
+                    &device_asset_id,
+                    &config.device_id,
+                    export.created_at,
+                    export.modified_at,
+                    video_id,
+                )
+                .await
+        }
+        None => {
+            uploader
+                .upload_asset(
+                    &export.path,
+                    &device_asset_id,
+                    &config.device_id,
+                    export.created_at,
+                    export.modified_at,
+                )
+                .await
+        }
+    };
 
     match result {
         Ok(up) => {
@@ -991,6 +1072,41 @@ async fn process_library_item(
             fail_or_retry_or_hold(&entry, store.as_ref(), config, &e).await
         }
     }
+}
+
+/// Make sure a Live Photo's motion video is on the server and return its
+/// Immich id: reused if those bytes were uploaded before (a retry after the
+/// still failed), otherwise uploaded and recorded as resource `paired_video`.
+async fn upload_paired_video(
+    local_id: &str,
+    video: &Path,
+    export: &LibraryExport,
+    store: &dyn QueueStore,
+    uploader: &dyn AssetUploader,
+    config: &WorkerConfig,
+) -> anyhow::Result<String> {
+    const RESOURCE: &str = "paired_video";
+    let hash = crate::upload::hasher::hash_file(video)?;
+    if let Some(existing) = store.uploaded_asset_id(&hash)? {
+        debug!(%local_id, asset_id = %existing, "Live Photo video already uploaded");
+        return Ok(existing);
+    }
+    let device_asset_id = photos_device_asset_id(local_id, RESOURCE);
+    let up = uploader
+        .upload_asset(
+            video,
+            &device_asset_id,
+            &config.device_id,
+            export.created_at,
+            export.modified_at,
+        )
+        .await?;
+    let size = std::fs::metadata(video).map(|m| m.len()).unwrap_or(0);
+    let label = format!("photos:{local_id}/{RESOURCE}");
+    store.record_upload(&label, &hash, size, 0, &up.asset_id, &device_asset_id, "")?;
+    store.record_photos_asset(local_id, RESOURCE, &hash, &up.asset_id, None)?;
+    info!(%local_id, asset_id = %up.asset_id, "Live Photo video uploaded");
+    Ok(up.asset_id)
 }
 
 /// Put an uploaded library asset into its Immich albums per `library.albums`:
@@ -1902,6 +2018,10 @@ mod tests {
     struct RecordingUploader {
         uploads: Mutex<Vec<(String, String)>>,
         albums: Mutex<Vec<(String, String)>>,
+        /// `(still file name, livePhotoVideoId)` for each linked still.
+        live_links: Mutex<Vec<(String, String)>>,
+        /// File names whose upload fails.
+        fail: Vec<&'static str>,
     }
 
     #[async_trait]
@@ -1920,14 +2040,43 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned();
-            self.uploads
-                .lock()
-                .unwrap()
-                .push((name, device_asset_id.to_string()));
+            if self.fail.contains(&name.as_str()) {
+                anyhow::bail!("simulated failure uploading {name}");
+            }
+            let mut uploads = self.uploads.lock().unwrap();
+            uploads.push((name, device_asset_id.to_string()));
             Ok(UploadResult {
-                asset_id: "imm-1".to_string(),
+                asset_id: format!("imm-{}", uploads.len()),
                 is_duplicate: false,
             })
+        }
+
+        async fn upload_live_still(
+            &self,
+            file_path: &Path,
+            device_asset_id: &str,
+            device_id: &str,
+            created_at: DateTime<Utc>,
+            modified_at: DateTime<Utc>,
+            live_photo_video_id: &str,
+        ) -> anyhow::Result<UploadResult> {
+            let name = file_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            self.live_links
+                .lock()
+                .unwrap()
+                .push((name, live_photo_video_id.to_string()));
+            self.upload_asset(
+                file_path,
+                device_asset_id,
+                device_id,
+                created_at,
+                modified_at,
+            )
+            .await
         }
 
         async fn check_duplicates(
@@ -1952,6 +2101,8 @@ mod tests {
         outcome: fn() -> Option<LibraryExportError>,
         exported: Mutex<Vec<std::path::PathBuf>>,
         albums: fn() -> Vec<LibraryAlbum>,
+        /// Export a Live Photo: a still plus `IMG_0001.MOV`.
+        paired: bool,
     }
 
     impl LibraryExporter for FakeExporter {
@@ -1964,12 +2115,19 @@ mod tests {
             let path = sub.join("IMG_0001.HEIC");
             std::fs::write(&path, format!("original bytes of {local_id}")).unwrap();
             self.exported.lock().unwrap().push(path.clone());
+            let paired_video = self.paired.then(|| {
+                let v = sub.join("IMG_0001.MOV");
+                std::fs::write(&v, format!("motion bytes of {local_id}")).unwrap();
+                self.exported.lock().unwrap().push(v.clone());
+                v
+            });
             Ok(LibraryExport {
                 path,
                 resource: "photo",
                 created_at: Utc::now(),
                 modified_at: Utc::now(),
                 albums: (self.albums)(),
+                paired_video,
             })
         }
     }
@@ -2124,6 +2282,162 @@ mod tests {
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────
+
+    fn live_exporter(dir: &Path) -> Arc<FakeExporter> {
+        Arc::new(FakeExporter {
+            dir: dir.to_path_buf(),
+            outcome: || None,
+            exported: Mutex::new(Vec::new()),
+            albums: || vec![album("C1", "Hawaii")],
+            paired: true,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_live_photo_uploads_its_video_first_then_the_linked_still() {
+        let dir = tempfile::tempdir().unwrap();
+        let exporter = live_exporter(dir.path());
+        let store = Arc::new(MockStore::default());
+        let uploader = Arc::new(RecordingUploader::default());
+        let config = library_config(exporter.clone());
+
+        let done = run_one_photos_entry(&store, uploader.clone(), &config, "LIVE").await;
+
+        assert_eq!(done.status, "completed", "{:?}", done.error_message);
+        assert_eq!(
+            *uploader.uploads.lock().unwrap(),
+            vec![
+                (
+                    "IMG_0001.MOV".to_string(),
+                    "photos-LIVE-paired_video".to_string()
+                ),
+                ("IMG_0001.HEIC".to_string(), "photos-LIVE-photo".to_string()),
+            ],
+            "video first, then the still"
+        );
+        assert_eq!(
+            *uploader.live_links.lock().unwrap(),
+            vec![("IMG_0001.HEIC".to_string(), "imm-1".to_string())],
+            "the still links to the video's Immich id"
+        );
+        // Only the still goes into albums (Immich hides the motion part).
+        assert_eq!(
+            *uploader.albums.lock().unwrap(),
+            vec![("immichsync test".to_string(), "imm-2".to_string())]
+        );
+        let rows = store.photos_assets.lock().unwrap().clone();
+        assert!(rows.contains(&("LIVE".into(), "paired_video".into(), "imm-1".into())));
+        assert!(rows.contains(&("LIVE".into(), "photo".into(), "imm-2".into())));
+        for p in exporter.exported.lock().unwrap().iter() {
+            assert!(!p.exists(), "{} must be deleted", p.display());
+        }
+    }
+
+    /// The still is never marked done before its video is.
+    #[tokio::test]
+    async fn a_failed_video_upload_leaves_the_still_unuploaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let exporter = live_exporter(dir.path());
+        let store = Arc::new(MockStore::default());
+        let uploader = Arc::new(RecordingUploader {
+            fail: vec!["IMG_0001.MOV"],
+            ..RecordingUploader::default()
+        });
+
+        let done = run_one_photos_entry(
+            &store,
+            uploader.clone(),
+            &library_config(exporter.clone()),
+            "LIVE",
+        )
+        .await;
+
+        assert_ne!(done.status, "completed");
+        assert!(
+            uploader.uploads.lock().unwrap().is_empty(),
+            "no still without its video"
+        );
+        for p in exporter.exported.lock().unwrap().iter() {
+            assert!(!p.exists(), "{} must be deleted", p.display());
+        }
+    }
+
+    /// If the still is already in Immich (same SHA-1, e.g. uploaded from a
+    /// watched folder), its motion video must not go up on its own: it would
+    /// sit in the timeline as an unlinked, visible video (Pia's review on
+    /// #138). Nothing is uploaded; the existing still joins its albums.
+    #[tokio::test]
+    async fn a_live_photo_whose_still_is_already_uploaded_uploads_no_video() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MockStore::default());
+        let probe = dir.path().join("probe");
+        std::fs::write(&probe, "original bytes of LIVE").unwrap();
+        let still_hash = crate::upload::hasher::hash_file(&probe).unwrap();
+        store
+            .uploaded
+            .lock()
+            .unwrap()
+            .insert(still_hash, "imm-still".to_string());
+        let uploader = Arc::new(RecordingUploader::default());
+        let exporter = live_exporter(dir.path());
+
+        let done = run_one_photos_entry(
+            &store,
+            uploader.clone(),
+            &library_config(exporter.clone()),
+            "LIVE",
+        )
+        .await;
+
+        assert_eq!(done.status, "completed");
+        assert!(
+            uploader.uploads.lock().unwrap().is_empty(),
+            "no unlinked video"
+        );
+        assert_eq!(
+            *uploader.albums.lock().unwrap(),
+            vec![("immichsync test".to_string(), "imm-still".to_string())]
+        );
+        for p in exporter.exported.lock().unwrap().iter() {
+            assert!(!p.exists(), "{} must be deleted", p.display());
+        }
+    }
+
+    /// A retry after the still failed doesn't upload the video again: the
+    /// still links to the video already on the server.
+    #[tokio::test]
+    async fn a_retry_reuses_the_uploaded_video() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MockStore::default());
+        // The first attempt's video upload is on record.
+        let probe = dir.path().join("probe");
+        std::fs::write(&probe, "motion bytes of LIVE").unwrap();
+        let vhash = crate::upload::hasher::hash_file(&probe).unwrap();
+        store
+            .uploaded
+            .lock()
+            .unwrap()
+            .insert(vhash, "imm-video".to_string());
+        let uploader = Arc::new(RecordingUploader::default());
+
+        let done = run_one_photos_entry(
+            &store,
+            uploader.clone(),
+            &library_config(live_exporter(dir.path())),
+            "LIVE",
+        )
+        .await;
+
+        assert_eq!(done.status, "completed");
+        assert_eq!(
+            *uploader.uploads.lock().unwrap(),
+            vec![("IMG_0001.HEIC".to_string(), "photos-LIVE-photo".to_string())]
+        );
+        assert_eq!(
+            *uploader.live_links.lock().unwrap(),
+            vec![("IMG_0001.HEIC".to_string(), "imm-video".to_string())]
+        );
+    }
 
     #[tokio::test]
     async fn a_photo_in_two_albums_lands_in_both_mirrors_created_once() {
@@ -2309,6 +2623,7 @@ mod tests {
             outcome: || None,
             exported: Mutex::new(Vec::new()),
             albums: || vec![album("C1", "Hawaii")],
+            paired: false,
         });
         // Same bytes as the export, already uploaded from a watched folder.
         let store = Arc::new(MockStore::default());
@@ -2401,6 +2716,7 @@ mod tests {
             outcome: || None,
             exported: Mutex::new(Vec::new()),
             albums: Vec::new,
+            paired: false,
         });
         let store = Arc::new(MockStore::default());
         let uploader = Arc::new(RecordingUploader::default());
@@ -2445,6 +2761,7 @@ mod tests {
             outcome: || None,
             exported: Mutex::new(Vec::new()),
             albums: Vec::new,
+            paired: false,
         });
         let store = Arc::new(MockStore::default());
         // Same bytes the fake exporter writes, already uploaded from a folder.
@@ -2475,6 +2792,7 @@ mod tests {
             outcome: || None,
             exported: Mutex::new(Vec::new()),
             albums: Vec::new,
+            paired: false,
         });
         let store = Arc::new(MockStore::default());
         let mut config = library_config(exporter.clone());
@@ -2505,6 +2823,7 @@ mod tests {
             outcome: || Some(LibraryExportError::CloudOnly),
             exported: Mutex::new(Vec::new()),
             albums: Vec::new,
+            paired: false,
         });
         let store = Arc::new(MockStore::default());
         let uploader = Arc::new(RecordingUploader::default());
