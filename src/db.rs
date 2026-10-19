@@ -500,6 +500,33 @@ impl Database {
         Ok(result)
     }
 
+    /// Rewrite each folder row to its canonical path (`watch::paths`), for
+    /// rows stored before #99. Rows that don't resolve (folder missing, a
+    /// drive not mounted) are left as they are, and so is a row whose
+    /// canonical path another row already holds. Returns how many changed.
+    pub fn canonicalize_folder_paths(&self) -> usize {
+        let Ok(folders) = self.get_folders() else {
+            return 0;
+        };
+        let mut changed = 0;
+        for f in &folders {
+            let Ok(canon) = crate::watch::paths::normalize_folder(&f.path) else {
+                continue;
+            };
+            if canon == f.path || folders.iter().any(|o| o.id != f.id && o.path == canon) {
+                continue;
+            }
+            let res = self.conn.execute(
+                "UPDATE watched_folders SET path = ?1, updated_at = ?2 WHERE id = ?3",
+                params![canon, Utc::now().to_rfc3339(), f.id],
+            );
+            if res.is_ok() {
+                changed += 1;
+            }
+        }
+        changed
+    }
+
     /// Update mutable fields of a watched folder.
     #[allow(clippy::too_many_arguments)]
     pub fn update_folder(
@@ -1027,6 +1054,40 @@ mod tests {
         let mut db = Database { conn };
         db.run_migrations().expect("migrations");
         db
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_folder_paths_migrates_resolvable_rows_only() {
+        let real = tempfile::tempdir().unwrap();
+        let canon = std::fs::canonicalize(real.path()).unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("via-link");
+        std::os::unix::fs::symlink(&canon, &link).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let other_canon = std::fs::canonicalize(other.path()).unwrap();
+        let link2 = links.path().join("dup-link");
+        std::os::unix::fs::symlink(&other_canon, &link2).unwrap();
+
+        let db = open_test_db();
+        let a = db.add_folder(&link.to_string_lossy(), None, false).unwrap();
+        let b = db.add_folder("/definitely/not/here", None, false).unwrap();
+        // c's canonical path is already held by d: c must be left alone.
+        let c = db
+            .add_folder(&link2.to_string_lossy(), None, false)
+            .unwrap();
+        let d = db
+            .add_folder(&other_canon.to_string_lossy(), None, false)
+            .unwrap();
+
+        assert_eq!(db.canonicalize_folder_paths(), 1);
+        let path = |id| db.get_folder(id).unwrap().unwrap().path;
+        assert_eq!(path(a), canon.to_string_lossy());
+        assert_eq!(path(b), "/definitely/not/here");
+        assert_eq!(path(c), link2.to_string_lossy());
+        assert_eq!(path(d), other_canon.to_string_lossy());
+        // Idempotent.
+        assert_eq!(db.canonicalize_folder_paths(), 0);
     }
 
     // ── watched_folders ──────────────────────────────────────────────────────

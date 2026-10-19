@@ -267,6 +267,24 @@ impl WizardApp {
             ui.add_space(32.0);
 
             if ui.button("Start ImmichSync").clicked() {
+                // Check the folder before anything is saved, so a typo
+                // (or a literal `~/Pictures`) is caught here rather than
+                // stored and silently never watched (#99).
+                if !self.watch_folder.trim().is_empty() {
+                    match crate::watch::paths::normalize_folder(&self.watch_folder) {
+                        Ok(canonical) => self.watch_folder = canonical,
+                        Err(e) => {
+                            rfd::MessageDialog::new()
+                                .set_level(rfd::MessageLevel::Error)
+                                .set_title("ImmichSync")
+                                .set_description(format!("Watch folder: {e}"))
+                                .set_buttons(rfd::MessageButtons::Ok)
+                                .show();
+                            return;
+                        }
+                    }
+                }
+
                 // Apply autostart preference.
                 self.config.ui.start_with_windows = self.enable_autostart;
 

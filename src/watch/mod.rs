@@ -3,6 +3,7 @@
 pub mod filter;
 pub mod folder;
 pub mod network;
+pub mod paths;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
