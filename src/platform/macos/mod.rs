@@ -14,3 +14,4 @@ pub mod notify;
 pub mod packages;
 pub mod shutdown;
 pub mod single_instance;
+pub mod trash;

@@ -645,13 +645,30 @@ fn sha1_of_string(s: &str) -> String {
 /// The hidden directory name used for post-upload trash.
 pub const TRASH_DIR_NAME: &str = ".immichsync-trash";
 
+/// Post-upload "Move to Trash".
+///
+/// macOS: the Finder Trash (`platform::trash`), so the user can put files
+/// back from Finder (#95). Elsewhere: `.immichsync-trash/` under the
+/// watched folder, purged after `trash_retention_days`.
+pub fn trash_file(file_path: &std::path::Path, folder_root: &str) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = folder_root;
+        crate::platform::trash::move_to_trash(file_path)?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    trash_into_folder(file_path, folder_root)
+}
+
 /// Move a file into `.immichsync-trash/` under the watched folder root,
 /// preserving relative subfolder structure.
 ///
 /// E.g. if `folder_root` is `C:\Photos` and `file_path` is
 /// `C:\Photos\Vacation\img.jpg`, the file moves to
 /// `C:\Photos\.immichsync-trash\Vacation\img.jpg`.
-pub fn trash_file(file_path: &std::path::Path, folder_root: &str) -> anyhow::Result<()> {
+#[cfg(not(target_os = "macos"))]
+fn trash_into_folder(file_path: &std::path::Path, folder_root: &str) -> anyhow::Result<()> {
     let root = std::path::Path::new(folder_root);
     let trash_root = root.join(TRASH_DIR_NAME);
 
@@ -695,6 +712,28 @@ pub fn trash_file(file_path: &std::path::Path, folder_root: &str) -> anyhow::Res
     }
 
     Ok(())
+}
+
+/// True when the file at `path` is still the one that was uploaded: same size
+/// and mtime as recorded, or (for rows without an mtime, or when only the
+/// mtime moved) the same SHA-1. Guards trash/delete of already-uploaded
+/// files, so a file edited or replaced since its upload (a camera reusing
+/// `IMG_0001.JPG`, an edit saved over an export) is never removed (#95).
+pub fn still_matches_upload(
+    path: &std::path::Path,
+    rec: &crate::db::UploadedRecord,
+) -> std::io::Result<bool> {
+    let meta = std::fs::metadata(path)?;
+    if meta.len() as i64 != rec.file_size {
+        return Ok(false);
+    }
+    if rec.file_mtime != 0 && crate::upload::queue::mtime_secs(&meta) == rec.file_mtime {
+        return Ok(true);
+    }
+    match crate::upload::hasher::hash_file(path) {
+        Ok(h) => Ok(h.eq_ignore_ascii_case(&rec.file_hash)),
+        Err(e) => Err(std::io::Error::other(e.to_string())),
+    }
 }
 
 /// Delete files in `.immichsync-trash/` directories that are older than
@@ -775,6 +814,50 @@ fn walk_and_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── still_matches_upload (#95) ───────────────────────────────────────────
+
+    fn rec_for(path: &std::path::Path) -> crate::db::UploadedRecord {
+        let meta = std::fs::metadata(path).unwrap();
+        crate::db::UploadedRecord {
+            file_path: path.to_string_lossy().into_owned(),
+            file_hash: crate::upload::hasher::hash_file(path).unwrap(),
+            file_size: meta.len() as i64,
+            file_mtime: crate::upload::queue::mtime_secs(&meta),
+        }
+    }
+
+    #[test]
+    fn unchanged_file_still_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("IMG_0001.JPG");
+        std::fs::write(&p, vec![7u8; 4096]).unwrap();
+        let rec = rec_for(&p);
+        assert!(still_matches_upload(&p, &rec).unwrap());
+    }
+
+    #[test]
+    fn replaced_file_with_new_size_does_not_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("IMG_0001.JPG");
+        std::fs::write(&p, vec![7u8; 4096]).unwrap();
+        let rec = rec_for(&p);
+        std::fs::write(&p, vec![9u8; 5000]).unwrap(); // camera reused the name
+        assert!(!still_matches_upload(&p, &rec).unwrap());
+    }
+
+    #[test]
+    fn same_size_different_bytes_falls_back_to_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("edit.jpg");
+        std::fs::write(&p, vec![1u8; 4096]).unwrap();
+        let mut rec = rec_for(&p);
+        std::fs::write(&p, vec![2u8; 4096]).unwrap();
+        rec.file_mtime = 0; // legacy row: no mtime, so the hash decides
+        assert!(!still_matches_upload(&p, &rec).unwrap());
+        rec.file_mtime = 1; // mtime differs: also falls through to the hash
+        assert!(!still_matches_upload(&p, &rec).unwrap());
+    }
     use std::collections::HashMap;
     use std::sync::Mutex;
 
