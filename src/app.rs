@@ -477,7 +477,11 @@ impl App {
                 spawn_window_subprocess("settings", flag, Some(tx));
             }
             TrayAction::UploadNow => {
-                info!("Upload Now requested");
+                // Re-run the scan of every watched folder (the same restart
+                // the folder reconcile does), so anything the watcher missed
+                // is queued now (#100).
+                info!("Upload Now requested: rescanning watched folders");
+                self.restart_watch_engine();
             }
             TrayAction::About => {
                 if self.window_open.about.swap(true, Ordering::SeqCst) {
@@ -770,12 +774,18 @@ impl App {
             "Folder reconcile: drift detected, restarting watch engine to converge"
         );
 
+        self.restart_watch_engine();
+    }
+
+    /// Stop every watcher and start the engine again, which re-runs the
+    /// initial scan. Used by the folder reconcile and by Upload Now.
+    fn restart_watch_engine(&mut self) {
         if let Some(ref mut engine) = self.watch_engine {
             engine.stop_all();
         }
         self.watch_engine = None;
         if let Err(e) = self.start_watch_engine() {
-            warn!(error = %e, "Folder reconcile: restart_watch_engine failed");
+            warn!(error = %e, "restart_watch_engine failed");
         }
     }
 
