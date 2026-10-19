@@ -96,6 +96,9 @@ pub struct App {
 #[derive(Clone)]
 pub struct WindowOpenTracker {
     pub settings: Arc<AtomicBool>,
+    /// PID of the open Settings subprocess (0 when none), so a second
+    /// Settings click can bring it to the front (#102).
+    pub settings_pid: Arc<std::sync::atomic::AtomicU32>,
     pub about: Arc<AtomicBool>,
     pub upload_log: Arc<AtomicBool>,
     pub trash_log: Arc<AtomicBool>,
@@ -106,6 +109,7 @@ impl WindowOpenTracker {
     fn new() -> Self {
         Self {
             settings: Arc::new(AtomicBool::new(false)),
+            settings_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             about: Arc::new(AtomicBool::new(false)),
             upload_log: Arc::new(AtomicBool::new(false)),
             trash_log: Arc::new(AtomicBool::new(false)),
@@ -216,6 +220,12 @@ impl App {
         // Photos library: queue the newest assets if it's on and access was
         // already granted. Never prompts; the prompt belongs to Settings.
         self.start_photos_source();
+
+        // An update applied with its restart deferred (Later at startup, or
+        // a quit before restarting): offer the restart, don't re-download.
+        if let Some(version) = updater::pending_restart_version() {
+            self.mark_update_ready(Some(&version));
+        }
 
         // Schedule the first automatic update check after a startup delay.
         if crate::platform::SELF_UPDATE_SUPPORTED && self.config.advanced.check_for_updates {
@@ -567,13 +577,23 @@ impl App {
             }
             TrayAction::OpenSettings => {
                 if self.window_open.settings.swap(true, Ordering::SeqCst) {
-                    info!("Settings window already open, ignoring");
+                    let pid = self.window_open.settings_pid.load(Ordering::SeqCst);
+                    info!(
+                        pid,
+                        "Settings window already open; bringing it to the front"
+                    );
+                    crate::platform::focus_window(pid, crate::ui::settings::WINDOW_TITLE);
                     return;
                 }
                 let (tx, rx) = std::sync::mpsc::channel();
                 self.settings_rx = Some(rx);
                 let flag = self.window_open.settings.clone();
-                spawn_window_subprocess("settings", flag, Some(tx));
+                spawn_window_subprocess(
+                    "settings",
+                    flag,
+                    Some(self.window_open.settings_pid.clone()),
+                    Some(tx),
+                );
             }
             TrayAction::UploadNow => {
                 // Re-run the scan of every watched folder (the same restart
@@ -588,7 +608,7 @@ impl App {
                     return;
                 }
                 let flag = self.window_open.about.clone();
-                spawn_window_subprocess("about", flag, None);
+                spawn_window_subprocess("about", flag, None, None);
             }
             TrayAction::ViewLog => {
                 if self.window_open.upload_log.swap(true, Ordering::SeqCst) {
@@ -596,7 +616,7 @@ impl App {
                     return;
                 }
                 let flag = self.window_open.upload_log.clone();
-                spawn_window_subprocess("log", flag, None);
+                spawn_window_subprocess("log", flag, None, None);
             }
             TrayAction::ViewTrash => {
                 if self.window_open.trash_log.swap(true, Ordering::SeqCst) {
@@ -604,7 +624,7 @@ impl App {
                     return;
                 }
                 let flag = self.window_open.trash_log.clone();
-                spawn_window_subprocess("trash-log", flag, None);
+                spawn_window_subprocess("trash-log", flag, None, None);
             }
             TrayAction::RetryKeychain => {
                 // Re-read config.toml on a worker thread: the Keychain read
@@ -659,6 +679,20 @@ impl App {
                     self.shutdown();
                     updater::relaunch_self();
                 }
+            }
+            TrayAction::UpdateAppliedRestart => {
+                info!("Update applied from the dialog; restarting gracefully");
+                self.update_ready = true;
+                self.shutdown();
+                updater::relaunch_self();
+            }
+            TrayAction::UpdateAppliedLater => {
+                let version = self
+                    .pending_update
+                    .as_ref()
+                    .map(|i| i.new_version.clone())
+                    .or_else(updater::pending_restart_version);
+                self.mark_update_ready(version.as_deref());
             }
             TrayAction::Quit => {
                 // Handled in run() directly.
@@ -1197,6 +1231,7 @@ impl App {
             Ok(version) => {
                 info!(version = %version, "Background update downloaded and applied");
                 self.update_ready = true;
+                updater::note_update_applied();
 
                 // Update tray menu to show "Restart to Update".
                 if let Some(ref mut tray) = self.tray {
@@ -1260,6 +1295,9 @@ impl App {
 
         let flag = self.window_open.update.clone();
         let info_path_str = info_path.display().to_string();
+        // The relaunch happens on the main loop, after shutdown(), never on
+        // this thread (#127).
+        let actions = self.tray.as_ref().map(|t| t.action_sender());
 
         std::thread::spawn(move || {
             let exe = match crate::platform::install::installed_exe_path() {
@@ -1281,10 +1319,9 @@ impl App {
             {
                 Ok(status) => {
                     info!(?status, "Update dialog subprocess exited");
-                    if status.code() == Some(0) {
-                        // Update was applied — relaunch.
-                        info!("Update applied, relaunching");
-                        updater::relaunch_self();
+                    let action = action_for_update_dialog_exit(status.code());
+                    if let (Some(action), Some(tx)) = (action, actions.as_ref()) {
+                        let _ = tx.send(action);
                     }
                 }
                 Err(e) => {
@@ -1293,6 +1330,19 @@ impl App {
             }
             flag.store(false, Ordering::SeqCst);
         });
+    }
+
+    /// An update is on disk and waits for a restart: show Restart to Update.
+    fn mark_update_ready(&mut self, version: Option<&str>) {
+        info!(?version, "Update applied; restart deferred");
+        self.update_ready = true;
+        // Windows (Settings, logs) keep running the previous image until the
+        // restart; the dialog applied this update in another process, so
+        // this process's flag isn't set yet (#128).
+        updater::note_update_applied();
+        if let Some(ref mut tray) = self.tray {
+            tray.set_restart_to_update(Some(version.unwrap_or("new version")));
+        }
     }
 
     /// Stop all background work, waiting briefly for the upload worker to
@@ -1505,6 +1555,7 @@ async fn initial_scan(
 fn spawn_window_subprocess(
     window_type: &'static str,
     open_flag: Arc<AtomicBool>,
+    pid_slot: Option<Arc<std::sync::atomic::AtomicU32>>,
     config_tx: Option<std::sync::mpsc::Sender<crate::config::Config>>,
 ) {
     // Prefer the installed exe path so subprocesses always run from the
@@ -1520,13 +1571,25 @@ fn spawn_window_subprocess(
             }
         },
     };
+    // After an update is applied, windows run the previous image until the
+    // restart, so they match the running tray (#128).
+    let exe = updater::window_exe(exe);
 
     std::thread::spawn(move || {
         info!(window_type, "Spawning window subprocess");
-        match std::process::Command::new(&exe)
+        let status = std::process::Command::new(&exe)
             .args(["--window", window_type])
-            .status()
-        {
+            .spawn()
+            .and_then(|mut child| {
+                if let Some(ref slot) = pid_slot {
+                    slot.store(child.id(), Ordering::SeqCst);
+                }
+                child.wait()
+            });
+        if let Some(ref slot) = pid_slot {
+            slot.store(0, Ordering::SeqCst);
+        }
+        match status {
             Ok(status) => {
                 info!(window_type, ?status, "Window subprocess exited");
                 // For settings, reload config from disk after the subprocess exits.
@@ -1564,6 +1627,17 @@ fn update_check_skip_reason(
         Some("an update check or download is in progress")
     } else {
         None
+    }
+}
+
+/// What the main loop should do after the update dialog exits. Only
+/// Restart Now restarts; Later and a window close after applying offer
+/// Restart to Update; anything else changed nothing (#127).
+fn action_for_update_dialog_exit(code: Option<i32>) -> Option<TrayAction> {
+    match code {
+        Some(crate::ui::update::EXIT_RESTART_NOW) => Some(TrayAction::UpdateAppliedRestart),
+        Some(crate::ui::update::EXIT_APPLIED_LATER) => Some(TrayAction::UpdateAppliedLater),
+        _ => None,
     }
 }
 
@@ -1703,6 +1777,20 @@ mod tests {
         assert!(update_check_skip_reason(true, true, false).is_some());
         assert!(update_check_skip_reason(true, false, true).is_some());
         assert!(update_check_skip_reason(false, false, false).is_some());
+    }
+
+    #[test]
+    fn only_restart_now_restarts_after_the_update_dialog() {
+        assert!(matches!(
+            action_for_update_dialog_exit(Some(0)),
+            Some(TrayAction::UpdateAppliedRestart)
+        ));
+        assert!(matches!(
+            action_for_update_dialog_exit(Some(2)),
+            Some(TrayAction::UpdateAppliedLater)
+        ));
+        assert!(action_for_update_dialog_exit(Some(1)).is_none());
+        assert!(action_for_update_dialog_exit(None).is_none());
     }
 
     #[test]

@@ -61,6 +61,11 @@ pub enum TrayAction {
     RestartToUpdate,
     /// Re-read the stored API key after a denied Keychain prompt (#114).
     RetryKeychain,
+    /// Synthetic, from the update-dialog watcher: an update was applied and
+    /// the user chose Restart Now. Restarts through the graceful path (#127).
+    UpdateAppliedRestart,
+    /// Synthetic: an update was applied and the restart deferred (Later).
+    UpdateAppliedLater,
     Quit,
 }
 
@@ -319,9 +324,7 @@ pub struct TrayApp {
 
     /// Sender half of the action channel. Cloned into the menu-event handler
     /// at construction. Held so `action_sender()` can hand out additional
-    /// senders to threads that want to inject synthetic actions; no caller
-    /// uses that hook yet, hence the dead-code allow on both.
-    #[allow(dead_code)]
+    /// senders to threads that inject synthetic actions (the update dialog).
     action_tx: mpsc::Sender<TrayAction>,
 }
 
@@ -631,9 +634,7 @@ impl TrayApp {
     }
 
     /// Return a clone of the action sender, useful for injecting actions
-    /// programmatically (e.g. from a device event thread). Reserved for
-    /// future callers; nothing uses it today.
-    #[allow(dead_code)]
+    /// programmatically, e.g. the update-dialog watcher thread.
     pub fn action_sender(&self) -> mpsc::Sender<TrayAction> {
         self.action_tx.clone()
     }
