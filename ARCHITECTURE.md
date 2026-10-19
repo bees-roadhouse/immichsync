@@ -24,13 +24,14 @@
 
 | Component | Crate/Tech | Purpose |
 |-----------|-----------|---------|
-| Watch Engine | `notify` (ReadDirectoryChangesW) | Filesystem event watching |
+| Watch Engine | `notify` (ReadDirectoryChangesW on Windows, FSEvents on macOS) | Filesystem event watching |
 | Network Fallback | `notify::PollWatcher` | Polling for NFS/paths where RDCW fails |
-| Device Monitor | `windows` crate (WM_DEVICECHANGE) | USB/SD card insertion/removal |
+| Device Monitor | `windows` crate (WM_DEVICECHANGE) / `objc2-disk-arbitration` (macOS), behind `platform::volumes` | USB/SD card insertion/removal |
+| Photos Library (macOS) | `objc2-photos` (PhotoKit), read-only | Opt-in Apple Photos library source ([ADR 0002](docs/adr/0002-photokit-library-source.md)) |
 | Upload Queue | `tokio` + custom async pipeline | Concurrent upload with retry |
 | API Client | `reqwest` | Multipart upload to Immich REST API |
 | State DB | `rusqlite` (bundled) | Track uploads, queue, watch folders |
-| System Tray | `tray-icon` + `winit` | Background tray app |
+| System Tray | `tray-icon` + `winit` | Windows tray / macOS menu-bar app |
 | Settings UI | `egui` + `eframe` | Configuration window |
 | Config | `serde` + `toml` | Persistent settings file |
 | Logging | `tracing` + `tracing-subscriber` | Structured logging with rotation |
