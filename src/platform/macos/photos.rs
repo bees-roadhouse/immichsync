@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context as _};
 use block2::RcBlock;
 use chrono::{DateTime, TimeZone, Utc};
-use objc2::rc::Retained;
+use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{AllocAnyThread, ClassType, DefinedClass, Message};
 use objc2_foundation::{
@@ -172,21 +172,21 @@ fn nsset_strings(set: &NSSet<NSString>) -> Vec<String> {
     set.iter().map(|s| s.to_string()).collect()
 }
 
-impl crate::watch::photos::PhotosLibrary for PhotoKitLibrary {
-    fn current_token(&self) -> anyhow::Result<Vec<u8>> {
+impl PhotoKitLibrary {
+    fn current_token_impl(&self) -> anyhow::Result<Vec<u8>> {
         require_access()?;
         let token = unsafe { PHPhotoLibrary::sharedPhotoLibrary().currentChangeToken() };
         archive(&token)
     }
 
-    fn all_asset_ids(&self, newest_first: bool) -> anyhow::Result<Vec<String>> {
+    fn all_asset_ids_impl(&self, newest_first: bool) -> anyhow::Result<Vec<String>> {
         require_access()?;
         let result =
             unsafe { PHAsset::fetchAssetsWithOptions(Some(&sync_fetch_options(newest_first))) };
         Ok(syncable_ids(&result))
     }
 
-    fn changes_since(
+    fn changes_since_impl(
         &self,
         token: &[u8],
     ) -> Result<crate::watch::photos::LibraryChanges, crate::watch::photos::ChangesError> {
@@ -263,6 +263,26 @@ impl crate::watch::photos::PhotosLibrary for PhotoKitLibrary {
             deleted,
             token,
         })
+    }
+}
+
+// Each entry point drains its own autorelease pool: these run on the
+// long-lived Photos source thread and on blocking export threads, neither of
+// which has one, and a full pass over a big library autoreleases a lot.
+impl crate::watch::photos::PhotosLibrary for PhotoKitLibrary {
+    fn current_token(&self) -> anyhow::Result<Vec<u8>> {
+        autoreleasepool(|_| self.current_token_impl())
+    }
+
+    fn all_asset_ids(&self, newest_first: bool) -> anyhow::Result<Vec<String>> {
+        autoreleasepool(|_| self.all_asset_ids_impl(newest_first))
+    }
+
+    fn changes_since(
+        &self,
+        token: &[u8],
+    ) -> Result<crate::watch::photos::LibraryChanges, crate::watch::photos::ChangesError> {
+        autoreleasepool(|_| self.changes_since_impl(token))
     }
 }
 
@@ -524,6 +544,16 @@ pub struct PhotoKitExporter;
 
 impl LibraryExporter for PhotoKitExporter {
     fn export_original(
+        &self,
+        local_id: &str,
+        allow_network: bool,
+    ) -> Result<LibraryExport, LibraryExportError> {
+        autoreleasepool(|_| self.export_original_impl(local_id, allow_network))
+    }
+}
+
+impl PhotoKitExporter {
+    fn export_original_impl(
         &self,
         local_id: &str,
         allow_network: bool,
