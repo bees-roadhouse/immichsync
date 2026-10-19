@@ -735,12 +735,16 @@ async fn process_library_item(
                 .await;
         }
     };
-    let _cleanup = TempExport(export.path.clone());
+    // Deletes the export however this ends. Dropped explicitly before any
+    // retry backoff, so a private original never waits in temp; the retry
+    // exports again.
+    let cleanup = TempExport(export.path.clone());
     let label = format!("photos:{local_id}/{}", export.resource);
 
     let hash = match crate::upload::hasher::hash_file(&export.path) {
         Ok(h) => h,
         Err(e) => {
+            drop(cleanup);
             return fail_or_retry(&entry, store.as_ref(), config, &format!("hash failed: {e}"))
                 .await;
         }
@@ -796,7 +800,10 @@ async fn process_library_item(
                 error!(id = entry.id, error = %e, "Failed to mark entry completed");
             }
         }
-        Err(e) => fail_or_retry(&entry, store.as_ref(), config, &e.to_string()).await,
+        Err(e) => {
+            drop(cleanup);
+            fail_or_retry(&entry, store.as_ref(), config, &e.to_string()).await
+        }
     }
 }
 
@@ -1469,6 +1476,37 @@ mod tests {
 
         assert_eq!(done.status, "completed");
         assert!(uploader.uploads.lock().unwrap().is_empty());
+    }
+
+    /// A failed upload backs off before retrying; the private export must
+    /// not sit in temp for that wait (the retry exports again anyway).
+    #[tokio::test]
+    async fn a_failed_photos_upload_deletes_the_export_before_backing_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let exporter = Arc::new(FakeExporter {
+            dir: dir.path().to_path_buf(),
+            outcome: || None,
+            exported: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(MockStore::default());
+        let mut config = library_config(exporter.clone());
+        // backoff_delay works in whole seconds, so the base must be >= 1 s.
+        config.base_retry_delay = Duration::from_secs(1);
+
+        store.enqueue_photos("RETRY").unwrap();
+        let entry = store.dequeue_pending(1).unwrap().pop().unwrap();
+        let task = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                process_item(entry, store, Arc::new(FailingUploader), &config).await;
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let path = exporter.exported.lock().unwrap()[0].clone();
+        assert!(!task.is_finished(), "still in the retry backoff");
+        assert!(!path.exists(), "export must be gone during the backoff");
+        task.await.unwrap();
     }
 
     #[tokio::test]

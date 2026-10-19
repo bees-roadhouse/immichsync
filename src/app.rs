@@ -194,6 +194,8 @@ impl App {
             // so entries already queued still settle if it's turned off.
             #[cfg(target_os = "macos")]
             {
+                // Before any worker can export: clear what a crash left.
+                crate::platform::photos::sweep_stale_exports();
                 let album = Some(self.config.photos.album_name.trim().to_string())
                     .filter(|a| !a.is_empty());
                 pipeline = pipeline.with_library(crate::upload::worker::LibrarySource {

@@ -334,30 +334,36 @@ impl Database {
         let current_version = self.get_schema_version()?;
         debug!(current_version, "Running schema migrations");
 
-        if current_version < 1 {
-            self.migrate_v1()?;
-            self.set_schema_version(1)?;
-            info!("Applied schema migration v1");
+        let steps: [(u32, fn(&Self) -> Result<(), DbError>); 4] = [
+            (1, Self::migrate_v1),
+            (2, Self::migrate_v2),
+            (3, Self::migrate_v3),
+            (4, Self::migrate_v4),
+        ];
+        for (version, migrate) in steps {
+            if current_version < version {
+                self.apply_migration(version, migrate)?;
+            }
         }
 
-        if current_version < 2 {
-            self.migrate_v2()?;
-            self.set_schema_version(2)?;
-            info!("Applied schema migration v2");
-        }
+        Ok(())
+    }
 
-        if current_version < 3 {
-            self.migrate_v3()?;
-            self.set_schema_version(3)?;
-            info!("Applied schema migration v3");
-        }
-
-        if current_version < 4 {
-            self.migrate_v4()?;
-            self.set_schema_version(4)?;
-            info!("Applied schema migration v4");
-        }
-
+    /// Run one migration and record its version in a single transaction.
+    /// SQLite DDL is transactional, so a step that dies part-way (disk full,
+    /// the app killed during start) leaves the previous version intact and
+    /// is simply run again next start, instead of leaving a half-applied
+    /// schema that fails forever on "duplicate column".
+    fn apply_migration(
+        &self,
+        version: u32,
+        migrate: fn(&Self) -> Result<(), DbError>,
+    ) -> Result<(), DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        migrate(self)?;
+        self.set_schema_version(version)?;
+        tx.commit()?;
+        info!(version, "Applied schema migration");
         Ok(())
     }
 
@@ -1475,10 +1481,10 @@ mod tests {
         assert_eq!(entries[1].file_path, "photos:ABC-123/L0/001");
     }
 
-    #[test]
-    fn v3_database_with_queued_rows_upgrades_to_v4_as_folder_entries() {
+    /// Build a v3 database the way an existing install has one.
+    fn v3_db() -> Database {
         let conn = Connection::open_in_memory().unwrap();
-        let mut db = Database { conn };
+        let db = Database { conn };
         db.conn
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
@@ -1488,6 +1494,57 @@ mod tests {
         db.migrate_v2().unwrap();
         db.migrate_v3().unwrap();
         db.set_schema_version(3).unwrap();
+        db
+    }
+
+    fn has_column(db: &Database, table: &str, column: &str) -> bool {
+        let mut stmt = db
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        names.iter().any(|n| n == column)
+    }
+
+    /// An upgrade that dies part-way through v4 must leave the DB exactly at
+    /// v3, so the next start can run v4 again. Simulated by making v4's
+    /// second ALTER fail after its first has run: without a transaction the
+    /// first column would stay, and every later start would die on
+    /// "duplicate column name: source" (Pia's review on #111).
+    #[test]
+    fn a_failed_v4_upgrade_rolls_back_and_the_next_start_succeeds() {
+        let mut db = v3_db();
+        db.conn
+            .execute_batch("ALTER TABLE upload_queue ADD COLUMN photos_local_id TEXT;")
+            .unwrap();
+
+        assert!(
+            db.run_migrations().is_err(),
+            "v4 must fail on the planted column"
+        );
+        assert_eq!(db.get_schema_version().unwrap(), 3);
+        assert!(
+            !has_column(&db, "upload_queue", "source"),
+            "the first ALTER must be rolled back with the rest of v4"
+        );
+
+        // The interruption clears (here: drop the planted column) and the
+        // next start upgrades normally.
+        db.conn
+            .execute_batch("ALTER TABLE upload_queue DROP COLUMN photos_local_id;")
+            .unwrap();
+        db.run_migrations().unwrap();
+        assert_eq!(db.get_schema_version().unwrap(), 4);
+        assert!(has_column(&db, "upload_queue", "source"));
+    }
+
+    #[test]
+    fn v3_database_with_queued_rows_upgrades_to_v4_as_folder_entries() {
+        let mut db = v3_db();
         db.conn
             .execute(
                 "INSERT INTO upload_queue (file_path, status, retry_count, queued_at)

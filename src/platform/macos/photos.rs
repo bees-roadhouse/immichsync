@@ -181,6 +181,44 @@ fn safe_file_name(original: &str) -> String {
     }
 }
 
+/// Where exports are written: `$TMPDIR/immichsync-photos/<uuid>/<name>`.
+/// Nothing else writes here.
+pub fn export_root() -> PathBuf {
+    std::env::temp_dir().join("immichsync-photos")
+}
+
+/// Delete exports a crash or force-quit left behind (between export and the
+/// entry settling). They are private originals, so they don't wait for the
+/// OS to clean `$TMPDIR`. Call at startup, before the pipeline runs.
+pub fn sweep_stale_exports() {
+    let removed = sweep(&export_root());
+    if removed > 0 {
+        info!(
+            removed,
+            "Removed leftover Photos exports from a previous run"
+        );
+    }
+}
+
+/// Remove leftovers under `root`; returns how many entries were removed.
+fn sweep(root: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            let p = e.path();
+            let gone = if p.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else {
+                std::fs::remove_file(&p)
+            };
+            gone.is_ok()
+        })
+        .count()
+}
+
 /// Exports originals with `PHAssetResourceManager`, local copies only.
 pub struct PhotoKitExporter;
 
@@ -203,9 +241,7 @@ impl LibraryExporter for PhotoKitExporter {
         })?;
 
         let name = safe_file_name(&unsafe { resource.originalFilename() }.to_string());
-        let dir: PathBuf = std::env::temp_dir()
-            .join("immichsync-photos")
-            .join(uuid::Uuid::new_v4().to_string());
+        let dir: PathBuf = export_root().join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create {}", dir.display()))
             .map_err(LibraryExportError::Other)?;
@@ -257,6 +293,8 @@ impl LibraryExporter for PhotoKitExporter {
                 )))
             }
             Err(_) => {
+                // PhotoKit's write may still be in flight; removing the
+                // directory makes it fail harmlessly rather than land.
                 cleanup(&dir);
                 Err(LibraryExportError::Other(anyhow!(
                     "export timed out after {}s",
@@ -270,6 +308,20 @@ impl LibraryExporter for PhotoKitExporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sweep_removes_leftover_exports_and_tolerates_no_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("immichsync-photos");
+        assert_eq!(sweep(&root), 0, "a missing root is fine");
+
+        for id in ["a", "b"] {
+            std::fs::create_dir_all(root.join(id)).unwrap();
+            std::fs::write(root.join(id).join("IMG.HEIC"), b"private").unwrap();
+        }
+        assert_eq!(sweep(&root), 2);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
 
     #[test]
     fn safe_file_name_keeps_only_the_last_component() {
