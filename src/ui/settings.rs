@@ -503,13 +503,9 @@ impl SettingsApp {
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
-                ui.label("Poll Interval (secs):");
-                let mut poll_i32 = self.poll_interval as i32;
-                ui.add(egui::DragValue::new(&mut poll_i32).range(5..=300));
-                self.poll_interval = poll_i32.max(5) as u64;
-                ui.end_row();
-
-                ui.label("Log Level:");
+                ui.label("Log Level:").on_hover_text(
+                    "Applies the next time ImmichSync starts. RUST_LOG overrides it.",
+                );
                 egui::ComboBox::from_id_salt("log_level")
                     .selected_text(&self.log_level)
                     .show_ui(ui, |ui| {
@@ -518,12 +514,6 @@ impl SettingsApp {
                         }
                     });
                 ui.end_row();
-
-                ui.label("Write Settle (ms):");
-                let mut settle_i32 = self.write_settle_ms as i32;
-                ui.add(egui::DragValue::new(&mut settle_i32).range(500..=10_000));
-                self.write_settle_ms = settle_i32.max(500) as u64;
-                ui.end_row();
             });
 
         ui.add_space(12.0);
@@ -531,7 +521,6 @@ impl SettingsApp {
         ui.add_space(8.0);
 
         ui.checkbox(&mut self.autostart, crate::platform::AUTOSTART_LABEL);
-        ui.checkbox(&mut self.minimize_to_tray, "Minimize to system tray");
         ui.checkbox(&mut self.show_notifications, "Show notifications");
         ui.checkbox(
             &mut self.check_for_updates,
