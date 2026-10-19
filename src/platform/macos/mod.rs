@@ -14,6 +14,7 @@ pub mod known_folders;
 pub mod notify;
 pub mod packages;
 pub mod photos;
+mod photos_delete;
 pub mod shutdown;
 pub mod single_instance;
 pub mod trash;

@@ -274,6 +274,42 @@ impl ImmichClient {
 // AssetUploader trait implementation
 // ---------------------------------------------------------------------------
 
+/// One asset's state, for delete-from-Photos verification (#116).
+#[async_trait::async_trait]
+impl crate::watch::photos::delete::ServerAssets for ImmichClient {
+    async fn asset(
+        &self,
+        immich_asset_id: &str,
+    ) -> anyhow::Result<Option<crate::watch::photos::delete::ServerAsset>> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct AssetDto {
+            checksum: String,
+            #[serde(default)]
+            is_trashed: bool,
+        }
+        let response = self
+            .client
+            .get(self.url(&format!("/api/assets/{immich_asset_id}")))
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        // Immich answers 400 "Not found or no asset.read access" for an asset
+        // that isn't there, 404 on some versions.
+        if status == 404 || status == 400 {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(Self::map_status_error(response).await.into());
+        }
+        let dto: AssetDto = response.json().await?;
+        Ok(Some(crate::watch::photos::delete::ServerAsset {
+            checksum_b64: dto.checksum,
+            trashed: dto.is_trashed,
+        }))
+    }
+}
+
 /// The text fields of an asset upload, in order.
 fn upload_fields(
     device_asset_id: &str,

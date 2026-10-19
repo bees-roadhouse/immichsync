@@ -268,7 +268,7 @@ const DEFERRED_PHOTOS: &str =
     "source = 'photos' AND status = 'failed' AND error_message LIKE 'deferred:%'";
 
 /// The schema version a fully migrated database is at.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// An Immich album ImmichSync created to mirror a Photos album (#115).
 /// Only albums recorded here are ever renamed or added to by the mirror;
@@ -278,6 +278,17 @@ pub struct MirroredAlbum {
     pub immich_album_id: String,
     /// The name last given to it, to notice a rename in Photos.
     pub name: String,
+}
+
+/// One row of the delete-from-Photos log (#116).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhotosDeletion {
+    pub local_id: String,
+    /// Comma-separated Immich ids of the asset's verified resources.
+    pub immich_asset_ids: String,
+    /// `deleted`, `declined`, or `failed: …`.
+    pub outcome: String,
+    pub at: String,
 }
 
 /// One schema migration step (see [`Database::run_migrations`]).
@@ -362,6 +373,7 @@ impl Database {
             (3, Self::migrate_v3),
             (4, Self::migrate_v4),
             (5, Self::migrate_v5),
+            (6, Self::migrate_v6),
         ];
         for (version, migrate) in steps {
             if current_version < version {
@@ -531,6 +543,27 @@ impl Database {
             )
             .map_err(|e| DbError::Migration {
                 version: 5,
+                source: e,
+            })
+    }
+
+    /// Delete-from-Photos log (#116): every attempt, kept for the Trash Log
+    /// window and so a deleted asset is never offered again.
+    fn migrate_v6(&self) -> Result<(), DbError> {
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS photos_deletions (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    local_id          TEXT NOT NULL,
+                    immich_asset_ids  TEXT NOT NULL,
+                    outcome           TEXT NOT NULL,
+                    at                TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_photos_deletions_local_id
+                    ON photos_deletions(local_id);",
+            )
+            .map_err(|e| DbError::Migration {
+                version: 6,
                 source: e,
             })
     }
@@ -776,6 +809,68 @@ impl Database {
         }
         tx.commit()?;
         Ok(queued)
+    }
+
+    // ── delete from Photos (#116) ────────────────────────────────────────────
+
+    /// Every uploaded Photos resource, `(local_id, resource)`, for assets not
+    /// already deleted from the library by ImmichSync.
+    pub fn photos_uploaded_resources(
+        &self,
+    ) -> Result<Vec<(String, crate::watch::photos::delete::Recorded)>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pa.local_id, pa.resource, COALESCE(pa.sha1, ''), COALESCE(pa.immich_asset_id, ''),
+                    COALESCE((SELECT uf.file_size FROM uploaded_files uf
+                              WHERE uf.file_hash = pa.sha1 LIMIT 1), 0)
+             FROM photos_assets pa
+             WHERE NOT EXISTS (SELECT 1 FROM photos_deletions d
+                               WHERE d.local_id = pa.local_id AND d.outcome = 'deleted')
+             ORDER BY pa.local_id, pa.resource",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                crate::watch::photos::delete::Recorded {
+                    resource: r.get(1)?,
+                    sha1: r.get(2)?,
+                    immich_asset_id: r.get(3)?,
+                    size: r.get::<_, i64>(4)?.max(0) as u64,
+                },
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::Query)
+    }
+
+    /// Log one delete attempt: `deleted`, `declined` or `failed: …`.
+    pub fn record_photos_deletion(
+        &self,
+        local_id: &str,
+        immich_asset_ids: &str,
+        outcome: &str,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO photos_deletions (local_id, immich_asset_ids, outcome, at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![local_id, immich_asset_ids, outcome, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// The newest delete-log rows first.
+    pub fn photos_deletions(&self, limit: i64) -> Result<Vec<PhotosDeletion>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT local_id, immich_asset_ids, outcome, at FROM photos_deletions
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| {
+            Ok(PhotosDeletion {
+                local_id: r.get(0)?,
+                immich_asset_ids: r.get(1)?,
+                outcome: r.get(2)?,
+                at: r.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::Query)
     }
 
     // ── mirrored_albums ──────────────────────────────────────────────────────
@@ -1275,6 +1370,24 @@ impl crate::upload::queue::QueueStore for DbStore {
                 photos_local_id: e.photos_local_id,
             })
             .collect())
+    }
+
+    fn photos_uploaded_resources(
+        &self,
+    ) -> anyhow::Result<Vec<(String, crate::watch::photos::delete::Recorded)>> {
+        let db = self.db.lock().unwrap();
+        Ok(db.photos_uploaded_resources()?)
+    }
+
+    fn record_photos_deletion(
+        &self,
+        local_id: &str,
+        immich_asset_ids: &str,
+        outcome: &str,
+    ) -> anyhow::Result<()> {
+        let db = self.db.lock().unwrap();
+        db.record_photos_deletion(local_id, immich_asset_ids, outcome)?;
+        Ok(())
     }
 
     fn requeue_deferred_photos(&self) -> anyhow::Result<usize> {

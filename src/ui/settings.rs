@@ -663,6 +663,7 @@ impl SettingsApp {
         #[cfg(target_os = "macos")]
         {
             self.config.photos.enabled = self.photos.enabled;
+            self.config.photos.delete = self.photos.delete.clone();
             self.config.photos.icloud_originals = if self.photos.download_icloud {
                 crate::config::ICloudOriginals::Download
             } else {
@@ -1092,9 +1093,81 @@ impl AlbumChoice {
     }
 }
 
+/// One line per reason, for the delete preview: "12 too recent, 3 favourites".
+#[cfg(target_os = "macos")]
+fn kept_summary(kept: &[(String, crate::watch::photos::delete::Keep)]) -> String {
+    use crate::watch::photos::delete::Keep;
+    let order = [
+        (Keep::TooRecent, "too recent", "too recent"),
+        (Keep::Favorite, "favourite", "favourites"),
+        (Keep::InAlbum, "in an album", "in albums"),
+        (Keep::Burst, "burst", "bursts"),
+        (
+            Keep::NotUserLibrary,
+            "not in your own library",
+            "not in your own library",
+        ),
+        (
+            Keep::NotFullyUploaded,
+            "not fully uploaded",
+            "not fully uploaded",
+        ),
+        (
+            Keep::ServerMissing,
+            "missing on the server",
+            "missing on the server",
+        ),
+        (
+            Keep::ServerMismatch,
+            "server copy doesn't match",
+            "server copies don't match",
+        ),
+        (
+            Keep::ServerTrashed,
+            "in Immich's trash",
+            "in Immich's trash",
+        ),
+        (
+            Keep::ServerUnreachable,
+            "server unreachable",
+            "server unreachable",
+        ),
+        (
+            Keep::NotOffered,
+            "no longer in Photos",
+            "no longer in Photos",
+        ),
+    ];
+    order
+        .iter()
+        .filter_map(|(k, one, many)| {
+            let n = kept.iter().filter(|(_, r)| r == k).count();
+            (n > 0).then(|| format!("{n} {}", if n == 1 { one } else { many }))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What the delete-from-Photos section is doing.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct DeleteState {
+    /// The last preview, for this window.
+    preview: Option<crate::watch::photos::delete::DeletePlan>,
+    preview_rx:
+        Option<std::sync::mpsc::Receiver<Result<crate::watch::photos::delete::DeletePlan, String>>>,
+    delete_rx: Option<
+        std::sync::mpsc::Receiver<Result<crate::watch::photos::delete::DeleteOutcome, String>>,
+    >,
+    status: String,
+}
+
 #[cfg(target_os = "macos")]
 struct PhotosTabState {
     enabled: bool,
+    /// `[photos.delete]`, edited in place.
+    delete: crate::config::PhotosDeleteConfig,
+    deleting: DeleteState,
     /// Download iCloud-only originals (`icloud_originals = "download"`).
     download_icloud: bool,
     /// Entries deferred as iCloud-only, read when the window opens.
@@ -1118,6 +1191,8 @@ impl PhotosTabState {
             // A config that says "on" without access shows as off until fixed.
             enabled: cfg.enabled && access.can_read(),
             download_icloud: cfg.icloud_originals == crate::config::ICloudOriginals::Download,
+            delete: cfg.delete.clone(),
+            deleting: DeleteState::default(),
             deferred: open_db()
                 .and_then(|db| db.deferred_photos_count())
                 .unwrap_or(0),
@@ -1128,6 +1203,137 @@ impl PhotosTabState {
             access,
             pending: None,
             message: String::new(),
+        }
+    }
+
+    /// Delete from Photos after a verified upload (#116, ADR 0002 Amendment 1).
+    fn show_delete(&mut self, ui: &mut egui::Ui, server_url: &str, api_key: &str) {
+        use crate::watch::photos::delete::DeleteOutcome;
+        let st = &mut self.deleting;
+        if let Some(rx) = &st.preview_rx {
+            match rx.try_recv() {
+                Ok(Ok(plan)) => {
+                    st.status.clear();
+                    st.preview = Some(plan);
+                    st.preview_rx = None;
+                }
+                Ok(Err(e)) => {
+                    st.status = format!("Preview failed: {e}");
+                    st.preview_rx = None;
+                }
+                Err(_) => ui
+                    .ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(200)),
+            }
+        }
+        if let Some(rx) = &st.delete_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    st.status = match result {
+                        Ok(DeleteOutcome::Deleted(n)) => format!(
+                            "Deleted {n} photos. They're in Photos → Recently Deleted for 30 days."
+                        ),
+                        Ok(DeleteOutcome::Declined(_)) => {
+                            "Not deleted: you declined the macOS prompt.".into()
+                        }
+                        Ok(DeleteOutcome::Nothing) => {
+                            "Nothing deleted: none of the previewed photos still qualified.".into()
+                        }
+                        Ok(DeleteOutcome::Off) => "Deletion is off.".into(),
+                        Err(e) => format!("Delete failed: {e}"),
+                    };
+                    st.preview = None;
+                    st.delete_rx = None;
+                }
+                Err(_) => ui
+                    .ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(200)),
+            }
+        }
+
+        ui.label("Delete from Photos after upload");
+        let d = &mut self.delete;
+        ui.checkbox(
+            &mut d.enabled,
+            "Delete photos from the library once they're safely in Immich",
+        );
+        if d.enabled {
+            ui.checkbox(
+                &mut d.ack_icloud,
+                "I understand: with iCloud Photos on, this also deletes them from my iPhone, iPad and every Mac",
+            );
+            ui.checkbox(
+                &mut d.ack_no_shared_library,
+                "I don't use an iCloud Shared Library (ImmichSync can't tell who added a shared photo, \
+                 and deleting one deletes it for everyone)",
+            );
+            ui.horizontal(|ui| {
+                ui.label("Only photos older than");
+                ui.add(egui::DragValue::new(&mut d.min_age_days).range(1..=3650));
+                ui.label("days");
+            });
+            ui.checkbox(&mut d.keep_favorites, "Keep favourites");
+            ui.checkbox(&mut d.keep_in_albums, "Keep photos that are in an album");
+            ui.small(
+                "Only photos Immich has with a matching checksum, checked again right before deleting. \
+                 Live Photos go as a pair; bursts are never deleted. macOS asks you to confirm each \
+                 batch, and deleted photos stay in Recently Deleted for 30 days.",
+            );
+
+            let armed = d.armed();
+            let busy = st.preview_rx.is_some() || st.delete_rx.is_some();
+            ui.horizontal(|ui| {
+                let can_preview = armed && !busy && self.access.can_read();
+                if ui
+                    .add_enabled(can_preview, egui::Button::new("Preview…"))
+                    .clicked()
+                {
+                    st.preview_rx = Some(run_delete_plan(d.clone(), server_url, api_key));
+                    st.status = "Checking with the server…".into();
+                }
+                if let Some(plan) = &st.preview {
+                    let n = plan
+                        .delete
+                        .len()
+                        .min(crate::watch::photos::delete::MAX_BATCH);
+                    if n > 0
+                        && ui
+                            .add_enabled(
+                                armed && !busy,
+                                egui::Button::new(format!("Delete {n} photos…")),
+                            )
+                            .clicked()
+                    {
+                        st.delete_rx = Some(run_delete(
+                            plan.delete.clone(),
+                            d.clone(),
+                            server_url,
+                            api_key,
+                        ));
+                        st.status = "Waiting for the macOS confirmation…".into();
+                    }
+                }
+            });
+            if let Some(plan) = &st.preview {
+                ui.label(format!(
+                    "Would delete {} photos, about {}.",
+                    plan.delete.len(),
+                    format_bytes(plan.bytes)
+                ));
+                if plan.delete.len() > crate::watch::photos::delete::MAX_BATCH {
+                    ui.small(format!(
+                        "One batch deletes at most {}; preview again for the rest.",
+                        crate::watch::photos::delete::MAX_BATCH
+                    ));
+                }
+                let kept = kept_summary(&plan.kept);
+                if !kept.is_empty() {
+                    ui.small(format!("Kept: {kept}."));
+                }
+            }
+        }
+        if !st.status.is_empty() {
+            ui.small(&st.status);
         }
     }
 
@@ -1310,12 +1516,105 @@ impl PhotosTabState {
 
         ui.separator();
         self.show_albums(ui, server_url, api_key);
+
+        ui.separator();
+        self.show_delete(ui, server_url, api_key);
         ui.add_space(4.0);
         ui.small(
             "Syncs the whole library first, then new photos as you add them. \
              These choices apply after a restart.",
         );
     }
+}
+
+/// "1.2 GB", "340 MB".
+#[cfg(target_os = "macos")]
+fn format_bytes(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= 1024.0 * MB {
+        format!("{:.1} GB", b / (1024.0 * MB))
+    } else {
+        format!("{:.0} MB", (b / MB).max(if bytes > 0 { 1.0 } else { 0.0 }))
+    }
+}
+
+/// The pieces a delete run needs, opened in its own thread.
+#[cfg(target_os = "macos")]
+fn delete_world(
+    server_url: &str,
+    api_key: &str,
+) -> Result<
+    (
+        crate::db::DbStore,
+        crate::api::ImmichClient,
+        tokio::runtime::Runtime,
+    ),
+    String,
+> {
+    if server_url.is_empty() || api_key.is_empty() {
+        return Err("set the server URL and API key first".into());
+    }
+    let store = crate::db::DbStore::new(open_db().map_err(|e| e.to_string())?);
+    let client = crate::api::ImmichClient::new(server_url, api_key).map_err(|e| e.to_string())?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok((store, client, rt))
+}
+
+/// Dry run on a background thread.
+#[cfg(target_os = "macos")]
+fn run_delete_plan(
+    cfg: crate::config::PhotosDeleteConfig,
+    server_url: &str,
+    api_key: &str,
+) -> std::sync::mpsc::Receiver<Result<crate::watch::photos::delete::DeletePlan, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (url, key) = (server_url.to_string(), api_key.to_string());
+    std::thread::spawn(move || {
+        let result = delete_world(&url, &key).and_then(|(store, client, rt)| {
+            rt.block_on(crate::watch::photos::delete::plan(
+                &cfg,
+                &store,
+                &crate::platform::photos::PhotoKitDeleteLibrary,
+                &client,
+                chrono::Utc::now(),
+            ))
+            .map_err(|e| e.to_string())
+        });
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+/// The previewed batch, re-verified, on a background thread. macOS shows
+/// its confirmation from here.
+#[cfg(target_os = "macos")]
+fn run_delete(
+    previewed: Vec<String>,
+    cfg: crate::config::PhotosDeleteConfig,
+    server_url: &str,
+    api_key: &str,
+) -> std::sync::mpsc::Receiver<Result<crate::watch::photos::delete::DeleteOutcome, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (url, key) = (server_url.to_string(), api_key.to_string());
+    std::thread::spawn(move || {
+        let result = delete_world(&url, &key).and_then(|(store, client, rt)| {
+            rt.block_on(crate::watch::photos::delete::execute(
+                &previewed,
+                &cfg,
+                &store,
+                &crate::platform::photos::PhotoKitDeleteLibrary,
+                &client,
+                chrono::Utc::now(),
+            ))
+            .map_err(|e| e.to_string())
+        });
+        let _ = tx.send(result);
+    });
+    rx
 }
 
 /// Load the server's album names on a background thread for the dropdown.
@@ -1355,6 +1654,24 @@ fn fetch_album_names(
 mod photos_tests {
     use super::*;
     use crate::platform::photos::Access;
+
+    #[test]
+    fn the_kept_summary_counts_reasons_in_a_fixed_order() {
+        use crate::watch::photos::delete::Keep;
+        let kept = vec![
+            ("a".to_string(), Keep::TooRecent),
+            ("b".to_string(), Keep::Favorite),
+            ("c".to_string(), Keep::TooRecent),
+            ("d".to_string(), Keep::ServerMismatch),
+        ];
+        assert_eq!(
+            kept_summary(&kept),
+            "2 too recent, 1 favourite, 1 server copy doesn't match"
+        );
+        assert_eq!(kept_summary(&[]), "");
+        assert_eq!(format_bytes(0), "0 MB");
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024 / 2), "1.5 GB");
+    }
 
     #[test]
     fn album_choices_load_save_and_no_albums_is_exclusive() {

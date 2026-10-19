@@ -48,6 +48,23 @@ pub trait QueueStore: Send + Sync {
         anyhow::bail!("this store has no Photos library support")
     }
 
+    /// Uploaded Photos resources not yet deleted from the library (#116).
+    fn photos_uploaded_resources(
+        &self,
+    ) -> anyhow::Result<Vec<(String, crate::watch::photos::delete::Recorded)>> {
+        Ok(Vec::new())
+    }
+
+    /// Log one delete-from-Photos attempt (#116).
+    fn record_photos_deletion(
+        &self,
+        _local_id: &str,
+        _immich_asset_ids: &str,
+        _outcome: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Return iCloud-deferred Photos entries to pending (#82).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn requeue_deferred_photos(&self) -> anyhow::Result<usize> {

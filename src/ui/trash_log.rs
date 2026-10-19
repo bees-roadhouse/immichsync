@@ -24,8 +24,13 @@ pub fn show_trash_log(db: Arc<DbStore>) {
     };
 
     let entries = load_trash_entries(&db);
+    let photo_deletions = load_photo_deletions(&db);
 
-    let app = TrashLogApp { entries, db };
+    let app = TrashLogApp {
+        entries,
+        photo_deletions,
+        db,
+    };
 
     if let Err(e) = eframe::run_native(
         "ImmichSync Trash",
@@ -54,6 +59,8 @@ struct TrashEntry {
 
 struct TrashLogApp {
     entries: Vec<TrashEntry>,
+    /// Delete-from-Photos history (#116), newest first.
+    photo_deletions: Vec<crate::db::PhotosDeletion>,
     db: Arc<DbStore>,
 }
 
@@ -73,10 +80,49 @@ impl eframe::App for TrashLogApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Refresh").clicked() {
                         self.entries = load_trash_entries(&self.db);
+                        self.photo_deletions = load_photo_deletions(&self.db);
                     }
                 });
             });
         });
+
+        if !self.photo_deletions.is_empty() {
+            egui::TopBottomPanel::bottom("photo_deletions")
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.collapsing(
+                        format!("Deleted from Photos ({})", self.photo_deletions.len()),
+                        |ui| {
+                            ui.small(
+                                "Deleted photos stay in Photos → Recently Deleted for 30 days.",
+                            );
+                            egui::ScrollArea::vertical()
+                                .id_salt("photo_deletions_scroll")
+                                .max_height(160.0)
+                                .show(ui, |ui| {
+                                    egui::Grid::new("photo_deletions_grid")
+                                        .num_columns(4)
+                                        .striped(true)
+                                        .spacing([8.0, 4.0])
+                                        .show(ui, |ui| {
+                                            ui.strong("When");
+                                            ui.strong("Outcome");
+                                            ui.strong("Photo");
+                                            ui.strong("Immich");
+                                            ui.end_row();
+                                            for d in &self.photo_deletions {
+                                                ui.label(&d.at);
+                                                ui.label(&d.outcome);
+                                                ui.label(&d.local_id);
+                                                ui.label(&d.immich_asset_ids);
+                                                ui.end_row();
+                                            }
+                                        });
+                                });
+                        },
+                    );
+                });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.entries.is_empty() {
@@ -113,6 +159,16 @@ impl eframe::App for TrashLogApp {
 }
 
 // ── Data loading ────────────────────────────────────────────────────────────
+
+fn load_photo_deletions(db: &Arc<DbStore>) -> Vec<crate::db::PhotosDeletion> {
+    match db.inner().lock().unwrap().photos_deletions(500) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to load the delete-from-Photos log");
+            Vec::new()
+        }
+    }
+}
 
 fn load_trash_entries(db: &Arc<DbStore>) -> Vec<TrashEntry> {
     let guard = db.inner().lock().unwrap();
