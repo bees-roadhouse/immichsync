@@ -25,7 +25,7 @@ PhotoKit ──(enumerate / change token)──► PhotosSource ──(export or
 
 ### Read-only access and the permission prompt
 
-- PhotoKit has no read-only level: `.addOnly` cannot read, so we request `.readWrite` and **never call a change request**. The code has no `PHAssetChangeRequest` anywhere; a grep enforces this in review. Info.plist gets `NSPhotoLibraryUsageDescription`: "ImmichSync reads your Photos library to back it up to your Immich server. It never changes or deletes photos." A Developer-ID build with hardened runtime also needs the `com.apple.security.personal-information.photos-library` entitlement.
+- *Amended 2026-10-19 (Amendment 1, below): one isolated delete path, off by default.* PhotoKit has no read-only level: `.addOnly` cannot read, so we request `.readWrite` and **never call a change request**. The code has no `PHAssetChangeRequest` anywhere; a grep enforces this in review. Info.plist gets `NSPhotoLibraryUsageDescription`: "ImmichSync reads your Photos library to back it up to your Immich server. It never changes or deletes photos." A Developer-ID build with hardened runtime also needs the `com.apple.security.personal-information.photos-library` entitlement.
 - **Opt-in, and the prompt only follows the user's own action.** The library is off by default. Settings gets a *Photos library* section with **Sync my Photos library**. Ticking it calls `requestAuthorization(for: .readWrite)`, so the system prompt appears as the direct result of that click, never at startup or first run. The section shows the status:
   - *Not determined*: the toggle.
   - *Authorized*: the asset count and the last sync time.
@@ -87,3 +87,31 @@ PhotoKit ──(enumerate / change token)──► PhotosSource ──(export or
 2. **Originals only.** Edited renders are not uploaded.
 3. **Hidden and shared-library items excluded** by default.
 4. **Photos → Immich album mapping: later.** A possible sixth slice, not in this plan.
+
+## Amendment 1 (2026-10-19): optional delete from Photos after a verified upload (#116)
+
+- **Status:** accepted. Nate, 2026-10-19: "make sure we build it", "off by default".
+- **Reverses** *Read-only access* above, in one place. ImmichSync may now delete photos from the library, but only through **one isolated write path**: `platform::macos::photos_delete::delete_assets`, which calls `performChanges` with `PHAssetChangeRequest.deleteAssets`. Nothing else in the code may call `performChanges` or build a change request. The guard test `nothing_but_photos_delete_can_change_the_photos_library` fails on any other occurrence in `src/`. Only `watch::photos::delete` may call `delete_assets`, and the same test checks that too.
+- **No new permission level.** We already request `.readWrite`, since `.addOnly` can't read. macOS asks for confirmation on **every** `deleteAssets` call ("Allow ImmichSync to delete N photos?"), so deletes run in user-started batches, one prompt per batch, and never per photo or in the background.
+
+### Safeguards, all in code
+1. **Off by default.** It runs only with `[photos.delete] enabled = true` **and** two acknowledgements:
+   - `ack_icloud`: with iCloud Photos on, a delete removes the photo from every device.
+   - `ack_no_shared_library`: PhotoKit has no public API to tell who contributed an iCloud Shared Library item, and deleting one deletes it for every participant. So the user states that they don't use one. This is how safeguard 4's "never delete items contributed by others" holds. **Nate's decision, 2026-10-19 (via Pia): "Require acknowledgement".** Deletion stays impossible until this is ticked, and the setting tells anyone who does use a Shared Library to leave delete off. The other option, blocking the feature until Apple exposes contributor information, was not chosen. If Apple does expose it, replace the acknowledgement with a check.
+2. **Verified at delete time, not just at upload.** Every resource of the asset is asked of the server again: the still, plus the paired video for a Live Photo. The resource must exist, must not be in Immich's trash, and its checksum must equal the SHA-1 we recorded. A missing or mismatched copy means the photo is kept.
+3. **Age:** only photos older than `min_age_days`, default 30, by creation date.
+4. **Exclusions:**
+   - favourites are kept (`keep_favorites`, default on);
+   - optionally, anything in a user album is kept (`keep_in_albums`, default off);
+   - only user-library assets are considered (`sourceType = .typeUserLibrary`).
+5. **Units:** a Live Photo is deleted only once both its resources are verified. **Bursts are never deleted.** Only the burst pick is uploaded, so the unit can't be fully verified.
+6. **iCloud-only originals:** an asset is a candidate only if a full original was uploaded and recorded with its SHA-1. Recorded hashes are only ever of exported originals, so a never-downloaded original can't qualify.
+7. **Dry run and log:**
+   - Settings first shows a preview, "would delete N photos, about X", and the batch it confirms is exactly the previewed set, re-verified.
+   - Each attempt is written to `photos_deletions`, shown in the Trash Log window: the asset, the Immich ids, and the outcome (deleted, declined at the prompt, or failed).
+   - Deleted photos go to **Recently Deleted** for 30 days.
+
+### Consequences
+- `NSPhotoLibraryUsageDescription` no longer promises "never deletes". It says deletion happens only if the user turns on delete-after-upload.
+- The read-only guard becomes the single-write-path guard.
+- A schedule is not added. Each batch is started from Settings, which matches the per-batch system prompt.

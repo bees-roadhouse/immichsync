@@ -345,6 +345,54 @@ fn user_albums(asset: &PHAsset) -> Vec<LibraryAlbum> {
     albums
 }
 
+// ── Delete from Photos (#116) ───────────────────────────────────────────────
+
+/// The library for `watch::photos::delete`: facts for the rules, and the
+/// write path in `photos_delete`. Refuses unless access is already granted.
+pub struct PhotoKitDeleteLibrary;
+
+impl crate::watch::photos::delete::DeleteLibrary for PhotoKitDeleteLibrary {
+    fn facts(&self, local_ids: &[String]) -> Vec<crate::watch::photos::delete::AssetFacts> {
+        if !access().can_read() || local_ids.is_empty() {
+            return Vec::new();
+        }
+        let ids: Vec<_> = local_ids.iter().map(|s| NSString::from_str(s)).collect();
+        // Same filter as syncing: hidden items and non-picks never qualify.
+        let result = unsafe {
+            PHAsset::fetchAssetsWithLocalIdentifiers_options(
+                &NSArray::from_retained_slice(&ids),
+                Some(&sync_fetch_options(true)),
+            )
+        };
+        let mut out = Vec::new();
+        for i in 0..unsafe { result.count() } {
+            let a = unsafe { result.objectAtIndex(i) };
+            unsafe {
+                out.push(crate::watch::photos::delete::AssetFacts {
+                    local_id: a.localIdentifier().to_string(),
+                    created_at: to_utc(a.creationDate()),
+                    is_favorite: a.isFavorite(),
+                    in_user_album: !user_albums(&a).is_empty(),
+                    is_burst: a.representsBurst() || a.burstIdentifier().is_some(),
+                    user_library: a.sourceType().contains(PHAssetSourceType::TypeUserLibrary),
+                    is_video: a.mediaType() == PHAssetMediaType::Video,
+                    is_live: paired_video_resource(&a).is_some(),
+                    has_adjustments: a.hasAdjustments(),
+                });
+            }
+        }
+        out
+    }
+
+    fn delete_assets(
+        &self,
+        batch: &crate::watch::photos::delete::VerifiedBatch,
+    ) -> anyhow::Result<bool> {
+        require_access()?;
+        autoreleasepool(|_| super::photos_delete::delete_assets(batch))
+    }
+}
+
 // ── Change observer (#81) ──────────────────────────────────────────────────
 
 struct ObserverIvars {
@@ -704,38 +752,73 @@ mod tests {
         assert!(!Access::Restricted.can_read());
     }
 
-    /// Read-only, enforced: a PhotoKit change request (the only way to edit
-    /// or delete a photo) can only be applied through `performChanges`, so no
-    /// source file may call it. Comments naming the rule are fine.
+    /// One write path, enforced (ADR 0002 Amendment 1). A PhotoKit change
+    /// (the only way to edit or delete a photo) is applied through
+    /// `performChanges` with a change request, and that may appear in
+    /// exactly one file, `photos_delete.rs`. Its `delete_assets` may be
+    /// called only by `PhotoKitDeleteLibrary` here, whose trait method may be
+    /// called only by `watch::photos::delete`. Comments naming the rule are
+    /// fine. The grep is the backstop; the real gate is the type: both
+    /// delete paths take a `VerifiedBatch`, which only
+    /// `watch::photos::delete::execute` can build, so a bypass (`&ids`,
+    /// UFCS, a struct literal, reaching `photos_delete` from outside) doesn't
+    /// compile.
     #[test]
-    fn nothing_in_src_can_change_the_photos_library() {
-        fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
+    fn nothing_but_photos_delete_can_change_the_photos_library() {
+        fn walk(dir: &std::path::Path, files: &mut Vec<(String, String)>) {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
-                    walk(&path, hits);
+                    walk(&path, files);
                 } else if path.extension().is_some_and(|e| e == "rs") {
-                    let text = std::fs::read_to_string(&path).unwrap();
-                    for (n, line) in text.lines().enumerate() {
-                        let code = line.split("//").next().unwrap_or("");
-                        let needle = ["perform", "Changes"].concat();
-                        if code.contains(&needle)
-                            || code.contains(&["ChangeRequest", "::"].concat())
-                        {
-                            hits.push(format!("{}:{}", path.display(), n + 1));
-                        }
-                    }
+                    let code: String = std::fs::read_to_string(&path)
+                        .unwrap()
+                        .lines()
+                        .map(|l| l.split("//").next().unwrap_or(""))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    files.push((path.display().to_string(), code));
                 }
             }
         }
-        let mut hits = Vec::new();
-        walk(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut hits,
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        let in_files = |needle: &str| -> Vec<String> {
+            let mut v: Vec<String> = files
+                .iter()
+                .filter(|(_, code)| code.contains(needle))
+                .map(|(p, _)| {
+                    p.strip_prefix(&*src.display().to_string())
+                        .unwrap_or(p)
+                        .to_string()
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let write = ["perform", "Changes"].concat();
+        let request = ["ChangeRequest", "::"].concat();
+        let only_delete_file = vec!["/platform/macos/photos_delete.rs".to_string()];
+        assert_eq!(
+            in_files(&write),
+            only_delete_file,
+            "a library write outside photos_delete.rs"
         );
-        assert!(
-            hits.is_empty(),
-            "Photos library write paths found: {hits:?}"
+        assert_eq!(
+            in_files(&request),
+            only_delete_file,
+            "a change request outside photos_delete.rs"
+        );
+        assert_eq!(
+            in_files(&["photos_delete::", "delete_assets("].concat()),
+            vec!["/platform/macos/photos.rs".to_string()],
+            "the delete path called from elsewhere"
+        );
+        assert_eq!(
+            in_files(&[".delete_assets", "(&"].concat()),
+            vec!["/watch/photos/delete.rs".to_string()],
+            "the delete trait method called from elsewhere"
         );
     }
 

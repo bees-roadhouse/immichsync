@@ -15,6 +15,8 @@
 // PhotoKit itself lives in `platform::photos`; this module only decides
 // what to queue, so it is tested without a library or a TCC grant.
 
+pub mod delete;
+
 use tracing::{debug, info, warn};
 
 use crate::upload::queue::QueueStore;

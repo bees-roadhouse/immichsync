@@ -300,6 +300,47 @@ pub struct PhotosConfig {
     /// Storage): download them, one at a time (the default, Nate
     /// 2026-10-18), or skip them as *deferred* until they're local (#82).
     pub icloud_originals: ICloudOriginals,
+
+    /// Delete from Photos after a verified upload (#116). Off by default.
+    pub delete: PhotosDeleteConfig,
+}
+
+/// `[photos.delete]`: optional delete from Photos after a verified upload
+/// (ADR 0002 Amendment 1). Nothing is deleted unless [`armed`](Self::armed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PhotosDeleteConfig {
+    pub enabled: bool,
+    /// "With iCloud Photos on, a delete removes the photo from every device."
+    pub ack_icloud: bool,
+    /// "I don't use an iCloud Shared Library": PhotoKit can't tell who
+    /// contributed a shared photo, and deleting one deletes it for everyone.
+    pub ack_no_shared_library: bool,
+    /// Only photos older than this many days (by creation date).
+    pub min_age_days: u32,
+    pub keep_favorites: bool,
+    /// Keep anything that is in a Photos user album.
+    pub keep_in_albums: bool,
+}
+
+impl Default for PhotosDeleteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ack_icloud: false,
+            ack_no_shared_library: false,
+            min_age_days: 30,
+            keep_favorites: true,
+            keep_in_albums: false,
+        }
+    }
+}
+
+impl PhotosDeleteConfig {
+    /// On, with both acknowledgements given.
+    pub fn armed(&self) -> bool {
+        self.enabled && self.ack_icloud && self.ack_no_shared_library
+    }
 }
 
 /// `[photos] icloud_originals`.
@@ -343,6 +384,7 @@ impl Default for PhotosConfig {
             sync_albums: true,
             all_in_album: String::new(),
             icloud_originals: ICloudOriginals::Download,
+            delete: PhotosDeleteConfig::default(),
         }
     }
 }
@@ -355,6 +397,7 @@ struct PhotosConfigFile {
     sync_albums: bool,
     all_in_album: String,
     icloud_originals: ICloudOriginals,
+    delete: PhotosDeleteConfig,
     /// The tracer's single fixed album (#111). Read to migrate, never written.
     album_name: Option<String>,
 }
@@ -367,6 +410,7 @@ impl Default for PhotosConfigFile {
             sync_albums: d.sync_albums,
             all_in_album: d.all_in_album,
             icloud_originals: d.icloud_originals,
+            delete: d.delete,
             album_name: None,
         }
     }
@@ -388,6 +432,7 @@ impl From<PhotosConfigFile> for PhotosConfig {
             sync_albums: f.sync_albums,
             all_in_album,
             icloud_originals: f.icloud_originals,
+            delete: f.delete,
         }
     }
 }
@@ -851,6 +896,42 @@ mod tests {
         assert_eq!(typo.photos.icloud_originals, ICloudOriginals::Download);
         let written = toml::to_string_pretty(&skip).unwrap();
         assert!(written.contains("icloud_originals = \"skip\""), "{written}");
+    }
+
+    #[test]
+    fn photo_deletion_is_off_by_default_and_needs_both_acknowledgements() {
+        let d = Config::default().photos.delete;
+        assert!(!d.enabled && !d.ack_icloud && !d.ack_no_shared_library);
+        assert_eq!(d.min_age_days, 30);
+        assert!(d.keep_favorites);
+        assert!(!d.keep_in_albums);
+        assert!(!d.armed());
+
+        let on = |icloud, shared| PhotosDeleteConfig {
+            enabled: true,
+            ack_icloud: icloud,
+            ack_no_shared_library: shared,
+            ..PhotosDeleteConfig::default()
+        };
+        assert!(!on(false, true).armed());
+        assert!(!on(true, false).armed());
+        assert!(on(true, true).armed());
+        let off = PhotosDeleteConfig {
+            enabled: false,
+            ..on(true, true)
+        };
+        assert!(!off.armed());
+
+        let cfg: Config = toml::from_str(
+            "[photos.delete]\nenabled = true\nack_icloud = true\nack_no_shared_library = true\nmin_age_days = 60\n",
+        )
+        .unwrap();
+        assert!(cfg.photos.delete.armed());
+        assert_eq!(cfg.photos.delete.min_age_days, 60);
+        assert!(
+            cfg.photos.delete.keep_favorites,
+            "unset keys keep their safe default"
+        );
     }
 
     #[test]

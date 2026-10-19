@@ -28,10 +28,11 @@
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
-	<!-- Photos library source (ADR 0002). Shown in the system prompt that
-	     ticking "Sync my Photos library" raises; never asked at startup. -->
+	<!-- Photos library source (ADR 0002 and its Amendment 1). Shown in the
+	     system prompt that ticking "Sync my Photos library" raises; never
+	     asked at startup. -->
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>ImmichSync reads your Photos library to back it up to your Immich server. It never changes or deletes photos.</string>
+	<string>ImmichSync reads your Photos library to back it up to your Immich server. It deletes photos only if you turn on "Delete from Photos after upload", and macOS asks you each time.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright (c) Bee's Roadhouse. GPL-3.0-only.</string>
 </dict>
