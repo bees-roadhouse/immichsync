@@ -282,6 +282,20 @@ impl SettingsApp {
                 );
                 ui.end_row();
 
+                if self.api_key.is_empty() {
+                    if let Some(ref u) = self.config.server.unreadable_key {
+                        ui.label("");
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            format!(
+                                "{} Leave this blank to keep the saved key.",
+                                u.user_message()
+                            ),
+                        );
+                        ui.end_row();
+                    }
+                }
+
                 ui.label("Device Name:");
                 ui.add_sized(
                     [340.0, 20.0],

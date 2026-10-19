@@ -69,6 +69,8 @@ pub struct App {
     pending_update: Option<UpdateInfo>,
     /// Set to true once the update has been downloaded and applied.
     update_ready: bool,
+    /// The "can't read the API key" notification fires once per run (#114).
+    key_error_notified: bool,
     /// When the last server-reachability ping fired. The tray's Offline state
     /// is driven by this ... a single failed ping flips us to Offline, and
     /// a successful ping (or starting an upload, since uploads imply
@@ -142,6 +144,7 @@ impl App {
             last_update_check: Instant::now(),
             pending_update: None,
             update_ready: false,
+            key_error_notified: false,
             last_ping_at: Instant::now(),
             ping_rx: None,
             server_offline: false,
@@ -188,55 +191,7 @@ impl App {
         self.tray_rx = Some(tray_rx);
 
         // Create and start the upload pipeline if server is configured.
-        if let Some(ref client) = self.client {
-            let uploader: Arc<dyn AssetUploader> = Arc::new(client.clone());
-            let store: Arc<dyn QueueStore> = self.db.clone();
-            #[allow(unused_mut)]
-            let mut pipeline =
-                UploadPipeline::new(store, &self.config.server, &self.config.upload, uploader);
-
-            // Photos library entries are exported by PhotoKit (ADR 0002).
-            // The source is attached whether or not the library is enabled,
-            // so entries already queued still settle if it's turned off.
-            #[cfg(target_os = "macos")]
-            {
-                // Before any worker can export: clear what a crash left.
-                crate::platform::photos::sweep_stale_exports();
-                let photos = &self.config.photos;
-                let albums = crate::upload::worker::AlbumPolicy {
-                    mirror: photos.sync_albums,
-                    all_in: Some(photos.all_in_album.trim().to_string()).filter(|a| !a.is_empty()),
-                };
-                pipeline = pipeline.with_library(crate::upload::worker::LibrarySource::new(
-                    Arc::new(crate::platform::photos::PhotoKitExporter),
-                    albums,
-                ));
-            }
-
-            // Pipeline spawns tokio tasks — enter the runtime context.
-            let _guard = self.runtime.enter();
-            pipeline
-                .start()
-                .map_err(|e| anyhow::anyhow!("Failed to start pipeline: {}", e))?;
-
-            self.pipeline = Some(pipeline);
-
-            // Update tray with server info.
-            if let Some(ref mut tray) = self.tray {
-                let url_display = self
-                    .config
-                    .server
-                    .url
-                    .trim_start_matches("https://")
-                    .trim_start_matches("http://");
-                tray.set_server_status(url_display, true);
-            }
-        } else {
-            info!("No server configured; pipeline not started");
-            if let Some(ref mut tray) = self.tray {
-                tray.update_state(TrayState::Error("Server not configured".to_string()));
-            }
-        }
+        self.start_pipeline()?;
 
         // Set up the watch engine and bridge task.
         self.start_watch_engine()?;
@@ -303,11 +258,25 @@ impl App {
                 self.shutdown_and_exit();
             }
 
-            // Check for config updates from the settings window.
-            if let Some(ref rx) = self.settings_rx {
-                if let Ok(new_config) = rx.try_recv() {
+            // Check for config updates from the settings window or a
+            // Keychain retry. Cleared once it lands, so `is_some()` means a
+            // reload is in flight.
+            let reload = self.settings_rx.as_ref().map(|rx| rx.try_recv());
+            match reload {
+                Some(Ok(new_config)) => {
+                    self.settings_rx = None;
                     self.apply_new_config(new_config);
                 }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    // The reload failed (logged where it ran): keep what we
+                    // have, and offer Retry again if the key is still unreadable.
+                    self.settings_rx = None;
+                    let unreadable = self.config.server.unreadable_key.is_some();
+                    if let Some(ref mut tray) = self.tray {
+                        tray.set_key_unreadable(unreadable);
+                    }
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => {}
             }
 
             // Poll for update check results.
@@ -372,6 +341,80 @@ impl App {
     }
 
     // ── internals ────────────────────────────────────────────────────────
+
+    /// Create and start the upload pipeline when there is a client;
+    /// otherwise put the reason in the tray. Called at startup and again
+    /// when a config reload (Settings, Retry Keychain Access) first
+    /// produces a client (#114).
+    fn start_pipeline(&mut self) -> anyhow::Result<()> {
+        if self.pipeline.is_some() {
+            return Ok(());
+        }
+        if let Some(client) = self.client.clone() {
+            let client = &client;
+            let uploader: Arc<dyn AssetUploader> = Arc::new(client.clone());
+            let store: Arc<dyn QueueStore> = self.db.clone();
+            #[allow(unused_mut)]
+            let mut pipeline =
+                UploadPipeline::new(store, &self.config.server, &self.config.upload, uploader);
+
+            // Photos library entries are exported by PhotoKit (ADR 0002).
+            // The source is attached whether or not the library is enabled,
+            // so entries already queued still settle if it's turned off.
+            #[cfg(target_os = "macos")]
+            {
+                // Before any worker can export: clear what a crash left.
+                crate::platform::photos::sweep_stale_exports();
+                let photos = &self.config.photos;
+                let albums = crate::upload::worker::AlbumPolicy {
+                    mirror: photos.sync_albums,
+                    all_in: Some(photos.all_in_album.trim().to_string()).filter(|a| !a.is_empty()),
+                };
+                pipeline = pipeline.with_library(crate::upload::worker::LibrarySource::new(
+                    Arc::new(crate::platform::photos::PhotoKitExporter),
+                    albums,
+                ));
+            }
+
+            // Pipeline spawns tokio tasks — enter the runtime context.
+            let _guard = self.runtime.enter();
+            pipeline
+                .start()
+                .map_err(|e| anyhow::anyhow!("Failed to start pipeline: {}", e))?;
+
+            self.pipeline = Some(pipeline);
+
+            // Update tray with server info.
+            if let Some(ref mut tray) = self.tray {
+                let url_display = self
+                    .config
+                    .server
+                    .url
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://");
+                tray.set_server_status(url_display, true);
+            }
+        } else if let Some(ref unreadable) = self.config.server.unreadable_key {
+            warn!(error = %unreadable.error, "Stored API key unreadable; pipeline not started");
+            if let Some(ref mut tray) = self.tray {
+                tray.update_state(TrayState::Error(
+                    "can't read the API key — see the menu".to_string(),
+                ));
+                tray.set_key_unreadable(true);
+            }
+            if !self.key_error_notified {
+                self.key_error_notified = true;
+                self.notifications
+                    .show_toast_raw("ImmichSync isn't uploading", unreadable.user_message());
+            }
+        } else {
+            info!("No server configured; pipeline not started");
+            if let Some(ref mut tray) = self.tray {
+                tray.update_state(TrayState::Error("Server not configured".to_string()));
+            }
+        }
+        Ok(())
+    }
 
     /// Register watched folders and spawn the watch→pipeline bridge task.
     fn start_watch_engine(&mut self) -> anyhow::Result<()> {
@@ -552,6 +595,33 @@ impl App {
                 let flag = self.window_open.trash_log.clone();
                 spawn_window_subprocess("trash-log", flag, None);
             }
+            TrayAction::RetryKeychain => {
+                // Re-read config.toml on a worker thread: the Keychain read
+                // can block on macOS's access prompt. The result arrives
+                // through the same channel a Settings save uses.
+                if self.window_open.settings.load(Ordering::SeqCst) {
+                    info!("Settings is open; it reloads the config on close");
+                    return;
+                }
+                if self.settings_rx.is_some() {
+                    info!("A config reload is already in flight; ignoring Retry");
+                    return;
+                }
+                info!("Retrying the stored API key");
+                // Greyed out until the reload lands, so clicks while macOS's
+                // prompt is up don't stack Keychain reads (#130 review).
+                if let Some(ref mut tray) = self.tray {
+                    tray.set_key_unreadable(false);
+                }
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.settings_rx = Some(rx);
+                std::thread::spawn(move || match Config::load() {
+                    Ok(config) => {
+                        let _ = tx.send(config);
+                    }
+                    Err(e) => warn!(error = %e, "Config reload for Keychain retry failed"),
+                });
+            }
             TrayAction::CheckForUpdates => {
                 info!("Manual update check requested");
                 self.schedule_update_check(false);
@@ -617,6 +687,21 @@ impl App {
                         self.client = None;
                     }
                 }
+            }
+        }
+
+        // A reload that fixed (or still has) an unreadable key: start the
+        // pipeline now if this is the first client, and keep the tray honest.
+        if let Some(ref mut tray) = self.tray {
+            tray.set_key_unreadable(self.config.server.unreadable_key.is_some());
+        }
+        let had_pipeline = self.pipeline.is_some();
+        if let Err(e) = self.start_pipeline() {
+            warn!(error = %e, "Failed to start the upload pipeline after config update");
+        } else if !had_pipeline && self.pipeline.is_some() {
+            info!("Upload pipeline started after config reload");
+            if let Some(ref mut tray) = self.tray {
+                tray.update_state(TrayState::Idle);
             }
         }
 
