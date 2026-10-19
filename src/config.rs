@@ -218,6 +218,28 @@ impl Default for DevicesConfig {
     }
 }
 
+/// Apple Photos library source (macOS; docs/adr/0002-photokit-library-source.md).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PhotosConfig {
+    /// Sync the Photos library. Off by default; turning it on in Settings is
+    /// what raises the system permission prompt.
+    pub enabled: bool,
+
+    /// Album every library upload goes into. Mapping Photos albums to
+    /// Immich albums is a later slice. Empty = no album.
+    pub album_name: String,
+}
+
+impl Default for PhotosConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            album_name: "Photos library".to_string(),
+        }
+    }
+}
+
 /// System tray and notification UI settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -310,6 +332,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub upload: UploadConfig,
     pub devices: DevicesConfig,
+    pub photos: PhotosConfig,
     pub ui: UiConfig,
     pub advanced: AdvancedConfig,
 }
@@ -525,6 +548,7 @@ mod tests {
         assert_eq!(cfg.upload.order, "newest_first");
         assert_eq!(cfg.upload.max_retries, 5);
         assert_eq!(cfg.upload.timeout_secs, 3600);
+        assert!(!cfg.photos.enabled, "the Photos library is opt-in");
         assert!(cfg.devices.auto_watch);
         assert!(cfg.devices.look_for_dcim);
         assert_eq!(cfg.devices.on_insert, "auto");

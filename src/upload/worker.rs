@@ -115,6 +115,83 @@ pub struct WorkerConfig {
     /// The device identifier sent to Immich with every upload.
     /// Format: `"immichsync-{hostname}"`.
     pub device_id: String,
+
+    /// The Photos library source, when this build and config have one.
+    /// Entries with `source = photos` fail cleanly without it.
+    pub library: Option<Arc<LibrarySource>>,
+}
+
+// ─── Photos library source (ADR 0002) ────────────────────────────────────────
+
+/// One original exported from the Photos library to a temp file.
+#[derive(Debug)]
+pub struct LibraryExport {
+    /// The temp file, named after the asset's original filename (Immich
+    /// takes the upload's filename from it). Deleted once the entry settles.
+    pub path: std::path::PathBuf,
+    /// Which resource this is: `"photo"` or `"video"`.
+    pub resource: &'static str,
+    pub created_at: DateTime<Utc>,
+    pub modified_at: DateTime<Utc>,
+}
+
+/// Why an export produced no file. Built by the macOS exporter only.
+#[derive(Debug, thiserror::Error)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub enum LibraryExportError {
+    /// The original exists only in iCloud. Downloading is a later slice
+    /// (ADR 0002 §iCloud); until then the entry is deferred, not retried.
+    #[error("the original is only in iCloud")]
+    CloudOnly,
+    /// The asset is no longer in the library (deleted, or access revoked).
+    #[error("the asset is no longer in the Photos library")]
+    Gone,
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+/// Exports Photos library originals. Blocking: the worker calls it from
+/// `spawn_blocking`. The macOS implementation is `platform::photos`.
+pub trait LibraryExporter: Send + Sync {
+    fn export_original(&self, local_id: &str) -> Result<LibraryExport, LibraryExportError>;
+}
+
+/// What the worker needs to upload `source = photos` entries.
+pub struct LibrarySource {
+    pub exporter: Arc<dyn LibraryExporter>,
+    /// Fixed album for library uploads (album mapping is a later slice).
+    pub album: Option<String>,
+}
+
+impl std::fmt::Debug for LibrarySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LibrarySource")
+            .field("album", &self.album)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `deviceAssetId` for a library resource: stable across exports, so a
+/// re-export of the same asset is the same asset to Immich.
+pub fn photos_device_asset_id(local_id: &str, resource: &str) -> String {
+    format!("photos-{local_id}-{resource}")
+}
+
+/// Deletes the exported temp file (and its per-export directory) on drop,
+/// however the entry ends.
+struct TempExport(std::path::PathBuf);
+
+impl Drop for TempExport {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.0) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(path = %self.0.display(), error = %e, "Failed to delete exported temp file");
+            }
+        }
+        if let Some(dir) = self.0.parent() {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
 }
 
 impl Default for WorkerConfig {
@@ -128,6 +205,7 @@ impl Default for WorkerConfig {
             max_retries: 5,
             base_retry_delay: Duration::from_secs(1),
             device_id: format!("immichsync-{hostname}"),
+            library: None,
         }
     }
 }
@@ -154,6 +232,12 @@ impl UploadWorker {
             paused: Arc::new(pause_tx),
             paused_rx: pause_rx,
         }
+    }
+
+    /// Attach the Photos library source (see [`UploadPipeline::with_library`]).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn set_library(&mut self, library: LibrarySource) {
+        self.config.library = Some(Arc::new(library));
     }
 
     /// Signal all workers to stop after finishing their current upload.
@@ -288,6 +372,10 @@ async fn process_item(
     uploader: Arc<dyn AssetUploader>,
     config: &WorkerConfig,
 ) {
+    if entry.source == crate::upload::queue::QueueSource::Photos {
+        return process_library_item(entry, store, uploader, config).await;
+    }
+
     let path = std::path::PathBuf::from(&entry.file_path);
     let file_name = path
         .file_name()
@@ -533,52 +621,204 @@ async fn process_item(
             }
         }
 
-        Err(e) => {
-            let new_retry = entry.retry_count + 1;
-            let error_msg = e.to_string();
+        Err(e) => fail_or_retry(&entry, store.as_ref(), config, &e.to_string()).await,
+    }
+}
 
-            warn!(
-                id = entry.id,
-                path = %entry.file_path,
-                attempt = new_retry,
-                max = config.max_retries,
-                error = %error_msg,
-                "Upload failed"
+/// An attempt failed: back off and return the entry to `pending`, or mark
+/// it `failed` once retries are exhausted.
+async fn fail_or_retry(
+    entry: &QueueEntry,
+    store: &dyn QueueStore,
+    config: &WorkerConfig,
+    error_msg: &str,
+) {
+    let new_retry = entry.retry_count + 1;
+    let error_msg = error_msg.to_string();
+
+    warn!(
+        id = entry.id,
+        path = %entry.file_path,
+        attempt = new_retry,
+        max = config.max_retries,
+        error = %error_msg,
+        "Upload failed"
+    );
+
+    if new_retry >= config.max_retries {
+        // Exhausted retries — mark as failed permanently.
+        error!(
+            id = entry.id,
+            path = %entry.file_path,
+            "Upload permanently failed after {} retries",
+            config.max_retries
+        );
+
+        // We set the retry_count via the error path; the DB
+        // implementation is expected to increment it on status update.
+        if let Err(db_err) = store.update_status(entry.id, "failed", Some(&error_msg)) {
+            error!(id = entry.id, error = %db_err, "Failed to mark entry as failed");
+        }
+    } else {
+        // Schedule for retry with exponential backoff.
+        let delay = backoff_delay(new_retry, config.base_retry_delay);
+        debug!(
+            id = entry.id,
+            delay_secs = delay.as_secs(),
+            "Scheduling retry with backoff"
+        );
+
+        sleep(delay).await;
+
+        // Return to pending so the next dequeue loop picks it up.
+        // The retry_count increment is handled by the DB layer via
+        // a dedicated "increment retry" update; here we just set
+        // status back to pending.
+        if let Err(db_err) = store.update_status(entry.id, "pending", Some(&error_msg)) {
+            error!(id = entry.id, error = %db_err, "Failed to reset entry to pending");
+        }
+    }
+}
+
+/// Upload one Photos library asset: export its original to a temp file,
+/// then hash, dedup, upload and album it like a folder file. The temp file
+/// is deleted however the entry ends; a retry exports again.
+async fn process_library_item(
+    entry: QueueEntry,
+    store: Arc<dyn QueueStore>,
+    uploader: Arc<dyn AssetUploader>,
+    config: &WorkerConfig,
+) {
+    let Some(local_id) = entry.photos_local_id.clone() else {
+        let _ = store.update_status(
+            entry.id,
+            "failed",
+            Some("photos entry has no localIdentifier"),
+        );
+        return;
+    };
+    let Some(library) = config.library.clone() else {
+        warn!(id = entry.id, %local_id, "Photos entry queued but this build has no library source");
+        let _ = store.update_status(
+            entry.id,
+            "failed",
+            Some("the Photos library source is not available in this build"),
+        );
+        return;
+    };
+
+    info!(id = entry.id, %local_id, retry = entry.retry_count, "Processing Photos library entry");
+    if let Err(e) = store.update_status(entry.id, "uploading", None) {
+        error!(id = entry.id, error = %e, "Failed to mark entry as uploading");
+        return;
+    }
+
+    let exporter = library.exporter.clone();
+    let id_for_export = local_id.clone();
+    let exported =
+        tokio::task::spawn_blocking(move || exporter.export_original(&id_for_export)).await;
+    let export = match exported {
+        Ok(Ok(x)) => x,
+        Ok(Err(LibraryExportError::CloudOnly)) => {
+            info!(id = entry.id, %local_id, "Photos original is only in iCloud; skipped (download is a later slice)");
+            let _ = store.update_status(
+                entry.id,
+                "failed",
+                Some("deferred: the original is only in iCloud"),
             );
+            return;
+        }
+        Ok(Err(LibraryExportError::Gone)) => {
+            info!(id = entry.id, %local_id, "Photos asset is gone; dropping entry");
+            let _ = store.update_status(
+                entry.id,
+                "failed",
+                Some("the asset is no longer in the Photos library"),
+            );
+            return;
+        }
+        Ok(Err(LibraryExportError::Other(e))) => {
+            return fail_or_retry(
+                &entry,
+                store.as_ref(),
+                config,
+                &format!("export failed: {e:#}"),
+            )
+            .await;
+        }
+        Err(e) => {
+            return fail_or_retry(&entry, store.as_ref(), config, &format!("export task: {e}"))
+                .await;
+        }
+    };
+    // Deletes the export however this ends. Dropped explicitly before any
+    // retry backoff, so a private original never waits in temp; the retry
+    // exports again.
+    let cleanup = TempExport(export.path.clone());
+    let label = format!("photos:{local_id}/{}", export.resource);
 
-            if new_retry >= config.max_retries {
-                // Exhausted retries — mark as failed permanently.
-                error!(
-                    id = entry.id,
-                    path = %entry.file_path,
-                    "Upload permanently failed after {} retries",
-                    config.max_retries
-                );
+    let hash = match crate::upload::hasher::hash_file(&export.path) {
+        Ok(h) => h,
+        Err(e) => {
+            drop(cleanup);
+            return fail_or_retry(&entry, store.as_ref(), config, &format!("hash failed: {e}"))
+                .await;
+        }
+    };
 
-                // We set the retry_count via the error path; the DB
-                // implementation is expected to increment it on status update.
-                if let Err(db_err) = store.update_status(entry.id, "failed", Some(&error_msg)) {
-                    error!(id = entry.id, error = %db_err, "Failed to mark entry as failed");
-                }
-            } else {
-                // Schedule for retry with exponential backoff.
-                let delay = backoff_delay(new_retry, config.base_retry_delay);
-                debug!(
-                    id = entry.id,
-                    delay_secs = delay.as_secs(),
-                    "Scheduling retry with backoff"
-                );
+    // Layer 2 spans sources: the same original already uploaded from a
+    // watched folder (or an earlier export) is not uploaded again.
+    if store.is_file_uploaded(&hash).unwrap_or(false) {
+        info!(id = entry.id, %local_id, "Photos original already uploaded (same SHA-1); skipping");
+        let _ = store.record_photos_asset(&local_id, export.resource, &hash, "", None);
+        let _ = store.mark_completed(entry.id, None);
+        return;
+    }
 
-                sleep(delay).await;
+    let device_asset_id = photos_device_asset_id(&local_id, export.resource);
+    let result = uploader
+        .upload_asset(
+            &export.path,
+            &device_asset_id,
+            &config.device_id,
+            export.created_at,
+            export.modified_at,
+        )
+        .await;
 
-                // Return to pending so the next dequeue loop picks it up.
-                // The retry_count increment is handled by the DB layer via
-                // a dedicated "increment retry" update; here we just set
-                // status back to pending.
-                if let Err(db_err) = store.update_status(entry.id, "pending", Some(&error_msg)) {
-                    error!(id = entry.id, error = %db_err, "Failed to reset entry to pending");
+    match result {
+        Ok(up) => {
+            info!(id = entry.id, %local_id, asset_id = %up.asset_id, is_duplicate = up.is_duplicate, "Photos upload succeeded");
+            let size = std::fs::metadata(&export.path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if let Err(e) =
+                store.record_upload(&label, &hash, size, 0, &up.asset_id, &device_asset_id, "")
+            {
+                warn!(id = entry.id, error = %e, "Failed to record upload in uploaded_files");
+            }
+            let modified = export.modified_at.to_rfc3339();
+            if let Err(e) = store.record_photos_asset(
+                &local_id,
+                export.resource,
+                &hash,
+                &up.asset_id,
+                Some(&modified),
+            ) {
+                warn!(id = entry.id, error = %e, "Failed to record Photos asset");
+            }
+            if let Some(album) = library.album.as_deref() {
+                if let Err(e) = uploader.add_asset_to_album(album, &up.asset_id).await {
+                    warn!(id = entry.id, %album, error = %e, "Failed to add asset to album");
                 }
             }
+            if let Err(e) = store.mark_completed(entry.id, Some(&up.asset_id)) {
+                error!(id = entry.id, error = %e, "Failed to mark entry completed");
+            }
+        }
+        Err(e) => {
+            drop(cleanup);
+            fail_or_retry(&entry, store.as_ref(), config, &e.to_string()).await
         }
     }
 }
@@ -967,9 +1207,47 @@ mod tests {
         entries: Mutex<Vec<QueueEntry>>,
         uploaded: Mutex<HashMap<String, String>>,
         next_id: Mutex<i64>,
+        photos_assets: Mutex<Vec<(String, String, String)>>,
     }
 
     impl QueueStore for MockStore {
+        fn enqueue_photos(&self, local_id: &str) -> anyhow::Result<i64> {
+            let mut id_guard = self.next_id.lock().unwrap();
+            *id_guard += 1;
+            let id = *id_guard;
+            self.entries.lock().unwrap().push(QueueEntry {
+                id,
+                file_path: format!("photos:{local_id}"),
+                file_hash: None,
+                file_size: None,
+                folder_id: None,
+                status: "pending".to_string(),
+                retry_count: 0,
+                error_message: None,
+                queued_at: Utc::now(),
+                completed_at: None,
+                source: crate::upload::queue::QueueSource::Photos,
+                photos_local_id: Some(local_id.to_string()),
+            });
+            Ok(id)
+        }
+
+        fn record_photos_asset(
+            &self,
+            local_id: &str,
+            resource: &str,
+            _sha1: &str,
+            immich_asset_id: &str,
+            _modified_at: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.photos_assets.lock().unwrap().push((
+                local_id.to_string(),
+                resource.to_string(),
+                immich_asset_id.to_string(),
+            ));
+            Ok(())
+        }
+
         fn enqueue(&self, entry: NewQueueEntry) -> anyhow::Result<i64> {
             let mut id_guard = self.next_id.lock().unwrap();
             *id_guard += 1;
@@ -985,6 +1263,8 @@ mod tests {
                 error_message: None,
                 queued_at: Utc::now(),
                 completed_at: None,
+                source: crate::upload::queue::QueueSource::Folder,
+                photos_local_id: None,
             });
             Ok(id)
         }
@@ -1126,7 +1406,258 @@ mod tests {
         }
     }
 
+    /// Records what was uploaded and which album it went to.
+    #[derive(Default)]
+    struct RecordingUploader {
+        uploads: Mutex<Vec<(String, String)>>,
+        albums: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl AssetUploader for RecordingUploader {
+        async fn upload_asset(
+            &self,
+            file_path: &Path,
+            device_asset_id: &str,
+            _device_id: &str,
+            _created_at: DateTime<Utc>,
+            _modified_at: DateTime<Utc>,
+        ) -> anyhow::Result<UploadResult> {
+            assert!(file_path.exists(), "uploaded file must exist during upload");
+            let name = file_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            self.uploads
+                .lock()
+                .unwrap()
+                .push((name, device_asset_id.to_string()));
+            Ok(UploadResult {
+                asset_id: "imm-1".to_string(),
+                is_duplicate: false,
+            })
+        }
+
+        async fn check_duplicates(
+            &self,
+            _items: Vec<BulkCheckItem>,
+        ) -> anyhow::Result<Vec<BulkCheckResult>> {
+            Ok(Vec::new())
+        }
+
+        async fn add_asset_to_album(&self, album: &str, asset_id: &str) -> anyhow::Result<()> {
+            self.albums
+                .lock()
+                .unwrap()
+                .push((album.to_string(), asset_id.to_string()));
+            Ok(())
+        }
+    }
+
+    /// Exports a fixed outcome, writing a real temp file on success.
+    struct FakeExporter {
+        dir: std::path::PathBuf,
+        outcome: fn() -> Option<LibraryExportError>,
+        exported: Mutex<Vec<std::path::PathBuf>>,
+    }
+
+    impl LibraryExporter for FakeExporter {
+        fn export_original(&self, local_id: &str) -> Result<LibraryExport, LibraryExportError> {
+            if let Some(e) = (self.outcome)() {
+                return Err(e);
+            }
+            let sub = self.dir.join(local_id.replace('/', "_"));
+            std::fs::create_dir_all(&sub).unwrap();
+            let path = sub.join("IMG_0001.HEIC");
+            std::fs::write(&path, format!("original bytes of {local_id}")).unwrap();
+            self.exported.lock().unwrap().push(path.clone());
+            Ok(LibraryExport {
+                path,
+                resource: "photo",
+                created_at: Utc::now(),
+                modified_at: Utc::now(),
+            })
+        }
+    }
+
+    fn library_config(exporter: Arc<FakeExporter>) -> WorkerConfig {
+        WorkerConfig {
+            concurrency: 1,
+            max_retries: 3,
+            base_retry_delay: Duration::from_millis(1),
+            device_id: "immichsync-test".to_string(),
+            library: Some(Arc::new(LibrarySource {
+                exporter,
+                album: Some("immichsync test".to_string()),
+            })),
+        }
+    }
+
+    async fn run_one_photos_entry(
+        store: &Arc<MockStore>,
+        uploader: Arc<dyn AssetUploader>,
+        config: &WorkerConfig,
+        local_id: &str,
+    ) -> QueueEntry {
+        let id = store.enqueue_photos(local_id).unwrap();
+        let entry = store.dequeue_pending(1).unwrap().pop().unwrap();
+        process_item(entry, store.clone(), uploader, config).await;
+        let entries = store.entries.lock().unwrap();
+        entries.iter().find(|e| e.id == id).unwrap().clone()
+    }
+
     // ── Tests ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn photos_device_asset_id_is_stable_per_resource() {
+        assert_eq!(
+            photos_device_asset_id("ABC-1/L0/001", "photo"),
+            "photos-ABC-1/L0/001-photo"
+        );
+        assert_ne!(
+            photos_device_asset_id("A", "photo"),
+            photos_device_asset_id("A", "video")
+        );
+    }
+
+    #[tokio::test]
+    async fn photos_entry_exports_uploads_albums_and_deletes_the_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let exporter = Arc::new(FakeExporter {
+            dir: dir.path().to_path_buf(),
+            outcome: || None,
+            exported: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(MockStore::default());
+        let uploader = Arc::new(RecordingUploader::default());
+        let config = library_config(exporter.clone());
+
+        let done = run_one_photos_entry(&store, uploader.clone(), &config, "ABC/L0/001").await;
+
+        assert_eq!(done.status, "completed", "{:?}", done.error_message);
+        assert_eq!(
+            *uploader.uploads.lock().unwrap(),
+            vec![(
+                "IMG_0001.HEIC".to_string(),
+                "photos-ABC/L0/001-photo".to_string()
+            )]
+        );
+        assert_eq!(
+            *uploader.albums.lock().unwrap(),
+            vec![("immichsync test".to_string(), "imm-1".to_string())]
+        );
+        assert_eq!(
+            *store.photos_assets.lock().unwrap(),
+            vec![(
+                "ABC/L0/001".to_string(),
+                "photo".to_string(),
+                "imm-1".to_string()
+            )]
+        );
+        let exported = exporter.exported.lock().unwrap();
+        assert_eq!(exported.len(), 1);
+        assert!(!exported[0].exists(), "temp export must be deleted");
+        assert!(
+            !exported[0].parent().unwrap().exists(),
+            "per-export dir must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn photos_entry_already_uploaded_by_hash_is_not_uploaded_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let exporter = Arc::new(FakeExporter {
+            dir: dir.path().to_path_buf(),
+            outcome: || None,
+            exported: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(MockStore::default());
+        // Same bytes the fake exporter writes, already uploaded from a folder.
+        let probe = dir.path().join("probe");
+        std::fs::write(&probe, "original bytes of DUP").unwrap();
+        let hash = crate::upload::hasher::hash_file(&probe).unwrap();
+        store
+            .uploaded
+            .lock()
+            .unwrap()
+            .insert(hash, "folder-asset".to_string());
+        let uploader = Arc::new(RecordingUploader::default());
+
+        let done =
+            run_one_photos_entry(&store, uploader.clone(), &library_config(exporter), "DUP").await;
+
+        assert_eq!(done.status, "completed");
+        assert!(uploader.uploads.lock().unwrap().is_empty());
+    }
+
+    /// A failed upload backs off before retrying; the private export must
+    /// not sit in temp for that wait (the retry exports again anyway).
+    #[tokio::test]
+    async fn a_failed_photos_upload_deletes_the_export_before_backing_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let exporter = Arc::new(FakeExporter {
+            dir: dir.path().to_path_buf(),
+            outcome: || None,
+            exported: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(MockStore::default());
+        let mut config = library_config(exporter.clone());
+        // backoff_delay works in whole seconds, so the base must be >= 1 s.
+        config.base_retry_delay = Duration::from_secs(1);
+
+        store.enqueue_photos("RETRY").unwrap();
+        let entry = store.dequeue_pending(1).unwrap().pop().unwrap();
+        let task = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                process_item(entry, store, Arc::new(FailingUploader), &config).await;
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let path = exporter.exported.lock().unwrap()[0].clone();
+        assert!(!task.is_finished(), "still in the retry backoff");
+        assert!(!path.exists(), "export must be gone during the backoff");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn icloud_only_original_is_deferred_not_uploaded_or_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let exporter = Arc::new(FakeExporter {
+            dir: dir.path().to_path_buf(),
+            outcome: || Some(LibraryExportError::CloudOnly),
+            exported: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(MockStore::default());
+        let uploader = Arc::new(RecordingUploader::default());
+
+        let done =
+            run_one_photos_entry(&store, uploader.clone(), &library_config(exporter), "CLOUD")
+                .await;
+
+        assert_eq!(done.status, "failed");
+        assert_eq!(done.retry_count, 0, "a deferred entry is not retried");
+        assert!(done.error_message.unwrap().starts_with("deferred:"));
+        assert!(uploader.uploads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn photos_entry_without_a_library_source_fails_cleanly() {
+        let store = Arc::new(MockStore::default());
+        let uploader = Arc::new(RecordingUploader::default());
+        let config = WorkerConfig {
+            library: None,
+            base_retry_delay: Duration::from_millis(1),
+            ..WorkerConfig::default()
+        };
+
+        let done = run_one_photos_entry(&store, uploader.clone(), &config, "X").await;
+
+        assert_eq!(done.status, "failed");
+        assert!(uploader.uploads.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn backoff_delay_sequence() {
@@ -1182,6 +1713,7 @@ mod tests {
             max_retries: 3,
             base_retry_delay: Duration::from_millis(1),
             device_id: "immichsync-test".to_string(),
+            library: None,
         };
 
         process_item(entry, store.clone(), uploader, &config).await;
@@ -1221,6 +1753,7 @@ mod tests {
             max_retries: 3,
             base_retry_delay: Duration::from_millis(1),
             device_id: "immichsync-test".to_string(),
+            library: None,
         };
 
         process_item(entry, store.clone(), Arc::new(SucceedingUploader), &config).await;
@@ -1256,6 +1789,7 @@ mod tests {
             max_retries: 2,
             base_retry_delay: Duration::from_millis(1), // fast for tests
             device_id: "immichsync-test".to_string(),
+            library: None,
         };
 
         // Process until the entry is marked "failed".

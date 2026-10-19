@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use thiserror::Error;
 use tracing::{debug, info};
 
+pub use crate::db::QueueSource;
 use crate::upload::hasher;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
@@ -40,6 +41,29 @@ pub trait QueueStore: Send + Sync {
     /// Insert a new entry into the upload queue.
     /// Returns the row ID of the newly inserted entry.
     fn enqueue(&self, entry: NewQueueEntry) -> anyhow::Result<i64>;
+
+    /// Queue a Photos library asset by `localIdentifier` (ADR 0002). The
+    /// defaults below exist for the folder-only test mocks.
+    fn enqueue_photos(&self, _local_id: &str) -> anyhow::Result<i64> {
+        anyhow::bail!("this store has no Photos library support")
+    }
+
+    /// `true` if the asset is already queued or recorded.
+    fn photos_asset_seen(&self, _local_id: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Remember what one resource of a Photos asset became on the server.
+    fn record_photos_asset(
+        &self,
+        _local_id: &str,
+        _resource: &str,
+        _sha1: &str,
+        _immich_asset_id: &str,
+        _modified_at: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Return up to `limit` entries with status `"pending"`, ordered
     /// by insertion time (oldest first).
@@ -137,6 +161,11 @@ pub struct QueueEntry {
     pub queued_at: DateTime<Utc>,
     #[cfg_attr(not(test), allow(dead_code))]
     pub completed_at: Option<DateTime<Utc>>,
+
+    /// Folder file or Photos library asset.
+    pub source: QueueSource,
+    /// `PHAsset.localIdentifier` when `source == Photos`.
+    pub photos_local_id: Option<String>,
 }
 
 /// Aggregate counts across all queue entries.
@@ -343,6 +372,8 @@ mod tests {
                 error_message: None,
                 queued_at: Utc::now(),
                 completed_at: None,
+                source: crate::upload::queue::QueueSource::Folder,
+                photos_local_id: None,
             });
             Ok(id)
         }

@@ -40,7 +40,8 @@ IDENTITY="${MACOS_SIGN_IDENTITY:--}"
 if [ "$IDENTITY" = "-" ]; then
   codesign --force --sign - "$APP"
 else
-  codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
+  codesign --force --options runtime --timestamp \
+    --entitlements packaging/macos/ImmichSync.entitlements --sign "$IDENTITY" "$APP"
 fi
 codesign --verify --strict "$APP"
 

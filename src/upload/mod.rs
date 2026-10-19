@@ -81,6 +81,7 @@ impl UploadPipeline {
             max_retries: upload.max_retries,
             base_retry_delay: std::time::Duration::from_secs(1),
             device_id: server.device_id.clone(),
+            library: None,
         };
 
         let (pause_tx, _pause_rx) = watch::channel(false);
@@ -96,6 +97,16 @@ impl UploadPipeline {
             _pause_tx: pause_tx,
             worker_handle: None,
         }
+    }
+
+    /// Give the worker a Photos library source, so `source = photos` entries
+    /// can be exported and uploaded. Call before [`start`](Self::start).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn with_library(mut self, library: worker::LibrarySource) -> Self {
+        let worker = Arc::get_mut(&mut self.worker)
+            .expect("with_library is called before start(), while the worker is unshared");
+        worker.set_library(library);
+        self
     }
 
     /// Spawn the background worker loop.
@@ -245,6 +256,8 @@ mod tests {
                 error_message: None,
                 queued_at: Utc::now(),
                 completed_at: None,
+                source: crate::upload::queue::QueueSource::Folder,
+                photos_local_id: None,
             });
             Ok(id)
         }
