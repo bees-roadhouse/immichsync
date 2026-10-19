@@ -830,10 +830,17 @@ impl SettingsApp {
 
         let mut count = 0u32;
         let mut changed = 0u32;
+        let mut skipped_dirs = 0u32;
         for rec in &records {
             let clean = crate::db::strip_extended_prefix(&rec.file_path);
             let path = std::path::Path::new(clean);
             if !path.exists() {
+                continue;
+            }
+            // Never move or delete inside an app library, .Trashes and the
+            // like, even for files uploaded before the filter skipped them (#96).
+            if crate::watch::filter::in_skipped_dir(path) {
+                skipped_dirs += 1;
                 continue;
             }
             // Only act on the exact bytes Immich has.
@@ -873,6 +880,10 @@ impl SettingsApp {
             }
         }
 
+        if skipped_dirs > 0 {
+            info!(folder = %folder.path, skipped_dirs,
+                "Left files inside app libraries / housekeeping folders alone");
+        }
         if changed > 0 {
             info!(folder = %folder.path, changed,
                 "Skipped files that changed since upload");
