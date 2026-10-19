@@ -145,6 +145,12 @@ pub trait QueueStore: Send + Sync {
     /// Update the status (and optional error message) of a queue entry.
     fn update_status(&self, id: i64, status: &str, error: Option<&str>) -> anyhow::Result<()>;
 
+    /// Put an entry back to `pending` without counting a retry: the attempt
+    /// failed for a reason that isn't the entry's (a rejected API key).
+    fn requeue_without_retry(&self, id: i64) -> anyhow::Result<()> {
+        self.update_status(id, "pending", None)
+    }
+
     /// Mark a queue entry as completed and record the resulting asset ID.
     fn mark_completed(&self, id: i64, asset_id: Option<&str>) -> anyhow::Result<()>;
 

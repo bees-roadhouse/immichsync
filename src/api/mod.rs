@@ -1,5 +1,6 @@
 pub mod albums;
 pub mod assets;
+pub mod oauth;
 pub mod server;
 
 use reqwest::header::{HeaderMap, HeaderValue};

@@ -64,6 +64,7 @@ pub fn show_settings(config: Config, result_tx: Option<Sender<Config>>) {
         api_key: config.server.api_key.clone(),
         device_name: config.server.device_id.clone(),
         test_status: String::new(),
+        sign_in: Default::default(),
 
         // Upload tab
         concurrency: config.upload.concurrency,
@@ -176,6 +177,7 @@ struct SettingsApp {
     api_key: String,
     device_name: String,
     test_status: String,
+    sign_in: crate::ui::sign_in::SignIn,
 
     // Upload tab
     concurrency: u32,
@@ -317,6 +319,14 @@ impl SettingsApp {
             });
 
         ui.add_space(12.0);
+
+        let ctx = ui.ctx().clone();
+        if let Some(key) = self.sign_in.ui(ui, &ctx, &self.server_url) {
+            self.sign_in.status =
+                crate::ui::sign_in::persist_signed_in_key(&mut self.config, &self.server_url, &key);
+            self.api_key = key;
+        }
+        ui.add_space(8.0);
 
         ui.horizontal(|ui| {
             if ui.button("Test Connection").clicked() {
