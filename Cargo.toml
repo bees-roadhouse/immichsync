@@ -124,6 +124,10 @@ block2 = "0.6"
 objc2-photos = { version = "0.3", default-features = false, features = ["std", "block2", "PHAsset", "PHAssetResource", "PHAssetResourceManager", "PHError", "PHFetchOptions", "PHFetchResult", "PHObject", "PHPhotoLibrary", "PhotosTypes"] }
 # flock (single instance), signal (graceful SIGTERM/SIGINT)
 libc = "0.2"
+# Volume mount/unmount events (platform::volumes): DiskArbitration callbacks
+# on a CFRunLoop thread, reading the disk description dictionary
+objc2-disk-arbitration = { version = "0.3", default-features = false, features = ["std", "DADisk", "DASession"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFRunLoop", "CFString", "CFURL", "CFDictionary", "CFNumber", "CFUUID", "CFArray"] }
 
 # Temp files in tests
 [dev-dependencies]

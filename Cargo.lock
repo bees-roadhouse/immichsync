@@ -2401,6 +2401,8 @@ dependencies = [
  "notify-debouncer-full",
  "objc2 0.6.3",
  "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-disk-arbitration",
  "objc2-foundation 0.3.2",
  "objc2-photos",
  "objc2-service-management",
@@ -3231,6 +3233,15 @@ dependencies = [
  "objc2 0.5.2",
  "objc2-contacts",
  "objc2-foundation 0.2.2",
+]
+
+[[package]]
+name = "objc2-disk-arbitration"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee6933800935dccff2b811f1c5b804eb9b3d3347face044712188624bf547b45"
+dependencies = [
+ "objc2-core-foundation",
 ]
 
 [[package]]

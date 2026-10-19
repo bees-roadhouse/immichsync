@@ -16,3 +16,4 @@ pub mod photos;
 pub mod shutdown;
 pub mod single_instance;
 pub mod trash;
+pub mod volumes;
