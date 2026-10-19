@@ -36,6 +36,8 @@ jobs:
     name: Build and publish Windows binary
     runs-on: windows-latest
     timeout-minutes: 45
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
 
     steps:
       - name: Checkout
@@ -119,4 +121,42 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           generate_release_notes: true
           files: target/release/immichsync.exe
+          fail_on_unmatched_files: true
+
+  build-macos:
+    # Adds ImmichSync-<version>-macos-arm64.zip to the release the Windows
+    # job just created. Ad-hoc signed until the Developer ID exists: set the
+    # MACOS_SIGN_IDENTITY secret (and import the cert) to sign for real. See
+    # packaging/macos/make-app.sh and #63.
+    name: Build and publish macOS app
+    needs: build-and-release
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build-and-release.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+        env:
+          CARGO_TARGET_DIR: target
+
+      - name: Build ImmichSync.app
+        run: packaging/macos/make-app.sh target/macos
+        env:
+          CARGO_TARGET_DIR: target
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build-and-release.outputs.tag }}
+          files: target/macos/ImmichSync-*-macos-arm64.zip
           fail_on_unmatched_files: true

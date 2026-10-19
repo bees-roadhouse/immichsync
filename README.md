@@ -46,6 +46,14 @@ winget uninstall ImmichSync
 
 Uninstall removes the binary, shortcuts, autostart entry, and the Apps & Features registry block. **It preserves your settings and upload history** in `%APPDATA%\bees-roadhouse\immichsync\` and `%LOCALAPPDATA%\bees-roadhouse\immichsync\` so that a future reinstall picks up where you left off ... no first-run wizard, no re-upload of already-synced files.
 
+### macOS (preview)
+
+Apple Silicon, macOS 13 or newer. Releases carry `ImmichSync-<version>-macos-arm64.zip`. Unzip it and move `ImmichSync.app` to Applications. Until the Developer ID signing lands, the app is ad-hoc signed: the first time, right-click → **Open** to get past Gatekeeper. It runs as a menu-bar icon with no Dock icon. Settings, the upload queue and logs live in `~/Library/Application Support/bees-roadhouse/immichsync/`.
+
+Not yet on macOS: start at login, Keychain storage of the API key (it sits in a mode-0600 `config.toml` for now), notifications, and self-update. See [#57](https://github.com/bees-roadhouse/immichsync/issues/57).
+
+To build the bundle yourself: `packaging/macos/make-app.sh` (writes `target/macos/ImmichSync.app` and a zip).
+
 ### Building from Source
 
 **Prerequisites:**
