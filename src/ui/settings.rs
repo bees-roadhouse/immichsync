@@ -835,8 +835,8 @@ impl SettingsApp {
 
     /// Trash or delete files in `folder` that have already been uploaded.
     fn apply_post_upload_to_existing(&self, db: &Database, folder: &WatchedFolder) {
-        let paths = match db.get_uploaded_paths_in_folder(&folder.path) {
-            Ok(p) => p,
+        let records = match db.get_uploaded_in_folder(&folder.path) {
+            Ok(r) => r,
             Err(e) => {
                 tracing::warn!(folder = %folder.path, error = %e,
                     "Failed to query uploaded files for existing cleanup");
@@ -844,16 +844,31 @@ impl SettingsApp {
             }
         };
 
-        info!(folder = %folder.path, count = paths.len(),
+        info!(folder = %folder.path, count = records.len(),
             "Applying post-upload action to already-uploaded files");
 
         let mut count = 0u32;
-        for path_str in &paths {
-            // Strip the \\?\ extended-path prefix that the file watcher adds.
-            let clean = path_str.strip_prefix(r"\\?\").unwrap_or(path_str);
+        let mut changed = 0u32;
+        for rec in &records {
+            let clean = crate::db::strip_extended_prefix(&rec.file_path);
             let path = std::path::Path::new(clean);
             if !path.exists() {
                 continue;
+            }
+            // Only act on the exact bytes Immich has.
+            match crate::upload::worker::still_matches_upload(path, rec) {
+                Ok(true) => {}
+                Ok(false) => {
+                    changed += 1;
+                    tracing::warn!(file = %clean,
+                        "File changed since upload; leaving it in place");
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(file = %clean, error = %e,
+                        "Could not re-check file; leaving it in place");
+                    continue;
+                }
             }
 
             match folder.post_upload {
@@ -877,6 +892,10 @@ impl SettingsApp {
             }
         }
 
+        if changed > 0 {
+            info!(folder = %folder.path, changed,
+                "Skipped files that changed since upload");
+        }
         if count > 0 {
             let action = match folder.post_upload {
                 PostUpload::Trash => "trashed",
