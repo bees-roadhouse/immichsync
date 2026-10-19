@@ -671,10 +671,12 @@ fn trash_into_folder(file_path: &std::path::Path, folder_root: &str) -> anyhow::
         std::fs::create_dir_all(parent)?;
     }
 
-    // Try rename first (same volume), fall back to copy+delete.
-    if std::fs::rename(file_path, &dest).is_err() {
-        std::fs::copy(file_path, &dest)?;
-        std::fs::remove_file(file_path)?;
+    // Never replace an earlier trashed file with the same relative path (a
+    // camera reusing IMG_0001.JPG, #98): that copy is the user's safety net.
+    let landed = move_no_clobber(file_path, &dest)?;
+    if landed != dest {
+        debug!(from = %file_path.display(), to = %landed.display(),
+            "Trash name taken; kept both");
     }
 
     // Set the trash root directory as hidden (Windows).
@@ -696,6 +698,63 @@ fn trash_into_folder(file_path: &std::path::Path, folder_root: &str) -> anyhow::
     }
 
     Ok(())
+}
+
+/// Move `src` to `dest`, or to `name (1).ext`, `name (2).ext`, … if `dest`
+/// is taken. Returns where the file landed.
+///
+/// `std::fs::rename` and `copy` both silently replace an existing target, so
+/// each candidate is first claimed with `create_new` (atomic: fails if the
+/// name exists) and the move then lands on our own placeholder. Rename is
+/// tried first (same volume); otherwise the bytes are copied into the
+/// placeholder and `src` removed. On failure the placeholder is cleaned up.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn move_no_clobber(
+    src: &std::path::Path,
+    dest: &std::path::Path,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::ErrorKind;
+
+    let parent = dest.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = dest
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = dest
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+
+    for n in 0..10_000u32 {
+        let candidate = if n == 0 {
+            dest.to_path_buf()
+        } else {
+            parent.join(format!("{stem} ({n}){ext}"))
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+        let moved = std::fs::rename(src, &candidate).or_else(|_| {
+            std::fs::copy(src, &candidate)?;
+            std::fs::remove_file(src)
+        });
+        return match moved {
+            Ok(()) => Ok(candidate),
+            Err(e) => {
+                let _ = std::fs::remove_file(&candidate);
+                Err(e)
+            }
+        };
+    }
+    Err(std::io::Error::other(
+        "no free trash name after 10000 tries",
+    ))
 }
 
 /// True when the file at `path` is still the one that was uploaded: same size
@@ -798,6 +857,44 @@ fn walk_and_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── move_no_clobber (#98) ────────────────────────────────────────────────
+
+    #[test]
+    fn trashing_the_same_relative_path_twice_keeps_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let trash = dir.path().join(".immichsync-trash/DCIM/IMG_0001.JPG");
+        std::fs::create_dir_all(trash.parent().unwrap()).unwrap();
+
+        let first = dir.path().join("first.jpg");
+        std::fs::write(&first, b"first card").unwrap();
+        let a = move_no_clobber(&first, &trash).unwrap();
+
+        let second = dir.path().join("second.jpg");
+        std::fs::write(&second, b"second card").unwrap();
+        let b = move_no_clobber(&second, &trash).unwrap();
+
+        let third = dir.path().join("third.jpg");
+        std::fs::write(&third, b"third card").unwrap();
+        let c = move_no_clobber(&third, &trash).unwrap();
+
+        assert_eq!(a, trash);
+        assert_eq!(b.file_name().unwrap(), "IMG_0001 (1).JPG");
+        assert_eq!(c.file_name().unwrap(), "IMG_0001 (2).JPG");
+        assert_eq!(std::fs::read(&a).unwrap(), b"first card");
+        assert_eq!(std::fs::read(&b).unwrap(), b"second card");
+        assert_eq!(std::fs::read(&c).unwrap(), b"third card");
+        assert!(!first.exists() && !second.exists() && !third.exists());
+    }
+
+    #[test]
+    fn failed_move_leaves_no_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("x.jpg");
+        let missing = dir.path().join("does-not-exist.jpg");
+        assert!(move_no_clobber(&missing, &dest).is_err());
+        assert!(!dest.exists(), "placeholder must be cleaned up");
+    }
 
     // ── still_matches_upload (#95) ───────────────────────────────────────────
 
