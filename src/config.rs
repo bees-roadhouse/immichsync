@@ -97,6 +97,67 @@ pub struct ServerConfig {
     /// Device identifier sent with every upload request.
     /// Defaults to `immichsync-{hostname}`.
     pub device_id: String,
+
+    /// Set when `config.toml` holds a sealed key (`keychain:` / `enc:`) that
+    /// couldn't be opened this run: Keychain access denied or timed out,
+    /// DPAPI failure. `api_key` is then empty, and `save` writes the marker
+    /// back instead of `""`, so a Settings save can't orphan the stored key
+    /// (#114). Never serialized.
+    #[serde(skip)]
+    pub unreadable_key: Option<UnreadableKey>,
+}
+
+/// A stored API key that couldn't be opened, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableKey {
+    /// The value exactly as stored, e.g. `keychain:api-key`.
+    pub marker: String,
+    /// The secret store's error, for the log and the tray.
+    pub error: String,
+}
+
+/// Open a stored `api_key`: `(plaintext, None)` on success or when it isn't
+/// sealed; `("", Some(..))` when it is sealed and `open` fails.
+fn open_stored_key<E: std::fmt::Display>(
+    stored: &str,
+    is_sealed: impl Fn(&str) -> bool,
+    open: impl Fn(&str) -> Result<String, E>,
+) -> (String, Option<UnreadableKey>) {
+    if !is_sealed(stored) {
+        return (stored.to_string(), None);
+    }
+    match open(stored) {
+        Ok(plaintext) => (plaintext, None),
+        Err(e) => (
+            String::new(),
+            Some(UnreadableKey {
+                marker: stored.to_string(),
+                error: e.to_string(),
+            }),
+        ),
+    }
+}
+
+impl UnreadableKey {
+    /// What the tray, the notification and Settings say. Specific, because
+    /// to the user this otherwise looks exactly like a fresh install.
+    pub fn user_message(&self) -> &'static str {
+        if cfg!(target_os = "macos") {
+            "ImmichSync can't read its API key from the Keychain. Choose Retry Keychain \
+             Access in the menu bar (then Always Allow), or re-enter the key in Settings."
+        } else {
+            "ImmichSync can't decrypt its saved API key. Re-enter the key in Settings."
+        }
+    }
+}
+
+/// The `api_key` to write: an empty in-memory key over an unreadable stored
+/// one keeps the stored marker.
+fn key_to_persist(server: &ServerConfig) -> String {
+    match (&server.unreadable_key, server.api_key.is_empty()) {
+        (Some(u), true) => u.marker.clone(),
+        _ => server.api_key.clone(),
+    }
 }
 
 /// Environment variable that supplies the API key for this process only.
@@ -145,6 +206,7 @@ impl Default for ServerConfig {
             url: String::new(),
             api_key: String::new(),
             device_id: format!("immichsync-{hostname}"),
+            unreadable_key: None,
         }
     }
 }
@@ -542,19 +604,18 @@ impl Config {
             source: Box::new(source),
         })?;
 
-        // Decrypt API key if it was stored encrypted.
-        if crate::platform::encryption::is_encrypted(&config.server.api_key) {
-            match crate::platform::encryption::decrypt_api_key(&config.server.api_key) {
-                Ok(plaintext) => {
-                    config.server.api_key = plaintext;
-                    debug!("API key decrypted");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to decrypt API key; clearing it");
-                    config.server.api_key.clear();
-                }
-            }
+        // Open the API key if it was stored sealed. A failure keeps the
+        // marker in `unreadable_key` rather than forgetting it (#114).
+        let (key, unreadable) = open_stored_key(
+            &config.server.api_key,
+            crate::platform::encryption::is_encrypted,
+            crate::platform::encryption::decrypt_api_key,
+        );
+        config.server.api_key = key;
+        if let Some(ref u) = unreadable {
+            tracing::warn!(error = %u.error, "Could not open the stored API key; running without uploads");
         }
+        config.server.unreadable_key = unreadable;
 
         debug!(path = %path.display(), "Loaded config from disk");
         Ok(config)
@@ -566,11 +627,16 @@ impl Config {
     /// This ensures a partial write never corrupts the live file.
     /// The API key is encrypted before writing if it's not empty.
     pub fn save(&self) -> Result<(), ConfigError> {
-        let path = Self::config_path()?;
+        self.save_to(&Self::config_path()?)
+    }
+
+    fn save_to(&self, path: &std::path::Path) -> Result<(), ConfigError> {
+        let path = path.to_path_buf();
         let tmp_path = path.with_extension("toml.tmp");
 
         // Clone and encrypt the API key before serializing.
         let mut config_to_save = self.clone();
+        config_to_save.server.api_key = key_to_persist(&self.server);
 
         // A key supplied through API_KEY_ENV is never persisted: keep
         // whatever the file already held instead.
@@ -626,6 +692,90 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sealed(v: &str) -> bool {
+        v.starts_with("keychain:")
+    }
+
+    #[test]
+    fn an_unreadable_sealed_key_is_kept_not_forgotten() {
+        let (key, u) = open_stored_key("keychain:api-key", sealed, |_| {
+            Err::<String, _>("Unable to obtain authorization for this operation.")
+        });
+        assert_eq!(key, "");
+        let u = u.expect("failure recorded");
+        assert_eq!(u.marker, "keychain:api-key");
+        assert!(u.error.contains("authorization"));
+    }
+
+    #[test]
+    fn readable_and_plain_keys_open_normally() {
+        let (key, u) = open_stored_key("keychain:api-key", sealed, |_| Ok::<_, String>("k".into()));
+        assert_eq!((key.as_str(), u), ("k", None));
+        let (key, u) = open_stored_key("plain", sealed, |_| Err::<String, _>("unused"));
+        assert_eq!((key.as_str(), u), ("plain", None));
+    }
+
+    #[test]
+    fn saving_with_an_unreadable_key_writes_the_marker_back() {
+        let mut server = ServerConfig {
+            unreadable_key: Some(UnreadableKey {
+                marker: "keychain:api-key".into(),
+                error: "denied".into(),
+            }),
+            ..ServerConfig::default()
+        };
+        assert_eq!(key_to_persist(&server), "keychain:api-key");
+
+        // A key typed into Settings in that state replaces it.
+        server.api_key = "new-key".into();
+        assert_eq!(key_to_persist(&server), "new-key");
+
+        // No unreadable key: an empty key stays empty.
+        let server = ServerConfig::default();
+        assert_eq!(key_to_persist(&server), "");
+    }
+
+    #[test]
+    fn unreadable_key_round_trip_through_save_keeps_the_marker_in_toml() {
+        let mut cfg = Config::default();
+        cfg.server.url = "https://photos.example".into();
+        cfg.server.unreadable_key = Some(UnreadableKey {
+            marker: "keychain:api-key".into(),
+            error: "denied".into(),
+        });
+        let mut out = cfg.clone();
+        out.server.api_key = key_to_persist(&cfg.server);
+        let text = toml::to_string_pretty(&out).unwrap();
+        assert!(text.contains(r#"api_key = "keychain:api-key""#), "{text}");
+        assert!(!text.contains("unreadable_key"), "{text}");
+    }
+
+    /// End to end through the real load and save: an `enc:` value that
+    /// can't be opened (on macOS it is refused outright, on Windows DPAPI
+    /// rejects the bogus blob; neither touches a prompt) survives a save of
+    /// an otherwise-edited config.
+    #[test]
+    fn a_settings_save_after_a_failed_key_read_keeps_the_stored_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(
+            &path,
+            "[server]\nurl = \"https://photos.example\"\napi_key = \"enc:AAAA\"\n",
+        )
+        .unwrap();
+
+        let mut cfg = Config::load_from_disk(&path).unwrap();
+        assert_eq!(cfg.server.api_key, "");
+        assert!(cfg.server.unreadable_key.is_some());
+
+        cfg.server.device_id = "edited-in-settings".into();
+        cfg.save_to(&path).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#"api_key = "enc:AAAA""#), "{text}");
+        assert!(text.contains("edited-in-settings"), "{text}");
+    }
 
     #[test]
     fn default_config_has_expected_values() {

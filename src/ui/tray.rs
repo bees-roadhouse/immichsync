@@ -59,6 +59,8 @@ pub enum TrayAction {
     CheckForUpdates,
     OpenUpdateDialog,
     RestartToUpdate,
+    /// Re-read the stored API key after a denied Keychain prompt (#114).
+    RetryKeychain,
     Quit,
 }
 
@@ -89,6 +91,7 @@ const ID_VIEW_TRASH: &str = "view_trash";
 const ID_CHECK_UPDATES: &str = "check_updates";
 const ID_UPDATE_AVAILABLE: &str = "update_available";
 const ID_RESTART_TO_UPDATE: &str = "restart_to_update";
+const ID_RETRY_KEYCHAIN: &str = "retry_keychain";
 const ID_QUIT: &str = "quit";
 
 // ---------------------------------------------------------------------------
@@ -310,6 +313,9 @@ pub struct TrayApp {
     check_updates_item: MenuItem,
     update_available_item: MenuItem,
     restart_to_update_item: MenuItem,
+    /// Enabled only while the stored API key can't be read. macOS only: on
+    /// Windows a DPAPI failure doesn't get better by retrying.
+    retry_keychain_item: MenuItem,
 
     /// Sender half of the action channel. Cloned into the menu-event handler
     /// at construction. Held so `action_sender()` can hand out additional
@@ -354,6 +360,8 @@ impl TrayApp {
             MenuItem::with_id(ID_UPDATE_AVAILABLE, "Update Available!", false, None);
         let restart_to_update_item =
             MenuItem::with_id(ID_RESTART_TO_UPDATE, "Restart to Update", false, None);
+        let retry_keychain_item =
+            MenuItem::with_id(ID_RETRY_KEYCHAIN, "Retry Keychain Access", false, None);
         let quit_item = MenuItem::with_id(ID_QUIT, "Quit", true, None);
 
         // ---- Assemble context menu ----
@@ -392,6 +400,9 @@ impl TrayApp {
         menu.append(&update_available_item)
             .map_err(|e| TrayError::Build(e.to_string()))?;
         menu.append(&restart_to_update_item)
+            .map_err(|e| TrayError::Build(e.to_string()))?;
+        #[cfg(target_os = "macos")]
+        menu.append(&retry_keychain_item)
             .map_err(|e| TrayError::Build(e.to_string()))?;
         menu.append(&PredefinedMenuItem::separator())
             .map_err(|e| TrayError::Build(e.to_string()))?;
@@ -436,6 +447,7 @@ impl TrayApp {
                         ID_CHECK_UPDATES => Some(TrayAction::CheckForUpdates),
                         ID_UPDATE_AVAILABLE => Some(TrayAction::OpenUpdateDialog),
                         ID_RESTART_TO_UPDATE => Some(TrayAction::RestartToUpdate),
+                        ID_RETRY_KEYCHAIN => Some(TrayAction::RetryKeychain),
                         ID_QUIT => Some(TrayAction::Quit),
                         _ => None,
                     };
@@ -465,6 +477,7 @@ impl TrayApp {
             check_updates_item,
             update_available_item,
             restart_to_update_item,
+            retry_keychain_item,
             action_tx,
         };
 
@@ -610,6 +623,11 @@ impl TrayApp {
                 self.restart_to_update_item.set_enabled(false);
             }
         }
+    }
+
+    /// Show the API key as unreadable: enables Retry Keychain Access.
+    pub fn set_key_unreadable(&mut self, unreadable: bool) {
+        self.retry_keychain_item.set_enabled(unreadable);
     }
 
     /// Return a clone of the action sender, useful for injecting actions
