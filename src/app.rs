@@ -404,16 +404,7 @@ impl App {
                         continue;
                     }
                     let is_network = folder.watch_mode == crate::db::WatchMode::Poll;
-                    let includes = crate::watch::filter::parse_patterns_json(
-                        folder.include_patterns.as_deref(),
-                    );
-                    let excludes = crate::watch::filter::parse_patterns_json(
-                        folder.exclude_patterns.as_deref(),
-                    );
-                    let filter = FileFilter::new()
-                        .with_include_patterns(includes)
-                        .with_exclude_patterns(excludes)
-                        .with_ignore_online_files(folder.ignore_online_files);
+                    let filter = FileFilter::for_folder(folder);
                     let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
                     if let Err(e) =
                         engine.add_folder(path, filter, is_network, self.runtime.handle().clone())
@@ -495,7 +486,11 @@ impl App {
                 spawn_window_subprocess("settings", flag, Some(tx));
             }
             TrayAction::UploadNow => {
-                info!("Upload Now requested");
+                // Re-run the scan of every watched folder (the same restart
+                // the folder reconcile does), so anything the watcher missed
+                // is queued now (#100).
+                info!("Upload Now requested: rescanning watched folders");
+                self.restart_watch_engine();
             }
             TrayAction::About => {
                 if self.window_open.about.swap(true, Ordering::SeqCst) {
@@ -820,12 +815,18 @@ impl App {
             "Folder reconcile: drift detected, restarting watch engine to converge"
         );
 
+        self.restart_watch_engine();
+    }
+
+    /// Stop every watcher and start the engine again, which re-runs the
+    /// initial scan. Used by the folder reconcile and by Upload Now.
+    fn restart_watch_engine(&mut self) {
         if let Some(ref mut engine) = self.watch_engine {
             engine.stop_all();
         }
         self.watch_engine = None;
         if let Err(e) = self.start_watch_engine() {
-            warn!(error = %e, "Folder reconcile: restart_watch_engine failed");
+            warn!(error = %e, "restart_watch_engine failed");
         }
     }
 
@@ -1125,22 +1126,19 @@ async fn initial_scan(
     let store2 = store.clone();
     let folder_map2 = folder_map.clone();
 
-    // Capture per-folder `ignore_online_files` flags so the scan filter
-    // matches the live watcher's behavior. Read once up front so we don't
-    // hold the DB mutex while walking the trees.
-    let folder_ignore_online: std::collections::HashMap<i64, bool> = {
-        let store_ref = store.clone();
+    // Build each folder's filter the same way the live watcher does
+    // (patterns + online-files flag, #97). Read up front so we don't hold
+    // the DB mutex while walking the trees.
+    let folder_filters: std::collections::HashMap<i64, FileFilter> = {
         let mut map = std::collections::HashMap::new();
         for &id in folder_map.values() {
-            match store_ref.get_folder(id) {
-                Ok(Some(f)) => {
-                    map.insert(id, f.ignore_online_files);
-                }
-                _ => {
-                    // Default ON if we can't read it ... safe choice.
-                    map.insert(id, true);
-                }
-            }
+            let filter = match store.get_folder(id) {
+                Ok(Some(f)) => FileFilter::for_folder(&f),
+                // Unreadable row: the defaults (online files skipped) are the
+                // safe choice.
+                _ => FileFilter::new(),
+            };
+            map.insert(id, filter);
         }
         map
     };
@@ -1154,8 +1152,10 @@ async fn initial_scan(
 
         for (folder_path, &folder_id) in folder_map2.as_ref() {
             info!(path = %folder_path.display(), "Initial scan: scanning folder");
-            let ignore_online = folder_ignore_online.get(&folder_id).copied().unwrap_or(true);
-            let filter = FileFilter::new().with_ignore_online_files(ignore_online);
+            let filter = folder_filters
+                .get(&folder_id)
+                .cloned()
+                .unwrap_or_else(FileFilter::new);
             let mut dirs = vec![folder_path.clone()];
 
             while let Some(dir) = dirs.pop() {

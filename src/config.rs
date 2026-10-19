@@ -406,6 +406,19 @@ impl Config {
         Ok(Self::config_dir()?.join("config.toml"))
     }
 
+    /// Advanced → Log Level straight from `config.toml`, without the rest of
+    /// [`Config::load`] (no key decryption, so no Keychain access before
+    /// logging exists). `None` if there is no file or no setting.
+    pub fn configured_log_level() -> Option<String> {
+        let text = fs::read_to_string(Self::config_path().ok()?).ok()?;
+        let value: toml::Value = toml::from_str(&text).ok()?;
+        value
+            .get("advanced")?
+            .get("log_level")?
+            .as_str()
+            .map(str::to_string)
+    }
+
     /// Load configuration from disk.
     ///
     /// Returns `Config::default()` if the file does not yet exist (first run).
