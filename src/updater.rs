@@ -579,6 +579,40 @@ pub fn cleanup_old_bundle() {
     }
 }
 
+/// The version now on disk if it differs from the running one: an update
+/// applied with its restart deferred (#127). Windows reads `version.txt`
+/// beside the exe (`apply_update` writes it); macOS reads the running
+/// bundle's CFBundleShortVersionString (the swap replaced it).
+pub fn pending_restart_version() -> Option<String> {
+    newer_on_disk(version_on_disk().as_deref(), env!("CARGO_PKG_VERSION"))
+}
+
+fn newer_on_disk(on_disk: Option<&str>, running: &str) -> Option<String> {
+    let on_disk = on_disk?.trim();
+    let disk = semver::Version::parse(on_disk).ok()?;
+    let running = semver::Version::parse(running).ok()?;
+    (disk > running).then(|| disk.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn version_on_disk() -> Option<String> {
+    let bundle = crate::platform::bundle_update::running_bundle().ok()?;
+    let out = std::process::Command::new("/usr/bin/plutil")
+        .args(["-extract", "CFBundleShortVersionString", "raw", "-o", "-"])
+        .arg(bundle.join("Contents/Info.plist"))
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn version_on_disk() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    std::fs::read_to_string(exe.parent()?.join("version.txt")).ok()
+}
+
 // ─── Background download + apply ─────────────────────────────────────────────
 
 /// Download and apply an update without any UI.
@@ -781,6 +815,18 @@ mod tests {
         let old: GitHubAsset =
             serde_json::from_str(r#"{"name":"x","browser_download_url":"u","size":1}"#).unwrap();
         assert_eq!(old.digest, None);
+    }
+
+    #[test]
+    fn a_newer_version_on_disk_means_a_restart_is_pending() {
+        assert_eq!(
+            newer_on_disk(Some("0.3.1\n"), "0.3.0"),
+            Some("0.3.1".into())
+        );
+        assert_eq!(newer_on_disk(Some("0.3.0"), "0.3.0"), None);
+        assert_eq!(newer_on_disk(Some("0.2.9"), "0.3.0"), None);
+        assert_eq!(newer_on_disk(Some("garbage"), "0.3.0"), None);
+        assert_eq!(newer_on_disk(None, "0.3.0"), None);
     }
 
     #[test]
