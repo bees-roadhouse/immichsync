@@ -112,6 +112,8 @@ winrt-notification = "0.5"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSDate", "NSError", "NSRunLoop", "NSString", "NSUUID"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder", "NSRunningApplication"] }
+# Login item: SMAppService.mainApp (bundled builds)
+objc2-service-management = { version = "0.3", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
 # API key in the login Keychain (already in the tree via native-tls)
 security-framework = "3"
 # Notification Center (bundled builds only)
