@@ -1,49 +1,75 @@
 name: Release
 
-# Two ways to publish a release:
+# Publish a release by pushing a `vX.Y.Z` tag on `main`:
 #
-# 1. Push to `release` (the canonical flow). The author has bumped
-#    Cargo.toml in their PR per the Change Lifecycle "Rule 2: author
-#    bumps version in same change". This workflow reads Cargo.toml,
-#    creates a v{version} tag (if it doesn't already exist), builds the
-#    Windows binary, and attaches it to a GitHub Release with that tag.
+#   1. Bump `version` in Cargo.toml in a PR and merge it (the version lives
+#      only there; the zip name and the updater both read it).
+#   2. Tag the merge commit on main and push the tag:
+#        git tag -a v0.3.0 -m "Release v0.3.0" && git push origin v0.3.0
 #
-# 2. Push tag `v*.*.*` (manual or back-compat path). Builds the binary
-#    and attaches to a GitHub Release matching the tag. Verifies the tag
-#    matches Cargo.toml at the tagged commit so a stale tag can't ship a
-#    mismatched binary.
+# `verify` refuses a tag that doesn't match Cargo.toml or whose commit isn't
+# on main. Both platforms build before anything is published, so a failed
+# macOS build can't leave a release with only the Windows exe on it.
 #
-# Both paths converge on the same softprops/action-gh-release step. The
-# release-branch path is idempotent: re-running on a push to release
-# whose Cargo.toml version already has a tag will skip tag creation but
-# still ensure the GitHub Release exists with the binary attached.
+# The retired `release` branch trigger (and its tag-creating path) went with
+# the single-main migration (Branching Strategy, 2026-07-05; #122).
 
 on:
   push:
-    branches: [release]
     tags:
       - "v*.*.*"
 
+# Read-only by default: cargo build scripts and dependencies run in the
+# build jobs, so only `publish` gets a write token, and no checkout keeps
+# its token in .git/config.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  build-and-release:
-    name: Build and publish Windows binary
-    runs-on: windows-latest
-    timeout-minutes: 45
+  verify:
+    name: Verify tag
+    runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.version.outputs.tag }}
-
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Tag matches Cargo.toml and is on main
+        id: version
+        shell: bash
+        run: |
+          manifest="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "immichsync") | .version')"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$tag" != "$manifest" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest"
+            exit 1
+          fi
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag $GITHUB_REF_NAME ($GITHUB_SHA) is not on main"
+            exit 1
+          fi
+          echo "version=$manifest" >> "$GITHUB_OUTPUT"
+          echo "Releasing $manifest from $GITHUB_SHA"
+
+  build-windows:
+    name: Build Windows exe
+    needs: verify
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -55,89 +81,29 @@ jobs:
         env:
           CARGO_TARGET_DIR: target
 
-      # Resolve which version to publish. Tag-triggered runs use the tag.
-      # Branch-triggered runs use Cargo.toml.
-      - name: Resolve version
-        id: version
-        shell: pwsh
-        run: |
-          $manifestVersion = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          if ("${{ github.ref_type }}" -eq "tag") {
-            $tagVersion = "${{ github.ref_name }}".TrimStart("v")
-            if ($tagVersion -ne $manifestVersion) {
-              Write-Error "Tag $tagVersion does not match Cargo.toml version $manifestVersion"
-              exit 1
-            }
-            $version = $tagVersion
-            $tag = "${{ github.ref_name }}"
-            $needsTag = "false"
-          } else {
-            $version = $manifestVersion
-            $tag = "v$version"
-            # Will be checked below.
-            $needsTag = "unknown"
-          }
-          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "tag=$tag"         | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "needs_tag=$needsTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Write-Host "Resolved version $version (tag $tag)"
-
-      # Branch-triggered runs only: check if the tag already exists.
-      - name: Check existing tag
-        if: github.ref_type == 'branch'
-        id: tag_check
-        shell: pwsh
-        run: |
-          git fetch --tags
-          $tag = "${{ steps.version.outputs.tag }}"
-          $exists = (git tag --list $tag) -ne $null -and (git tag --list $tag).Length -gt 0
-          if ($exists) {
-            Write-Host "Tag $tag already exists; skipping tag creation."
-            "needs_tag=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          } else {
-            Write-Host "Tag $tag will be created."
-            "needs_tag=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          }
-
-      - name: Create and push tag
-        if: github.ref_type == 'branch' && steps.tag_check.outputs.needs_tag == 'true'
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          TAG="${{ steps.version.outputs.tag }}"
-          git tag -a "$TAG" -m "Release $TAG"
-          git push origin "$TAG"
-
       - name: Build release binary
         run: cargo build --release --locked
         env:
           CARGO_TARGET_DIR: target
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          name: ImmichSync ${{ steps.version.outputs.tag }}
-          tag_name: ${{ steps.version.outputs.tag }}
-          generate_release_notes: true
-          files: target/release/immichsync.exe
-          fail_on_unmatched_files: true
+          name: windows
+          path: target/release/immichsync.exe
+          if-no-files-found: error
 
   build-macos:
-    # Adds ImmichSync-<version>-macos-arm64.zip to the release the Windows
-    # job just created. Ad-hoc signed until the Developer ID exists: set the
-    # MACOS_SIGN_IDENTITY secret (and import the cert) to sign for real. See
-    # packaging/macos/make-app.sh and #63.
-    name: Build and publish macOS app
-    needs: build-and-release
+    # Ad-hoc signed (make-app.sh's default). Developer ID signing and
+    # notarization are #93; nothing here signs for real yet.
+    name: Build macOS app
+    needs: verify
     runs-on: macos-15
     timeout-minutes: 45
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.build-and-release.outputs.tag }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -154,9 +120,34 @@ jobs:
         env:
           CARGO_TARGET_DIR: target
 
-      - name: Attach to GitHub Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: target/macos/ImmichSync-${{ needs.verify.outputs.version }}-macos-arm64.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [verify, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.build-and-release.outputs.tag }}
-          files: target/macos/ImmichSync-*-macos-arm64.zip
+          name: ImmichSync ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          # v0.3.0-rc1 and the like go to the prerelease channel only, so
+          # installs on "latest" never pick them up.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/immichsync.exe
+            dist/ImmichSync-${{ needs.verify.outputs.version }}-macos-arm64.zip
           fail_on_unmatched_files: true
