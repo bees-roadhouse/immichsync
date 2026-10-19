@@ -40,6 +40,7 @@ egui = "0.29"
 
 # Hashing
 sha1 = "0.10"
+sha2 = "0.10"
 
 # EXIF parsing
 kamadak-exif = "0.5"

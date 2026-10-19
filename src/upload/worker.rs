@@ -1040,8 +1040,14 @@ pub(crate) async fn place_in_albums(
     uploader: &dyn AssetUploader,
 ) {
     let policy = &library.albums;
-    if policy.mirror && !albums.is_empty() {
-        let _serial = library.album_lock.lock().await;
+    let mirror = policy.mirror && !albums.is_empty();
+    if !mirror && policy.all_in.is_none() {
+        return;
+    }
+    // Both kinds can create an album on first need (the catch-all by name),
+    // so both run under the lock.
+    let _serial = library.album_lock.lock().await;
+    if mirror {
         for album in albums {
             if let Err(e) = place_in_mirror(asset_id, album, store, uploader).await {
                 warn!(album = %album.title, error = %e, "Failed to add asset to mirrored album");
@@ -1887,6 +1893,8 @@ mod tests {
         by_name: Mutex<Vec<(String, String)>>,
         gone: Mutex<std::collections::HashSet<String>>,
         create_delay: Duration,
+        /// Catch-all albums made by name (get-or-create, like the client).
+        by_name_created: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -1913,6 +1921,18 @@ mod tests {
         }
 
         async fn add_asset_to_album(&self, album: &str, asset_id: &str) -> anyhow::Result<()> {
+            // Get-or-create by name, with the same check-then-create gap the
+            // real client has.
+            let exists = self
+                .by_name_created
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|n| n == album);
+            if !exists {
+                tokio::time::sleep(self.create_delay).await;
+                self.by_name_created.lock().unwrap().push(album.to_string());
+            }
             self.by_name
                 .lock()
                 .unwrap()
@@ -2250,6 +2270,29 @@ mod tests {
         b.await.unwrap();
         assert_eq!(server.created.lock().unwrap().len(), 1);
         assert_eq!(server.added.lock().unwrap().len(), 2);
+    }
+
+    /// The catch-all album is found-or-created by name; two workers placing
+    /// at once must not create it twice (Pia's review on #132).
+    #[tokio::test]
+    async fn concurrent_placements_create_the_catch_all_once() {
+        let store = Arc::new(MockStore::default());
+        let server = Arc::new(AlbumServer {
+            create_delay: Duration::from_millis(50),
+            ..AlbumServer::default()
+        });
+        let lib = Arc::new(source(false, Some("Everything")));
+        let run = |asset: &'static str| {
+            let (store, server, lib) = (store.clone(), server.clone(), lib.clone());
+            tokio::spawn(async move {
+                place_in_albums(asset, &[], &lib, store.as_ref(), server.as_ref()).await
+            })
+        };
+        let (a, b) = (run("imm-1"), run("imm-2"));
+        a.await.unwrap();
+        b.await.unwrap();
+        assert_eq!(server.by_name_created.lock().unwrap().len(), 1);
+        assert_eq!(server.by_name.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

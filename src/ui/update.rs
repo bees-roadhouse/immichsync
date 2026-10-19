@@ -232,6 +232,7 @@ impl UpdateApp {
         self.state = DialogState::Downloading;
 
         let url = self.info.download_url.clone();
+        let digest = self.info.digest.clone();
         let new_version = self.info.new_version.clone();
         let progress = self.progress.clone();
         let error_msg = self.error_msg.clone();
@@ -248,7 +249,7 @@ impl UpdateApp {
                 }
             };
 
-            match updater::download_update_blocking(&url, progress_fn) {
+            match updater::download_update_blocking(&url, digest.as_deref(), progress_fn) {
                 Ok(path) => {
                     // Apply the update.
                     match updater::apply_update(&path, &new_version) {
