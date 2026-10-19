@@ -503,13 +503,9 @@ impl SettingsApp {
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
-                ui.label("Poll Interval (secs):");
-                let mut poll_i32 = self.poll_interval as i32;
-                ui.add(egui::DragValue::new(&mut poll_i32).range(5..=300));
-                self.poll_interval = poll_i32.max(5) as u64;
-                ui.end_row();
-
-                ui.label("Log Level:");
+                ui.label("Log Level:").on_hover_text(
+                    "Applies the next time ImmichSync starts. RUST_LOG overrides it.",
+                );
                 egui::ComboBox::from_id_salt("log_level")
                     .selected_text(&self.log_level)
                     .show_ui(ui, |ui| {
@@ -518,12 +514,6 @@ impl SettingsApp {
                         }
                     });
                 ui.end_row();
-
-                ui.label("Write Settle (ms):");
-                let mut settle_i32 = self.write_settle_ms as i32;
-                ui.add(egui::DragValue::new(&mut settle_i32).range(500..=10_000));
-                self.write_settle_ms = settle_i32.max(500) as u64;
-                ui.end_row();
             });
 
         ui.add_space(12.0);
@@ -531,7 +521,6 @@ impl SettingsApp {
         ui.add_space(8.0);
 
         ui.checkbox(&mut self.autostart, crate::platform::AUTOSTART_LABEL);
-        ui.checkbox(&mut self.minimize_to_tray, "Minimize to system tray");
         ui.checkbox(&mut self.show_notifications, "Show notifications");
         ui.checkbox(
             &mut self.check_for_updates,
@@ -839,8 +828,8 @@ impl SettingsApp {
 
     /// Trash or delete files in `folder` that have already been uploaded.
     fn apply_post_upload_to_existing(&self, db: &Database, folder: &WatchedFolder) {
-        let paths = match db.get_uploaded_paths_in_folder(&folder.path) {
-            Ok(p) => p,
+        let records = match db.get_uploaded_in_folder(&folder.path) {
+            Ok(r) => r,
             Err(e) => {
                 tracing::warn!(folder = %folder.path, error = %e,
                     "Failed to query uploaded files for existing cleanup");
@@ -848,16 +837,31 @@ impl SettingsApp {
             }
         };
 
-        info!(folder = %folder.path, count = paths.len(),
+        info!(folder = %folder.path, count = records.len(),
             "Applying post-upload action to already-uploaded files");
 
         let mut count = 0u32;
-        for path_str in &paths {
-            // Strip the \\?\ extended-path prefix that the file watcher adds.
-            let clean = path_str.strip_prefix(r"\\?\").unwrap_or(path_str);
+        let mut changed = 0u32;
+        for rec in &records {
+            let clean = crate::db::strip_extended_prefix(&rec.file_path);
             let path = std::path::Path::new(clean);
             if !path.exists() {
                 continue;
+            }
+            // Only act on the exact bytes Immich has.
+            match crate::upload::worker::still_matches_upload(path, rec) {
+                Ok(true) => {}
+                Ok(false) => {
+                    changed += 1;
+                    tracing::warn!(file = %clean,
+                        "File changed since upload; leaving it in place");
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(file = %clean, error = %e,
+                        "Could not re-check file; leaving it in place");
+                    continue;
+                }
             }
 
             match folder.post_upload {
@@ -881,6 +885,10 @@ impl SettingsApp {
             }
         }
 
+        if changed > 0 {
+            info!(folder = %folder.path, changed,
+                "Skipped files that changed since upload");
+        }
         if count > 0 {
             let action = match folder.post_upload {
                 PostUpload::Trash => "trashed",

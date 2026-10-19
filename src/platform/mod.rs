@@ -31,6 +31,7 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{
     autostart, encryption, event_loop, install, known_folders, notify, shutdown, single_instance,
+    trash,
 };
 
 /// Application User Model ID for toast notifications and Start Menu shortcuts.
