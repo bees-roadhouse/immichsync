@@ -30,7 +30,7 @@ pub mod uninstall;
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{
-    autostart, encryption, event_loop, install, known_folders, notify, photos, shutdown,
+    autostart, encryption, event_loop, install, known_folders, notify, packages, photos, shutdown,
     single_instance, trash,
 };
 

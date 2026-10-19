@@ -261,6 +261,9 @@ pub struct QueueStats {
 
 // ─── Database ────────────────────────────────────────────────────────────────
 
+/// One schema migration step (see [`Database::run_migrations`]).
+type Migration = fn(&Database) -> Result<(), DbError>;
+
 /// Wraps a `rusqlite::Connection` and provides typed CRUD methods.
 pub struct Database {
     conn: Connection,
@@ -334,7 +337,7 @@ impl Database {
         let current_version = self.get_schema_version()?;
         debug!(current_version, "Running schema migrations");
 
-        let steps: [(u32, fn(&Self) -> Result<(), DbError>); 4] = [
+        let steps: [(u32, Migration); 4] = [
             (1, Self::migrate_v1),
             (2, Self::migrate_v2),
             (3, Self::migrate_v3),
@@ -354,11 +357,7 @@ impl Database {
     /// the app killed during start) leaves the previous version intact and
     /// is simply run again next start, instead of leaving a half-applied
     /// schema that fails forever on "duplicate column".
-    fn apply_migration(
-        &self,
-        version: u32,
-        migrate: fn(&Self) -> Result<(), DbError>,
-    ) -> Result<(), DbError> {
+    fn apply_migration(&self, version: u32, migrate: Migration) -> Result<(), DbError> {
         let tx = self.conn.unchecked_transaction()?;
         migrate(self)?;
         self.set_schema_version(version)?;

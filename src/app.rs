@@ -1180,11 +1180,10 @@ async fn initial_scan(
 
                     let path = entry.path();
 
-                    // Recurse into subdirectories, skipping trash.
+                    // Recurse into subdirectories, except trash, volume
+                    // housekeeping and packages (#96).
                     if path.is_dir() {
-                        if path.file_name().is_some_and(|n| {
-                            n == crate::upload::worker::TRASH_DIR_NAME
-                        }) {
+                        if crate::watch::filter::is_skipped_dir(&path) {
                             continue;
                         }
                         dirs.push(path);
