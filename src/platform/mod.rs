@@ -41,6 +41,13 @@ pub use macos::{
 #[cfg(windows)]
 pub const APP_USER_MODEL_ID: &str = "BeesRoadhouse.ImmichSync";
 
+/// Settings label for the autostart toggle, in the OS's own words.
+pub const AUTOSTART_LABEL: &str = if cfg!(windows) {
+    "Start with Windows"
+} else {
+    "Start at login"
+};
+
 /// Whether the GitHub-release self-updater can replace this build. Windows
 /// swaps the `.exe`; macOS has no bundle to swap until #63, so update checks
 /// are skipped there rather than offering an `.exe`.

@@ -143,6 +143,16 @@ impl FileFilter {
         }
     }
 
+    /// The filter for one watched folder: its include/exclude globs and its
+    /// online-files setting. The live watcher and the initial scan both use
+    /// this, so a folder's patterns apply however a file is found (#97).
+    pub fn for_folder(folder: &crate::db::WatchedFolder) -> Self {
+        Self::new()
+            .with_include_patterns(parse_patterns_json(folder.include_patterns.as_deref()))
+            .with_exclude_patterns(parse_patterns_json(folder.exclude_patterns.as_deref()))
+            .with_ignore_online_files(folder.ignore_online_files)
+    }
+
     /// Override whether cloud placeholders (Windows attributes, macOS dataless) are
     /// skipped. Default is `true`. Set to `false` to upload placeholders too
     /// (the file read will trigger a cloud download for each file).
@@ -822,5 +832,54 @@ mod tests {
         );
         assert!(f.should_include(&beside));
         assert!(is_skipped_dir(&dir.path().join("Old.app")));
+    }
+
+    // ── for_folder (#97) ─────────────────────────────────────────────────────
+
+    fn folder_with(include: Option<&str>, exclude: Option<&str>) -> crate::db::WatchedFolder {
+        crate::db::WatchedFolder {
+            id: 1,
+            path: "/x".into(),
+            label: None,
+            enabled: true,
+            watch_mode: crate::db::WatchMode::Native,
+            poll_interval_secs: 30,
+            album_mode: crate::db::AlbumMode::None,
+            album_name: None,
+            include_patterns: include.map(str::to_string),
+            exclude_patterns: exclude.map(str::to_string),
+            post_upload: crate::db::PostUpload::Keep,
+            ignore_online_files: true,
+            auto_added: false,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn folder_filter_applies_exclude_globs() {
+        let dir = tempfile::tempdir().unwrap();
+        let thumb = dir.path().join("thumbnails").join("t.jpg");
+        let photo = dir.path().join("p.jpg");
+        for p in [&thumb, &photo] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, vec![0u8; 4096]).unwrap();
+        }
+        let f = FileFilter::for_folder(&folder_with(None, Some(r#"["**/thumbnails/**"]"#)));
+        assert!(!f.should_include(&thumb));
+        assert!(f.should_include(&photo));
+    }
+
+    #[test]
+    fn folder_filter_applies_include_globs() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("a.dng");
+        let jpg = dir.path().join("a.jpg");
+        for p in [&raw, &jpg] {
+            std::fs::write(p, vec![0u8; 4096]).unwrap();
+        }
+        let f = FileFilter::for_folder(&folder_with(Some(r#"["**/*.dng"]"#), None));
+        assert!(f.should_include(&raw));
+        assert!(!f.should_include(&jpg));
     }
 }

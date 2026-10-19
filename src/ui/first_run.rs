@@ -4,7 +4,7 @@
 //   1. Welcome
 //   2. Server Config + Test Connection
 //   3. Folder Setup (pick watch folder)
-//   4. Autostart (start with Windows?)
+//   4. Autostart (start with Windows / at login?)
 //   5. Done
 //
 // Returns `Some(Config)` if the user completes the wizard, `None` if cancelled.
@@ -232,12 +232,12 @@ impl WizardApp {
     }
 
     fn show_autostart(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Start with Windows");
+        ui.heading(crate::platform::AUTOSTART_LABEL);
         ui.add_space(8.0);
         ui.label("ImmichSync can start automatically when you sign in.");
         ui.add_space(16.0);
 
-        ui.checkbox(&mut self.enable_autostart, "Start ImmichSync with Windows");
+        ui.checkbox(&mut self.enable_autostart, crate::platform::AUTOSTART_LABEL);
 
         ui.add_space(8.0);
         ui.label("You can change this later in Settings.");

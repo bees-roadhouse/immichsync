@@ -52,7 +52,9 @@ Apple Silicon, macOS 13 or newer. Releases carry `ImmichSync-<version>-macos-arm
 
 The API key is kept in your login Keychain (`config.toml` holds only a `keychain:` marker), and upload and error notifications go to Notification Center. Because the build is ad-hoc signed, macOS asks once after each update whether ImmichSync may use its Keychain item; choose **Always Allow**.
 
-Not yet on macOS: start at login and self-update. See [#57](https://github.com/bees-roadhouse/immichsync/issues/57).
+**Start at login** in Settings registers ImmichSync under System Settings → General → Login Items.
+
+Not yet on macOS: self-update. See [#57](https://github.com/bees-roadhouse/immichsync/issues/57).
 
 To build the bundle yourself: `packaging/macos/make-app.sh` (writes `target/macos/ImmichSync.app` and a zip).
 

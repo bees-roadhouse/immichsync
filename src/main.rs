@@ -34,6 +34,19 @@ fn debug_log(msg: &str) {
     }
 }
 
+/// The tracing filter: `RUST_LOG` when set (developers), otherwise Settings →
+/// Advanced → Log Level, otherwise `info` (#100). Unknown levels fall back
+/// to `info` rather than silencing the log.
+fn log_directive(rust_log: Option<String>, configured: Option<String>) -> String {
+    if let Some(env) = rust_log.filter(|s| !s.trim().is_empty()) {
+        return env;
+    }
+    match configured.as_deref().map(str::trim) {
+        Some(l @ ("trace" | "debug" | "info" | "warn" | "error")) => l.to_string(),
+        _ => "info".to_string(),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     debug_log(&format!(
         "=== ImmichSync starting === version={} args={:?}",
@@ -82,10 +95,10 @@ fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_directive(
+            std::env::var("RUST_LOG").ok(),
+            config::Config::configured_log_level(),
+        )))
         .init();
 
     // Prune old log files against the retention cap once at startup. The
@@ -563,4 +576,22 @@ fn run_window_subprocess(window_type: &str) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::log_directive;
+
+    #[test]
+    fn rust_log_wins_then_settings_then_info() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            log_directive(s("immichsync=trace"), s("warn")),
+            "immichsync=trace"
+        );
+        assert_eq!(log_directive(s("  "), s("debug")), "debug");
+        assert_eq!(log_directive(None, s("error")), "error");
+        assert_eq!(log_directive(None, s("loud")), "info");
+        assert_eq!(log_directive(None, None), "info");
+    }
 }
