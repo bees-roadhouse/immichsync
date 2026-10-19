@@ -17,15 +17,17 @@ use anyhow::{anyhow, Context as _};
 use block2::RcBlock;
 use chrono::{DateTime, TimeZone, Utc};
 use objc2::rc::Retained;
+use objc2::Message;
 use objc2_foundation::{NSArray, NSBundle, NSDate, NSError, NSSortDescriptor, NSString, NSURL};
 use objc2_photos::{
-    PHAccessLevel, PHAsset, PHAssetMediaType, PHAssetResource, PHAssetResourceManager,
-    PHAssetResourceRequestOptions, PHAssetResourceType, PHAssetSourceType, PHAuthorizationStatus,
+    PHAccessLevel, PHAsset, PHAssetCollection, PHAssetCollectionSubtype, PHAssetCollectionType,
+    PHAssetMediaType, PHAssetResource, PHAssetResourceManager, PHAssetResourceRequestOptions,
+    PHAssetResourceType, PHAssetSourceType, PHAuthorizationStatus, PHCollection, PHCollectionList,
     PHFetchOptions, PHPhotoLibrary, PHPhotosError,
 };
 use tracing::{debug, info};
 
-use crate::upload::worker::{LibraryExport, LibraryExportError, LibraryExporter};
+use crate::upload::worker::{LibraryAlbum, LibraryExport, LibraryExportError, LibraryExporter};
 
 /// Photos library access, as macOS reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +139,65 @@ pub fn newest_asset_ids(limit: usize) -> Vec<String> {
         }
     }
     ids
+}
+
+/// Whether a Photos album subtype is mirrored to Immich: only albums the
+/// user made. Shared albums (ADR 0002), albums synced from iTunes/Finder,
+/// camera-import albums and My Photo Stream are not; smart albums are a
+/// different collection type and never fetched.
+fn is_mirrored_subtype(subtype: PHAssetCollectionSubtype) -> bool {
+    subtype == PHAssetCollectionSubtype::AlbumRegular
+}
+
+/// Folder titles above `collection`, outermost first.
+fn folder_path(collection: &PHCollection) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current: Retained<PHCollection> = collection.retain();
+    // Folders nest; 32 levels is far beyond any real library and stops a
+    // cycle, should PhotoKit ever report one.
+    for _ in 0..32 {
+        let parents = unsafe {
+            PHCollectionList::fetchCollectionListsContainingCollection_options(&current, None)
+        };
+        let Some(parent) = (unsafe { parents.firstObject() }) else {
+            break;
+        };
+        out.push(
+            unsafe { parent.localizedTitle() }
+                .map(|t| t.to_string())
+                .unwrap_or_default(),
+        );
+        current = Retained::into_super(parent);
+    }
+    out.reverse();
+    out
+}
+
+/// The user albums `asset` is in, named for Immich.
+fn user_albums(asset: &PHAsset) -> Vec<LibraryAlbum> {
+    let collections = unsafe {
+        PHAssetCollection::fetchAssetCollectionsContainingAsset_withType_options(
+            asset,
+            PHAssetCollectionType::Album,
+            None,
+        )
+    };
+    let mut albums = Vec::new();
+    for i in 0..unsafe { collections.count() } {
+        let c = unsafe { collections.objectAtIndex(i) };
+        if !is_mirrored_subtype(unsafe { c.assetCollectionSubtype() }) {
+            continue;
+        }
+        let title = unsafe { c.localizedTitle() }
+            .map(|t| t.to_string())
+            .unwrap_or_default();
+        let folders = folder_path(&c);
+        albums.push(LibraryAlbum {
+            local_id: unsafe { c.localIdentifier() }.to_string(),
+            title: crate::watch::photos::album_title(&folders, &title),
+        });
+    }
+    albums
 }
 
 /// How long one export may take before it is treated as failed. Local
@@ -280,6 +341,7 @@ impl LibraryExporter for PhotoKitExporter {
                     resource: kind,
                     created_at: to_utc(unsafe { asset.creationDate() }),
                     modified_at: to_utc(unsafe { asset.modificationDate() }),
+                    albums: user_albums(&asset),
                 })
             }
             Ok(Some((code, _))) if code == PHPhotosError::NetworkAccessRequired.0 => {
@@ -321,6 +383,22 @@ mod tests {
         }
         assert_eq!(sweep(&root), 2);
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn only_regular_user_albums_are_mirrored() {
+        assert!(is_mirrored_subtype(PHAssetCollectionSubtype::AlbumRegular));
+        for other in [
+            PHAssetCollectionSubtype::AlbumCloudShared,
+            PHAssetCollectionSubtype::AlbumSyncedAlbum,
+            PHAssetCollectionSubtype::AlbumSyncedEvent,
+            PHAssetCollectionSubtype::AlbumSyncedFaces,
+            PHAssetCollectionSubtype::AlbumImported,
+            PHAssetCollectionSubtype::AlbumMyPhotoStream,
+            PHAssetCollectionSubtype::SmartAlbumFavorites,
+        ] {
+            assert!(!is_mirrored_subtype(other), "{other:?}");
+        }
     }
 
     #[test]

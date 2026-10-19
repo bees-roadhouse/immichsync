@@ -244,7 +244,7 @@ impl eframe::App for SettingsApp {
             Tab::Connection => self.show_connection_tab(ui),
             Tab::WatchFolders => self.show_watch_folders_tab(ui),
             #[cfg(target_os = "macos")]
-            Tab::Photos => self.photos.show(ui),
+            Tab::Photos => self.photos.show(ui, &self.server_url, &self.api_key),
             Tab::Upload => self.show_upload_tab(ui),
             Tab::Advanced => self.show_advanced_tab(ui),
         });
@@ -663,7 +663,9 @@ impl SettingsApp {
         #[cfg(target_os = "macos")]
         {
             self.config.photos.enabled = self.photos.enabled;
-            self.config.photos.album_name = self.photos.album.trim().to_string();
+            let (sync_albums, all_in) = self.photos.albums.to_config();
+            self.config.photos.sync_albums = sync_albums;
+            self.config.photos.all_in_album = all_in;
         }
 
         self.config.upload.concurrency = self.concurrency;
@@ -1036,10 +1038,63 @@ fn photos_toggle(access: crate::platform::photos::Access, can_prompt: bool) -> P
     }
 }
 
+/// The Photos tab's album choices (#115): mirror Photos albums, put
+/// everything into one album, or neither. The first two combine.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AlbumChoice {
+    sync_albums: bool,
+    all_in_on: bool,
+    /// The chosen server album, or a new name to create.
+    all_in: String,
+}
+
+#[cfg(target_os = "macos")]
+impl AlbumChoice {
+    fn from_config(cfg: &crate::config::PhotosConfig) -> Self {
+        let all_in = cfg.all_in_album.trim().to_string();
+        Self {
+            sync_albums: cfg.sync_albums,
+            all_in_on: !all_in.is_empty(),
+            all_in,
+        }
+    }
+
+    fn no_albums(&self) -> bool {
+        !self.sync_albums && !self.all_in_on
+    }
+
+    /// Ticking "No albums" clears the other two; unticking it turns album
+    /// sync back on (the default).
+    fn set_no_albums(&mut self, on: bool) {
+        if on {
+            self.sync_albums = false;
+            self.all_in_on = false;
+        } else {
+            self.sync_albums = true;
+        }
+    }
+
+    /// `(sync_albums, all_in_album)` to save. A ticked catch-all with a
+    /// blank name saves as off.
+    fn to_config(&self) -> (bool, String) {
+        let name = if self.all_in_on {
+            self.all_in.trim().to_string()
+        } else {
+            String::new()
+        };
+        (self.sync_albums, name)
+    }
+}
+
 #[cfg(target_os = "macos")]
 struct PhotosTabState {
     enabled: bool,
-    album: String,
+    albums: AlbumChoice,
+    /// Album names on the server, for the catch-all dropdown.
+    server_albums: Vec<String>,
+    albums_rx: Option<std::sync::mpsc::Receiver<Result<Vec<String>, String>>>,
+    albums_status: String,
     access: crate::platform::photos::Access,
     /// The answer to a prompt raised by the toggle, while it's showing.
     pending: Option<std::sync::mpsc::Receiver<anyhow::Result<crate::platform::photos::Access>>>,
@@ -1053,14 +1108,87 @@ impl PhotosTabState {
         Self {
             // A config that says "on" without access shows as off until fixed.
             enabled: cfg.enabled && access.can_read(),
-            album: cfg.album_name.clone(),
+            albums: AlbumChoice::from_config(cfg),
+            server_albums: Vec::new(),
+            albums_rx: None,
+            albums_status: String::new(),
             access,
             pending: None,
             message: String::new(),
         }
     }
 
-    fn show(&mut self, ui: &mut egui::Ui) {
+    /// Albums: mirror Photos albums, one catch-all, or none.
+    fn show_albums(&mut self, ui: &mut egui::Ui, server_url: &str, api_key: &str) {
+        if let Some(rx) = &self.albums_rx {
+            match rx.try_recv() {
+                Ok(Ok(names)) => {
+                    self.albums_status = format!("{} albums on the server", names.len());
+                    self.server_albums = names;
+                    self.albums_rx = None;
+                }
+                Ok(Err(e)) => {
+                    self.albums_status = format!("Couldn't load albums: {e}");
+                    self.albums_rx = None;
+                }
+                Err(_) => ui
+                    .ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(200)),
+            }
+        }
+
+        ui.label("Albums");
+        let c = &mut self.albums;
+        ui.checkbox(&mut c.sync_albums, "Sync my Photos albums");
+        ui.small(
+            "Each Photos album becomes an Immich album; a photo in several albums is in each. \
+             Smart albums and shared albums are left out.",
+        );
+
+        let was_on = c.all_in_on;
+        ui.checkbox(
+            &mut c.all_in_on,
+            "Also put everything into one Immich album",
+        );
+        let load = c.all_in_on && !was_on && self.server_albums.is_empty();
+        if c.all_in_on {
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("photos_all_in")
+                    .selected_text(if c.all_in.trim().is_empty() {
+                        "Choose an album"
+                    } else {
+                        c.all_in.as_str()
+                    })
+                    .show_ui(ui, |ui| {
+                        for name in &self.server_albums {
+                            ui.selectable_value(&mut c.all_in, name.clone(), name);
+                        }
+                    });
+                ui.label("or a new name:");
+                ui.text_edit_singleline(&mut c.all_in);
+            });
+            ui.horizontal(|ui| {
+                if ui.small_button("Refresh albums").clicked() && self.albums_rx.is_none() {
+                    self.albums_rx = Some(fetch_album_names(server_url, api_key));
+                    self.albums_status = "Loading albums…".to_string();
+                }
+                if !self.albums_status.is_empty() {
+                    ui.small(&self.albums_status);
+                }
+            });
+        }
+        if load && self.albums_rx.is_none() {
+            self.albums_rx = Some(fetch_album_names(server_url, api_key));
+            self.albums_status = "Loading albums…".to_string();
+        }
+
+        let mut none = self.albums.no_albums();
+        if ui.checkbox(&mut none, "No albums (upload only)").changed() {
+            self.albums.set_no_albums(none);
+        }
+    }
+
+    fn show(&mut self, ui: &mut egui::Ui, server_url: &str, api_key: &str) {
         use crate::platform::photos::{self, Access};
 
         if let Some(rx) = &self.pending {
@@ -1145,26 +1273,89 @@ impl PhotosTabState {
         }
 
         ui.add_space(8.0);
-        egui::Grid::new("photos_grid")
-            .num_columns(2)
-            .spacing([8.0, 6.0])
-            .show(ui, |ui| {
-                ui.label("Album:");
-                ui.text_edit_singleline(&mut self.album);
-                ui.end_row();
-            });
+        ui.separator();
+        self.show_albums(ui, server_url, api_key);
         ui.add_space(4.0);
         ui.small(
             "This first version uploads the 3 newest items whose originals are on this Mac; \
-             items stored only in iCloud are skipped for now. Album changes apply after a restart.",
+             items stored only in iCloud are skipped for now. Album choices apply after a restart.",
         );
     }
+}
+
+/// Load the server's album names on a background thread for the dropdown.
+#[cfg(target_os = "macos")]
+fn fetch_album_names(
+    server_url: &str,
+    api_key: &str,
+) -> std::sync::mpsc::Receiver<Result<Vec<String>, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (url, key) = (server_url.to_string(), api_key.to_string());
+    std::thread::spawn(move || {
+        let result = (|| {
+            if url.is_empty() || key.is_empty() {
+                return Err("set the server URL and API key first".to_string());
+            }
+            let client = crate::api::ImmichClient::new(&url, &key).map_err(|e| e.to_string())?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let mut names: Vec<String> = rt
+                .block_on(client.get_albums())
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|a| a.album_name)
+                .collect();
+            names.sort_by_key(|n| n.to_lowercase());
+            names.dedup();
+            Ok(names)
+        })();
+        let _ = tx.send(result);
+    });
+    rx
 }
 
 #[cfg(all(test, target_os = "macos"))]
 mod photos_tests {
     use super::*;
     use crate::platform::photos::Access;
+
+    #[test]
+    fn album_choices_load_save_and_no_albums_is_exclusive() {
+        let mut cfg = crate::config::PhotosConfig::default();
+        let c = AlbumChoice::from_config(&cfg);
+        assert!(
+            c.sync_albums && !c.all_in_on && !c.no_albums(),
+            "sync albums by default"
+        );
+        assert_eq!(c.to_config(), (true, String::new()));
+
+        cfg.all_in_album = "Everything".into();
+        let mut c = AlbumChoice::from_config(&cfg);
+        assert!(c.sync_albums && c.all_in_on);
+        assert_eq!(c.to_config(), (true, "Everything".into()));
+
+        c.set_no_albums(true);
+        assert!(c.no_albums());
+        assert_eq!(c.to_config(), (false, String::new()));
+        c.set_no_albums(false);
+        assert_eq!(c.to_config(), (true, String::new()));
+
+        // A ticked catch-all with no name saves as off; names are trimmed.
+        let c = AlbumChoice {
+            sync_albums: false,
+            all_in_on: true,
+            all_in: "  ".into(),
+        };
+        assert_eq!(c.to_config(), (false, String::new()));
+        let c = AlbumChoice {
+            sync_albums: false,
+            all_in_on: true,
+            all_in: " Trip ".into(),
+        };
+        assert_eq!(c.to_config(), (false, "Trip".into()));
+    }
 
     #[test]
     fn the_toggle_prompts_only_when_undetermined_and_promptable() {

@@ -219,23 +219,70 @@ impl Default for DevicesConfig {
 }
 
 /// Apple Photos library source (macOS; docs/adr/0002-photokit-library-source.md).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, from = "PhotosConfigFile")]
 pub struct PhotosConfig {
     /// Sync the Photos library. Off by default; turning it on in Settings is
     /// what raises the system permission prompt.
     pub enabled: bool,
 
-    /// Album every library upload goes into. Mapping Photos albums to
-    /// Immich albums is a later slice. Empty = no album.
-    pub album_name: String,
+    /// Mirror each Photos user album as an Immich album (many-to-many,
+    /// #115). On by default. Smart and shared albums are never mirrored.
+    pub sync_albums: bool,
+
+    /// Also put every library upload into this one Immich album, an existing
+    /// one or a new name. Empty = off.
+    pub all_in_album: String,
 }
 
 impl Default for PhotosConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            album_name: "Photos library".to_string(),
+            sync_albums: true,
+            all_in_album: String::new(),
+        }
+    }
+}
+
+/// `[photos]` as it may appear on disk, including the pre-#115 key.
+#[derive(Deserialize)]
+#[serde(default)]
+struct PhotosConfigFile {
+    enabled: bool,
+    sync_albums: bool,
+    all_in_album: String,
+    /// The tracer's single fixed album (#111). Read to migrate, never written.
+    album_name: Option<String>,
+}
+
+impl Default for PhotosConfigFile {
+    fn default() -> Self {
+        let d = PhotosConfig::default();
+        Self {
+            enabled: d.enabled,
+            sync_albums: d.sync_albums,
+            all_in_album: d.all_in_album,
+            album_name: None,
+        }
+    }
+}
+
+impl From<PhotosConfigFile> for PhotosConfig {
+    /// Migration (#115): a non-empty tracer `album_name` becomes the
+    /// catch-all album, unless `all_in_album` is already set; album sync
+    /// stays at its default (on) unless the file says otherwise.
+    fn from(f: PhotosConfigFile) -> Self {
+        let mut all_in_album = f.all_in_album;
+        if all_in_album.trim().is_empty() {
+            if let Some(old) = f.album_name.filter(|n| !n.trim().is_empty()) {
+                all_in_album = old.trim().to_string();
+            }
+        }
+        Self {
+            enabled: f.enabled,
+            sync_albums: f.sync_albums,
+            all_in_album,
         }
     }
 }
@@ -561,6 +608,42 @@ mod tests {
         assert_eq!(cfg.advanced.write_settle_ms, 2000);
         assert_eq!(cfg.advanced.update_repo, "bees-roadhouse/immichsync");
         assert_eq!(cfg.advanced.update_channel, "latest");
+    }
+
+    #[test]
+    fn a_tracer_album_name_becomes_the_catch_all_with_album_sync_on() {
+        let cfg: Config =
+            toml::from_str("[photos]\nenabled = true\nalbum_name = \"Photos library\"\n").unwrap();
+        assert!(cfg.photos.enabled);
+        assert!(cfg.photos.sync_albums, "album sync is on by default");
+        assert_eq!(cfg.photos.all_in_album, "Photos library");
+
+        let written = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            !written.contains("album_name"),
+            "the old key is never written back"
+        );
+        let again: Config = toml::from_str(&written).unwrap();
+        assert_eq!(again.photos, cfg.photos);
+    }
+
+    #[test]
+    fn photos_album_settings_defaults_and_precedence() {
+        let fresh = Config::default().photos;
+        assert!(fresh.sync_albums);
+        assert!(fresh.all_in_album.is_empty());
+
+        // An empty legacy name means no catch-all.
+        let cfg: Config = toml::from_str("[photos]\nalbum_name = \"  \"\n").unwrap();
+        assert!(cfg.photos.all_in_album.is_empty());
+
+        // The new key wins over a leftover old one.
+        let cfg: Config = toml::from_str(
+            "[photos]\nall_in_album = \"Mine\"\nalbum_name = \"Old\"\nsync_albums = false\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.photos.all_in_album, "Mine");
+        assert!(!cfg.photos.sync_albums);
     }
 
     #[test]

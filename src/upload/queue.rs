@@ -48,6 +48,34 @@ pub trait QueueStore: Send + Sync {
         anyhow::bail!("this store has no Photos library support")
     }
 
+    /// The Immich asset id of an earlier upload with this SHA-1.
+    fn uploaded_asset_id(&self, _hash: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// The Immich album ImmichSync made for a Photos album (#115).
+    fn mirrored_album(
+        &self,
+        _collection_id: &str,
+    ) -> anyhow::Result<Option<crate::db::MirroredAlbum>> {
+        Ok(None)
+    }
+
+    /// Insert or update a mirrored album mapping.
+    fn record_mirrored_album(
+        &self,
+        _collection_id: &str,
+        _immich_album_id: &str,
+        _name: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Drop a mirrored album mapping whose Immich album is gone.
+    fn forget_mirrored_album(&self, _collection_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// `true` if the asset is already queued or recorded.
     fn photos_asset_seen(&self, _local_id: &str) -> anyhow::Result<bool> {
         Ok(false)
