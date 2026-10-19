@@ -166,6 +166,12 @@ pub struct WorkerConfig {
     /// The Photos library source, when this build and config have one.
     /// Entries with `source = photos` fail cleanly without it.
     pub library: Option<Arc<LibrarySource>>,
+
+    /// Set when the server rejects the API key (401): the worker stops
+    /// taking entries, the rejected entry goes back to `pending` without
+    /// spending a retry, and the app asks the user to sign in again (#143).
+    /// A new key builds a new pipeline, so this never clears itself.
+    pub auth_rejected: Arc<std::sync::atomic::AtomicBool>,
 }
 
 // ─── Photos library source (ADR 0002) ────────────────────────────────────────
@@ -305,6 +311,7 @@ impl Default for WorkerConfig {
             base_retry_delay: Duration::from_secs(1),
             device_id: format!("immichsync-{hostname}"),
             library: None,
+            auth_rejected: Default::default(),
         }
     }
 }
@@ -323,6 +330,11 @@ pub struct UploadWorker {
 
 impl UploadWorker {
     /// Create a new worker pool with the given configuration.
+    /// The worker's configuration (shared flags included).
+    pub fn config(&self) -> &WorkerConfig {
+        &self.config
+    }
+
     pub fn new(config: WorkerConfig) -> Self {
         let (pause_tx, pause_rx) = tokio::sync::watch::channel(false);
         Self {
@@ -378,6 +390,22 @@ impl UploadWorker {
             // Use a non-blocking check so we can also check it inside the
             // sleep branch below.
             // We rely on `shutdown.notified()` being selectably pollable.
+
+            // ── Key rejected: hold everything until a new key (#143) ─────
+            if self
+                .config
+                .auth_rejected
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(5)) => {}
+                    _ = shutdown.notified() => {
+                        info!("Upload worker stopping (API key rejected)");
+                        return;
+                    }
+                }
+                continue;
+            }
 
             // ── Pause gate ───────────────────────────────────────────────
             if *paused_rx.borrow() {
@@ -735,8 +763,44 @@ async fn process_item(
             }
         }
 
-        Err(e) => fail_or_retry(&entry, store.as_ref(), config, &e.to_string()).await,
+        Err(e) => fail_or_retry_or_hold(&entry, store.as_ref(), config, &e).await,
     }
+}
+
+/// True when the server rejected the API key itself (HTTP 401), as opposed
+/// to anything about this file.
+pub(crate) fn is_auth_rejection(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<crate::api::ApiError>(),
+            Some(crate::api::ApiError::Auth(_))
+        )
+    })
+}
+
+/// An upload attempt failed. A rejected key (401) isn't the file's fault:
+/// hold the entry (back to `pending`, no retry spent) and stop the worker
+/// until a new key arrives, rather than burning every entry's retries and
+/// marking the whole queue `failed` (#143). Anything else retries as before.
+async fn fail_or_retry_or_hold(
+    entry: &QueueEntry,
+    store: &dyn QueueStore,
+    config: &WorkerConfig,
+    e: &anyhow::Error,
+) {
+    if is_auth_rejection(e) {
+        if !config
+            .auth_rejected
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            warn!(error = %e, "The server rejected the API key; holding uploads until sign-in");
+        }
+        if let Err(db_err) = store.requeue_without_retry(entry.id) {
+            error!(id = entry.id, error = %db_err, "Failed to requeue entry after a rejected key");
+        }
+        return;
+    }
+    fail_or_retry(entry, store, config, &e.to_string()).await
 }
 
 /// An attempt failed: back off and return the entry to `pending`, or mark
@@ -1005,7 +1069,7 @@ async fn process_library_item(
         }
         Err(e) => {
             drop(cleanup);
-            fail_or_retry(&entry, store.as_ref(), config, &e.to_string()).await
+            fail_or_retry_or_hold(&entry, store.as_ref(), config, &e).await
         }
     }
 }
@@ -1366,15 +1430,25 @@ pub fn still_matches_upload(
     }
 }
 
-/// Delete files in `.immichsync-trash/` directories that are older than
-/// `retention_days`.  Removes empty directories afterwards.
+/// Delete files in `.immichsync-trash/` directories that entered the trash
+/// more than `retention_days` before `now`. Removes empty directories
+/// afterwards.
 ///
-/// Called on startup and periodically from the app's main loop.
-pub fn cleanup_trash(folders: &[crate::db::WatchedFolder], retention_days: u32) {
-    use std::time::{Duration, SystemTime};
-
-    let max_age = Duration::from_secs(retention_days as u64 * 86400);
-    let now = SystemTime::now();
+/// The clock is when the file *entered* the trash (`trash_entries`), never
+/// its own mtime: a move keeps the mtime, so a year-old photo trashed today
+/// would otherwise be purged at the very next sweep (#110). A file with no
+/// entry (trashed since the last sweep, or before the table existed) is
+/// recorded at `now` and kept, so retention can only run late, by at most
+/// one sweep interval, never early.
+///
+/// Called on startup and hourly from the app's main loop.
+pub fn cleanup_trash(
+    db: &crate::db::Database,
+    folders: &[crate::db::WatchedFolder],
+    retention_days: u32,
+    now: DateTime<Utc>,
+) {
+    let max_age = chrono::Duration::days(retention_days as i64);
 
     for folder in folders {
         if folder.post_upload != crate::db::PostUpload::Trash {
@@ -1386,9 +1460,19 @@ pub fn cleanup_trash(folders: &[crate::db::WatchedFolder], retention_days: u32) 
             continue;
         }
 
-        // Walk recursively and delete old files.
         let mut dirs_to_check = Vec::new();
-        walk_and_delete(&trash_root, now, max_age, &mut dirs_to_check);
+        let mut present = std::collections::HashSet::new();
+        sweep_trash(
+            db,
+            &trash_root,
+            now,
+            max_age,
+            &mut dirs_to_check,
+            &mut present,
+        );
+        if let Err(e) = db.forget_trash_entries_not_in(&trash_root.to_string_lossy(), &present) {
+            warn!(error = %e, "Failed to prune trash entries");
+        }
 
         // Remove empty directories (deepest first).
         dirs_to_check.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
@@ -1402,13 +1486,16 @@ pub fn cleanup_trash(folders: &[crate::db::WatchedFolder], retention_days: u32) 
     }
 }
 
-/// Recursively walk a directory, deleting files older than `max_age` and
-/// collecting subdirectory paths for later empty-dir cleanup.
-fn walk_and_delete(
+/// Recursively walk a trash directory: record first sightings, delete files
+/// whose time in the trash exceeds `max_age`, and collect subdirectories for
+/// the empty-dir pass and still-present paths for the entry prune.
+fn sweep_trash(
+    db: &crate::db::Database,
     dir: &std::path::Path,
-    now: std::time::SystemTime,
-    max_age: std::time::Duration,
+    now: DateTime<Utc>,
+    max_age: chrono::Duration,
     dirs: &mut Vec<std::path::PathBuf>,
+    present: &mut std::collections::HashSet<String>,
 ) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -1422,18 +1509,40 @@ fn walk_and_delete(
         let path = entry.path();
         if path.is_dir() {
             dirs.push(path.clone());
-            walk_and_delete(&path, now, max_age, dirs);
-        } else if path.is_file() {
-            let should_delete = match path.metadata().and_then(|m| m.modified()) {
-                Ok(modified) => now.duration_since(modified).unwrap_or_default() > max_age,
-                Err(_) => false,
-            };
-            if should_delete {
-                if let Err(e) = std::fs::remove_file(&path) {
-                    warn!(path = %path.display(), error = %e, "Failed to delete expired trash file");
-                } else {
-                    debug!(path = %path.display(), "Deleted expired trash file");
+            sweep_trash(db, &path, now, max_age, dirs, present);
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let key = path.to_string_lossy().into_owned();
+        let entered = match db.trash_entered_at(&key) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                if let Err(e) = db.record_trash_entry(&key, now) {
+                    warn!(path = %key, error = %e, "Failed to record trash entry; keeping file");
                 }
+                present.insert(key);
+                continue;
+            }
+            Err(e) => {
+                warn!(path = %key, error = %e, "Failed to read trash entry; keeping file");
+                present.insert(key);
+                continue;
+            }
+        };
+        if now - entered <= max_age {
+            present.insert(key);
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                debug!(path = %key, "Deleted expired trash file");
+                let _ = db.forget_trash_entry(&key);
+            }
+            Err(e) => {
+                warn!(path = %key, error = %e, "Failed to delete expired trash file");
+                present.insert(key);
             }
         }
     }
@@ -1446,6 +1555,107 @@ mod tests {
     use super::*;
 
     // ── move_no_clobber (#98) ────────────────────────────────────────────────
+
+    fn trash_folder(path: &std::path::Path) -> crate::db::WatchedFolder {
+        use crate::db::{AlbumMode, PostUpload, WatchMode, WatchedFolder};
+        WatchedFolder {
+            id: 1,
+            path: path.to_string_lossy().into_owned(),
+            label: None,
+            enabled: true,
+            watch_mode: WatchMode::Native,
+            poll_interval_secs: 30,
+            album_mode: AlbumMode::None,
+            album_name: None,
+            include_patterns: None,
+            exclude_patterns: None,
+            post_upload: PostUpload::Trash,
+            ignore_online_files: true,
+            auto_added: false,
+            created_at: "2026-10-19T00:00:00Z".to_string(),
+            updated_at: "2026-10-19T00:00:00Z".to_string(),
+        }
+    }
+
+    /// #110: a photo whose own mtime is a year old, trashed now, survives
+    /// until `retention_days` after it entered the trash.
+    #[test]
+    fn trash_retention_counts_from_entering_the_trash_not_the_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let folders = [trash_folder(dir.path())];
+        let file = dir.path().join(".immichsync-trash/DCIM/IMG_0001.JPG");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"photo").unwrap();
+        let year_ago = std::time::SystemTime::now() - Duration::from_secs(365 * 86400);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(year_ago)
+            .unwrap();
+
+        let t0 = Utc::now();
+        let day = chrono::Duration::days(1);
+        cleanup_trash(&db, &folders, 30, t0);
+        assert!(file.exists(), "first sweep must not purge on the old mtime");
+
+        cleanup_trash(&db, &folders, 30, t0 + day * 29);
+        assert!(file.exists(), "still inside the 30-day window");
+
+        cleanup_trash(
+            &db,
+            &folders,
+            30,
+            t0 + day * 30 + chrono::Duration::hours(1),
+        );
+        assert!(!file.exists(), "gone after 30 days in the trash");
+        assert!(
+            !dir.path().join(".immichsync-trash/DCIM").exists(),
+            "empty trash dirs are removed"
+        );
+        assert_eq!(db.trash_entered_at(&file.to_string_lossy()).unwrap(), None);
+    }
+
+    /// Existing trash contents (trashed before this table) are recorded at
+    /// the first sweep after the upgrade and kept a full window.
+    #[test]
+    fn trash_from_before_the_upgrade_is_not_purged_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let folders = [trash_folder(dir.path())];
+        let old = dir.path().join(".immichsync-trash/old.jpg");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, b"x").unwrap();
+
+        let upgrade = Utc::now();
+        cleanup_trash(&db, &folders, 7, upgrade);
+        cleanup_trash(&db, &folders, 7, upgrade + chrono::Duration::days(6));
+        assert!(old.exists());
+        cleanup_trash(&db, &folders, 7, upgrade + chrono::Duration::days(8));
+        assert!(!old.exists());
+    }
+
+    /// A file restored out of the trash and trashed again later gets a new
+    /// clock, not the old entry's.
+    #[test]
+    fn a_restored_file_trashed_again_starts_a_fresh_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let folders = [trash_folder(dir.path())];
+        let f = dir.path().join(".immichsync-trash/a.jpg");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, b"x").unwrap();
+
+        let t0 = Utc::now();
+        cleanup_trash(&db, &folders, 7, t0);
+        std::fs::remove_file(&f).unwrap(); // the user restored it
+        cleanup_trash(&db, &folders, 7, t0 + chrono::Duration::days(1));
+        std::fs::write(&f, b"x").unwrap(); // trashed again on day 6
+        cleanup_trash(&db, &folders, 7, t0 + chrono::Duration::days(6));
+        cleanup_trash(&db, &folders, 7, t0 + chrono::Duration::days(10));
+        assert!(f.exists(), "only 4 days since it re-entered the trash");
+    }
 
     #[test]
     fn trashing_the_same_relative_path_twice_keeps_both() {
@@ -1657,6 +1867,15 @@ mod tests {
             Ok(())
         }
 
+        fn requeue_without_retry(&self, id: i64) -> anyhow::Result<()> {
+            let mut entries = self.entries.lock().unwrap();
+            if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
+                e.status = "pending".to_string();
+                e.error_message = None;
+            }
+            Ok(())
+        }
+
         fn mark_completed(&self, id: i64, _asset_id: Option<&str>) -> anyhow::Result<()> {
             let mut entries = self.entries.lock().unwrap();
             if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
@@ -1737,6 +1956,30 @@ mod tests {
                     asset_id: None,
                 })
                 .collect())
+        }
+    }
+
+    /// Answers every upload with a 401, as Immich does for a revoked key.
+    struct RejectingUploader;
+
+    #[async_trait]
+    impl AssetUploader for RejectingUploader {
+        async fn upload_asset(
+            &self,
+            _file_path: &Path,
+            _device_asset_id: &str,
+            _device_id: &str,
+            _created_at: DateTime<Utc>,
+            _modified_at: DateTime<Utc>,
+        ) -> anyhow::Result<UploadResult> {
+            Err(crate::api::ApiError::Auth("Invalid API key".into()).into())
+        }
+
+        async fn check_duplicates(
+            &self,
+            _items: Vec<BulkCheckItem>,
+        ) -> anyhow::Result<Vec<BulkCheckResult>> {
+            Ok(vec![])
         }
     }
 
@@ -1902,6 +2145,7 @@ mod tests {
                     all_in: Some("immichsync test".to_string()),
                 },
             ))),
+            auth_rejected: Default::default(),
         }
     }
 
@@ -2665,6 +2909,7 @@ mod tests {
             base_retry_delay: Duration::from_millis(1),
             device_id: "immichsync-test".to_string(),
             library: None,
+            auth_rejected: Default::default(),
         };
 
         process_item(entry, store.clone(), uploader, &config).await;
@@ -2705,6 +2950,7 @@ mod tests {
             base_retry_delay: Duration::from_millis(1),
             device_id: "immichsync-test".to_string(),
             library: None,
+            auth_rejected: Default::default(),
         };
 
         process_item(entry, store.clone(), Arc::new(SucceedingUploader), &config).await;
@@ -2713,6 +2959,55 @@ mod tests {
         assert_eq!(stats.completed, 0, "must not upload");
         assert_eq!(stats.failed, 1);
         assert!(inside.exists(), "must not move or delete the file");
+    }
+
+    /// #143: a revoked key holds the queue instead of failing it. The entry
+    /// goes back to `pending` with no retry spent, and the flag the app
+    /// turns into "sign in again" is set, however many times it happens.
+    #[tokio::test]
+    async fn a_rejected_key_holds_the_entry_without_spending_retries() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"photo data").unwrap();
+        tmp.flush().unwrap();
+        let store = Arc::new(MockStore::default());
+        let hash = crate::upload::hasher::hash_file(tmp.path()).unwrap();
+        store
+            .enqueue(NewQueueEntry {
+                file_path: tmp.path().display().to_string(),
+                file_hash: Some(hash),
+                file_size: Some(10),
+                folder_id: None,
+            })
+            .unwrap();
+        let config = WorkerConfig {
+            max_retries: 2,
+            base_retry_delay: Duration::from_millis(1),
+            ..WorkerConfig::default()
+        };
+
+        for _ in 0..5 {
+            let mut e = store.entries.lock().unwrap()[0].clone();
+            e.status = "uploading".to_string();
+            process_item(e, store.clone(), Arc::new(RejectingUploader), &config).await;
+        }
+
+        let e = store.entries.lock().unwrap()[0].clone();
+        assert_eq!(e.status, "pending");
+        assert_eq!(e.retry_count, 0, "a rejected key spends no retries");
+        assert!(config
+            .auth_rejected
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn only_a_401_counts_as_a_rejected_key() {
+        let auth: anyhow::Error = crate::api::ApiError::Auth("x".into()).into();
+        assert!(is_auth_rejection(&auth));
+        assert!(is_auth_rejection(&auth.context("uploading IMG_1.JPG")));
+        let other: anyhow::Error = crate::api::ApiError::ServerError("500".into()).into();
+        assert!(!is_auth_rejection(&other));
+        assert!(!is_auth_rejection(&anyhow::anyhow!("disk full")));
     }
 
     #[tokio::test]
@@ -2741,6 +3036,7 @@ mod tests {
             base_retry_delay: Duration::from_millis(1), // fast for tests
             device_id: "immichsync-test".to_string(),
             library: None,
+            auth_rejected: Default::default(),
         };
 
         // Process until the entry is marked "failed".

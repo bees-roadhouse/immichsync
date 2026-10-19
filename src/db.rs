@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -261,8 +261,16 @@ pub struct QueueStats {
 
 // ─── Database ────────────────────────────────────────────────────────────────
 
+/// v5's table, shared with v6's guard (see `migrate_v6`).
+const MIRRORED_ALBUMS_DDL: &str = "CREATE TABLE IF NOT EXISTS mirrored_albums (
+    photos_collection_id TEXT PRIMARY KEY,
+    immich_album_id      TEXT NOT NULL,
+    name                 TEXT NOT NULL,
+    created_at           TEXT NOT NULL
+)";
+
 /// The schema version a fully migrated database is at.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// An Immich album ImmichSync created to mirror a Photos album (#115).
 /// Only albums recorded here are ever renamed or added to by the mirror;
@@ -356,6 +364,7 @@ impl Database {
             (3, Self::migrate_v3),
             (4, Self::migrate_v4),
             (5, Self::migrate_v5),
+            (6, Self::migrate_v6),
         ];
         for (version, migrate) in steps {
             if current_version < version {
@@ -515,16 +524,34 @@ impl Database {
     /// in Photos renames the same Immich album.
     fn migrate_v5(&self) -> Result<(), DbError> {
         self.conn
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS mirrored_albums (
-                    photos_collection_id TEXT PRIMARY KEY,
-                    immich_album_id      TEXT NOT NULL,
-                    name                 TEXT NOT NULL,
-                    created_at           TEXT NOT NULL
-                 );",
-            )
+            .execute_batch(MIRRORED_ALBUMS_DDL)
             .map_err(|e| DbError::Migration {
                 version: 5,
+                source: e,
+            })
+    }
+
+    /// v6: `trash_entries`, when each file in `.immichsync-trash/` entered
+    /// it. Retention counts from this, never from the file's own mtime,
+    /// which a move preserves (#110).
+    ///
+    /// Also (re)creates v5's `mirrored_albums` if it's missing. That covers a
+    /// database that ran #134's branch while it still numbered this step
+    /// v5: it would be at version 5 with `trash_entries` and without
+    /// `mirrored_albums`, so the real v5 would never run. No such database
+    /// is known to exist (that branch only ran against in-memory test DBs),
+    /// but the guard costs one `IF NOT EXISTS`.
+    fn migrate_v6(&self) -> Result<(), DbError> {
+        self.conn
+            .execute_batch(&format!(
+                "{MIRRORED_ALBUMS_DDL};
+                 CREATE TABLE IF NOT EXISTS trash_entries (
+                    trash_path  TEXT PRIMARY KEY,
+                    trashed_at  TEXT NOT NULL
+                 );"
+            ))
+            .map_err(|e| DbError::Migration {
+                version: 6,
                 source: e,
             })
     }
@@ -597,6 +624,65 @@ impl Database {
     pub fn remove_folder(&self, id: i64) -> Result<(), DbError> {
         self.conn
             .execute("DELETE FROM watched_folders WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    // ── trash_entries ────────────────────────────────────────────────────────
+
+    /// When `trash_path` entered the trash, if recorded.
+    pub fn trash_entered_at(&self, trash_path: &str) -> Result<Option<DateTime<Utc>>, DbError> {
+        let text: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT trashed_at FROM trash_entries WHERE trash_path = ?1",
+                params![trash_path],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(text.and_then(|t| {
+            DateTime::parse_from_rfc3339(&t)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        }))
+    }
+
+    /// Record that `trash_path` entered the trash at `at` (kept if already
+    /// recorded, so the first sighting wins).
+    pub fn record_trash_entry(&self, trash_path: &str, at: DateTime<Utc>) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO trash_entries (trash_path, trashed_at) VALUES (?1, ?2)",
+            params![trash_path, at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Forget one entry (its file was purged).
+    pub fn forget_trash_entry(&self, trash_path: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "DELETE FROM trash_entries WHERE trash_path = ?1",
+            params![trash_path],
+        )?;
+        Ok(())
+    }
+
+    /// Forget entries under `root` whose files are gone (restored or removed
+    /// by the user), so a later file at the same path starts a fresh clock.
+    pub fn forget_trash_entries_not_in(
+        &self,
+        root: &str,
+        present: &std::collections::HashSet<String>,
+    ) -> Result<(), DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT trash_path FROM trash_entries WHERE substr(trash_path, 1, length(?1)) = ?1",
+        )?;
+        let stale: Vec<String> = stmt
+            .query_map(params![root], |r| r.get::<_, String>(0))?
+            .filter_map(Result::ok)
+            .filter(|p| !present.contains(p))
+            .collect();
+        for p in stale {
+            self.forget_trash_entry(&p)?;
+        }
         Ok(())
     }
 
@@ -1043,6 +1129,16 @@ impl Database {
     /// Set `error_msg` to `Some(msg)` when transitioning to `failed`.
     /// `completed_at` is recorded automatically when the new status is
     /// `Completed` or `Failed`.
+    /// Back to `pending` with `retry_count` untouched (a rejected API key
+    /// isn't the entry's failure, #143).
+    pub fn requeue_without_retry(&self, id: i64) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE upload_queue SET status = 'pending', error_message = NULL WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_queue_status(
         &self,
         id: i64,
@@ -1335,6 +1431,12 @@ impl crate::upload::queue::QueueStore for DbStore {
         let db = self.db.lock().unwrap();
         let qs = QueueStatus::from_str(status);
         db.update_queue_status(id, &qs, error)?;
+        Ok(())
+    }
+
+    fn requeue_without_retry(&self, id: i64) -> anyhow::Result<()> {
+        let db = self.db.lock().unwrap();
+        db.requeue_without_retry(id)?;
         Ok(())
     }
 
@@ -1881,6 +1983,67 @@ mod tests {
         db.run_migrations().unwrap();
         assert_eq!(db.get_schema_version().unwrap(), SCHEMA_VERSION);
         assert!(has_column(&db, "upload_queue", "source"));
+    }
+
+    #[test]
+    fn upgrade_from_v5_adds_trash_entries_and_keeps_existing_rows() {
+        let mut db = v3_db();
+        db.migrate_v4().unwrap();
+        db.migrate_v5().unwrap();
+        db.set_schema_version(5).unwrap();
+        db.enqueue("/photos/a.jpg", Some("h"), Some(1), None)
+            .unwrap();
+
+        db.run_migrations().unwrap();
+
+        assert_eq!(db.get_schema_version().unwrap(), 6);
+        let at = Utc::now();
+        db.record_trash_entry("/p/.immichsync-trash/a.jpg", at)
+            .unwrap();
+        let got = db
+            .trash_entered_at("/p/.immichsync-trash/a.jpg")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.timestamp(), at.timestamp());
+        assert_eq!(db.dequeue_pending(10).unwrap().len(), 1);
+    }
+
+    /// A database that ran #134's branch when trash_entries was numbered v5:
+    /// version 5, trash_entries present, mirrored_albums missing. v6 must
+    /// give it mirrored_albums and keep its trash entries.
+    #[test]
+    fn a_db_from_the_old_trash_v5_numbering_gets_mirrored_albums() {
+        let mut db = v3_db();
+        db.migrate_v4().unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TABLE trash_entries (trash_path TEXT PRIMARY KEY, trashed_at TEXT NOT NULL);
+                 INSERT INTO trash_entries VALUES ('/p/.immichsync-trash/x.jpg', '2026-10-19T00:00:00+00:00');",
+            )
+            .unwrap();
+        db.set_schema_version(5).unwrap();
+        assert!(!has_table(&db, "mirrored_albums"));
+
+        db.run_migrations().unwrap();
+
+        assert_eq!(db.get_schema_version().unwrap(), 6);
+        assert!(has_table(&db, "mirrored_albums"));
+        assert!(db
+            .trash_entered_at("/p/.immichsync-trash/x.jpg")
+            .unwrap()
+            .is_some());
+    }
+
+    fn has_table(db: &Database, table: &str) -> bool {
+        db.conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![table],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some()
     }
 
     #[test]

@@ -82,6 +82,7 @@ impl UploadPipeline {
             base_retry_delay: std::time::Duration::from_secs(1),
             device_id: server.device_id.clone(),
             library: None,
+            auth_rejected: Default::default(),
         };
 
         let (pause_tx, _pause_rx) = watch::channel(false);
@@ -163,6 +164,15 @@ impl UploadPipeline {
     pub fn resume(&self) {
         self.worker.resume();
         let _ = self._pause_tx.send(false);
+    }
+
+    /// True once the server has rejected this pipeline's API key (401).
+    /// The worker is holding; a new key means a new pipeline (#143).
+    pub fn auth_rejected(&self) -> bool {
+        self.worker
+            .config()
+            .auth_rejected
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Return current queue statistics.
