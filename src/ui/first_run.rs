@@ -32,6 +32,7 @@ pub fn run_first_run_wizard() -> Option<Config> {
         server_url: String::new(),
         api_key: String::new(),
         test_status: String::new(),
+        sign_in: Default::default(),
         watch_folder: default_pictures_folder(),
         enable_autostart: true,
         result: None,
@@ -81,6 +82,7 @@ struct WizardApp {
     server_url: String,
     api_key: String,
     test_status: String,
+    sign_in: crate::ui::sign_in::SignIn,
     watch_folder: String,
     enable_autostart: bool,
     result: Option<Config>,
@@ -139,7 +141,7 @@ impl WizardApp {
     fn show_server_config(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading("Connect to Immich");
         ui.add_space(8.0);
-        ui.label("Enter your Immich server URL and API key.");
+        ui.label("Enter your Immich server URL, then sign in or paste an API key.");
         ui.add_space(12.0);
 
         egui::Grid::new("wizard_server_grid")
@@ -161,6 +163,13 @@ impl WizardApp {
                 );
                 ui.end_row();
             });
+
+        ui.add_space(8.0);
+        if let Some(key) = self.sign_in.ui(ui, ctx, &self.server_url) {
+            self.sign_in.status =
+                crate::ui::sign_in::persist_signed_in_key(&mut self.config, &self.server_url, &key);
+            self.api_key = key;
+        }
 
         ui.add_space(12.0);
 

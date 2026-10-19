@@ -71,6 +71,9 @@ pub struct App {
     update_ready: bool,
     /// The "can't read the API key" notification fires once per run (#114).
     key_error_notified: bool,
+    /// The "API key rejected, sign in again" notification fires once per
+    /// pipeline (#143).
+    auth_rejected_notified: bool,
     /// When the last server-reachability ping fired. The tray's Offline state
     /// is driven by this ... a single failed ping flips us to Offline, and
     /// a successful ping (or starting an upload, since uploads imply
@@ -152,6 +155,7 @@ impl App {
             pending_update: None,
             update_ready: false,
             key_error_notified: false,
+            auth_rejected_notified: false,
             last_ping_at: Instant::now(),
             ping_rx: None,
             server_offline: false,
@@ -184,8 +188,10 @@ impl App {
             // Clean up expired trash files on startup.
             if let Ok(folders) = db.get_folders() {
                 crate::upload::worker::cleanup_trash(
+                    &db,
                     &folders,
                     self.config.upload.trash_retention_days,
+                    chrono::Utc::now(),
                 );
             }
         }
@@ -343,8 +349,10 @@ impl App {
                 let db = self.db.inner().lock().unwrap();
                 if let Ok(folders) = db.get_folders() {
                     crate::upload::worker::cleanup_trash(
+                        &db,
                         &folders,
                         self.config.upload.trash_retention_days,
+                        chrono::Utc::now(),
                     );
                 }
             }
@@ -743,7 +751,25 @@ impl App {
                         self.client = None;
                     }
                 }
+            } else {
+                // No URL or no key now: there's nothing to upload with.
+                self.client = None;
             }
+        }
+
+        // A new key or server: the running pipeline holds the old client, so
+        // stop it and let start_pipeline below build one with the new key.
+        // Before this, a key changed in Settings (or a sign-in after a 401)
+        // didn't reach the uploads until a restart (#143).
+        if server_changed {
+            if let Some(mut old) = self.pipeline.take() {
+                info!("Server or key changed; rebuilding the upload pipeline");
+                let rt = self.runtime.clone();
+                rt.block_on(async {
+                    old.stop().await;
+                });
+            }
+            self.auth_rejected_notified = false;
         }
 
         // A reload that fixed (or still has) an unreadable key: start the
@@ -843,6 +869,25 @@ impl App {
             .as_ref()
             .map(|e| e.health())
             .unwrap_or(crate::watch::EngineHealth::Healthy);
+
+        // A rejected key outranks everything else in the tray: nothing will
+        // upload until the user signs in again (#143).
+        if self.pipeline.as_ref().is_some_and(|p| p.auth_rejected()) {
+            if let Some(ref mut tray) = self.tray {
+                tray.update_state(TrayState::Error(
+                    "Immich rejected the API key — sign in again in Settings".to_owned(),
+                ));
+            }
+            if !self.auth_rejected_notified {
+                self.auth_rejected_notified = true;
+                self.notifications.show_toast_raw(
+                    "Sign in to Immich again",
+                    "Immich rejected ImmichSync's API key (revoked or expired). Uploads are \
+                     paused, nothing is lost. Open Settings and sign in again.",
+                );
+            }
+            return;
+        }
 
         if let Some(ref pipeline) = self.pipeline {
             if let Ok(stats) = pipeline.stats() {
