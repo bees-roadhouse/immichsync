@@ -45,39 +45,13 @@ const OFFLINE_BODY_OPACITY: f32 = 0.4;
 const SLASH_HALF: f32 = 1.75;
 const SLASH_GAP: f32 = 1.5;
 
-/// Convert near-white background pixels to transparent.
+/// Key out the source's flat background, for every icon output (Windows
+/// and macOS).
 ///
-/// The source is a logo on a near-white opaque background (R,G,B ~= 240..255,
-/// A = 255). Pixels within `STRICT` of white become fully transparent; pixels
-/// between `STRICT` and `SOFT` of white get a linear alpha falloff for soft
-/// edges.
-pub fn strip_white_background(src: &RgbaImage) -> RgbaImage {
-    const STRICT: i32 = 235;
-    const SOFT: i32 = 250;
-
-    let mut out = src.clone();
-    for px in out.pixels_mut() {
-        let r = px.0[0] as i32;
-        let g = px.0[1] as i32;
-        let b = px.0[2] as i32;
-        let min = r.min(g).min(b);
-        if min >= SOFT {
-            px.0[3] = 0;
-        } else if min >= STRICT {
-            // Linear falloff: SOFT -> 0 alpha, STRICT -> 255 alpha.
-            let t = (SOFT - min) as f32 / (SOFT - STRICT) as f32;
-            px.0[3] = (t * 255.0).round().clamp(0.0, 255.0) as u8;
-        }
-    }
-    out
-}
-
-/// Key out the source's flat background for the macOS art.
-///
-/// `strip_white_background` (the Windows pipeline) only clears pixels at 250+
-/// and the source background is RGB 246, so it leaves a 27%-alpha grey
-/// square behind the logo. Here the background colour is read from the
-/// top-left corner instead, and alpha ramps from 0 at `NEAR` to 255 at `FAR`
+/// The source background is RGB 246, not white, so a white-threshold strip
+/// (the old Windows pipeline, 250+) left a 27%-alpha grey square behind the
+/// logo (#121). The background colour is read from the top-left corner
+/// instead, and alpha ramps from 0 at `NEAR` to 255 at `FAR`
 /// (largest per-channel difference from that colour), which keeps the
 /// blades' soft light outlines.
 pub fn key_out_background(src: &RgbaImage) -> RgbaImage {
