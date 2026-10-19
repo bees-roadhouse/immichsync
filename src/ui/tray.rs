@@ -11,6 +11,9 @@
 //     image-decode cost and no `image` crate at runtime.
 //   * Three logical states: Idle (static), Syncing (frame-cycle every
 //     ~100ms), Offline (desaturated + corner slash badge).
+//   * On macOS the menu bar shows 36x36 template images instead (black plus
+//     alpha, tinted by macOS for light and dark menu bars; issue #119). The
+//     colour 32x32 set stays the window icon there. `tray_art` picks the set.
 //   * Frame cycling is driven externally from `app.rs::run`'s main loop
 //     calling `tick_animation()` once per pass; the tray owns the
 //     timer + frame index.
@@ -103,12 +106,16 @@ pub const ROT_FRAME_COUNT: usize = 12;
 pub const ROT_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
 const IDLE_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icons/tray_idle.rgba"));
+// On macOS the tray shows the template set in `tray_art`; these colour
+// frames are kept only for the unit tests there.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 const OFFLINE_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icons/tray_offline.rgba"));
 
 /// All rotation frames. Each is a 32x32 RGBA8 raw bitmap.
 ///
 /// Frame 0 is the canonical orientation (matches `IDLE_RGBA`). Frames 1..11
 /// are rotated clockwise in 30 degree increments.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 const ROT_FRAMES: [&[u8]; ROT_FRAME_COUNT] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/icons/tray_rot_00.rgba")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icons/tray_rot_01.rgba")),
@@ -134,15 +141,67 @@ const _: () = {
     // first frame; build.rs writes them with a fixed format so if one is
     // right the rest are too.
     assert!(ROT_FRAMES[0].len() == TRAY_ICON_BYTES);
+    assert!(tray_art::IDLE.len() == tray_art::BYTES);
+    assert!(tray_art::OFFLINE.len() == tray_art::BYTES);
+    assert!(tray_art::ROT[0].len() == tray_art::BYTES);
 };
 
-/// Build a tray-icon `Icon` from a raw RGBA8 blob of `TRAY_ICON_SIZE` square.
+/// The frames the tray actually shows. Windows: the colour set above.
+#[cfg(not(target_os = "macos"))]
+mod tray_art {
+    pub const SIZE: u32 = super::TRAY_ICON_SIZE;
+    pub const BYTES: usize = super::TRAY_ICON_BYTES;
+    pub const TEMPLATE: bool = false;
+    pub const IDLE: &[u8] = super::IDLE_RGBA;
+    pub const OFFLINE: &[u8] = super::OFFLINE_RGBA;
+    pub const ROT: [&[u8]; super::ROT_FRAME_COUNT] = super::ROT_FRAMES;
+}
+
+/// The frames the tray actually shows. macOS: 36x36 (18 pt @2x) template
+/// images from build/macos_icon.rs, black plus alpha. Offline/paused/error
+/// is the silhouette dimmed with a slash through it.
+#[cfg(target_os = "macos")]
+mod tray_art {
+    pub const SIZE: u32 = 36;
+    pub const BYTES: usize = (SIZE as usize) * (SIZE as usize) * 4;
+    pub const TEMPLATE: bool = true;
+    pub const IDLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icons/menubar_idle.rgba"));
+    pub const OFFLINE: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/icons/menubar_offline.rgba"));
+    pub const ROT: [&[u8]; super::ROT_FRAME_COUNT] = [
+        include_bytes!(concat!(env!("OUT_DIR"), "/icons/menubar_rot_00.rgba")),
+        include_bytes!(concat!(env!("OUT_DIR"), "/icons/menubar_rot_01.rgba")),
+        include_bytes!(concat!(env!("OUT_DIR"), "/icons/menubar_rot_02.rgba")),
+        include_bytes!(concat!(env!("OUT_DIR"), "/icons/menubar_rot_03.rgba")),
+        include_bytes!(concat!(env!("OUT_DIR"), "/icons/menubar_rot_04.rgba")),
+        include_bytes!(concat!(env!("OUT_DIR"), "/icons/menubar_rot_05.rgba")),
+        include_bytes!(concat!(env!("OUT_DIR"), "/icons/menubar_rot_06.rgba")),
+        include_bytes!(concat!(env!("OUT_DIR"), "/icons/menubar_rot_07.rgba")),
+        include_bytes!(concat!(env!("OUT_DIR"), "/icons/menubar_rot_08.rgba")),
+        include_bytes!(concat!(env!("OUT_DIR"), "/icons/menubar_rot_09.rgba")),
+        include_bytes!(concat!(env!("OUT_DIR"), "/icons/menubar_rot_10.rgba")),
+        include_bytes!(concat!(env!("OUT_DIR"), "/icons/menubar_rot_11.rgba")),
+    ];
+}
+
+/// Build a tray-icon `Icon` from a raw RGBA8 blob of `tray_art::SIZE` square.
 fn icon_from_rgba(rgba: &[u8]) -> Result<Icon, TrayError> {
     // tray-icon takes ownership of the Vec, so we clone the static slice
-    // into a fresh allocation each time. Cheap (4 KiB per swap) and lets
+    // into a fresh allocation each time. Cheap (4-5 KiB per swap) and lets
     // the static slices stay 'static.
-    Icon::from_rgba(rgba.to_vec(), TRAY_ICON_SIZE, TRAY_ICON_SIZE)
+    Icon::from_rgba(rgba.to_vec(), tray_art::SIZE, tray_art::SIZE)
         .map_err(|e| TrayError::IconCreate(e.to_string()))
+}
+
+/// Swap the tray icon. On macOS, tray-icon 0.19's `set_icon` resets the
+/// NSImage template flag to false, so the template is re-applied with the
+/// icon; off macOS `set_icon_with_as_template` is a no-op, so plain
+/// `set_icon` is the only call that works there.
+fn show_icon(tray: &TrayIcon, icon: Icon) {
+    #[cfg(target_os = "macos")]
+    let _ = tray.set_icon_with_as_template(Some(icon), tray_art::TEMPLATE);
+    #[cfg(not(target_os = "macos"))]
+    let _ = tray.set_icon(Some(icon));
 }
 
 /// The RGBA blob for the canonical (frame-0) brand icon. Used by window
@@ -167,14 +226,14 @@ pub fn brand_icon_dimensions() -> (u32, u32) {
 /// frame index when first entering Syncing (frame 0).
 fn static_icon_for_state(state: &TrayState) -> Result<Icon, TrayError> {
     match state {
-        TrayState::Idle => icon_from_rgba(IDLE_RGBA),
-        TrayState::Syncing { .. } => icon_from_rgba(ROT_FRAMES[0]),
+        TrayState::Idle => icon_from_rgba(tray_art::IDLE),
+        TrayState::Syncing { .. } => icon_from_rgba(tray_art::ROT[0]),
         // Paused / Error / Offline all use the offline overlay variant.
         // Distinct error states differ in tooltip + status text, not in
         // the icon. (Out of scope: a separate "paused" badge variant.)
-        TrayState::Paused => icon_from_rgba(OFFLINE_RGBA),
-        TrayState::Error(_) => icon_from_rgba(OFFLINE_RGBA),
-        TrayState::Offline => icon_from_rgba(OFFLINE_RGBA),
+        TrayState::Paused => icon_from_rgba(tray_art::OFFLINE),
+        TrayState::Error(_) => icon_from_rgba(tray_art::OFFLINE),
+        TrayState::Offline => icon_from_rgba(tray_art::OFFLINE),
     }
 }
 
@@ -349,6 +408,7 @@ impl TrayApp {
             tooltip: Some(tooltip_for_state(&initial_state)),
             menu: Some(Box::new(menu)),
             icon: Some(icon),
+            icon_is_template: tray_art::TEMPLATE,
             ..Default::default()
         })
         .map_err(|e| TrayError::Build(e.to_string()))?;
@@ -425,7 +485,7 @@ impl TrayApp {
 
         // Update icon.
         if let Ok(icon) = static_icon_for_state(&state) {
-            let _ = self._tray.set_icon(Some(icon));
+            show_icon(&self._tray, icon);
         }
 
         // Snap the rotation cursor on any non-syncing entry so a future
@@ -493,8 +553,8 @@ impl TrayApp {
         // catch-up after a long pause.
         self.next_frame_at = Some(now + ROT_FRAME_INTERVAL);
 
-        if let Ok(icon) = icon_from_rgba(ROT_FRAMES[self.rot_frame]) {
-            let _ = self._tray.set_icon(Some(icon));
+        if let Ok(icon) = icon_from_rgba(tray_art::ROT[self.rot_frame]) {
+            show_icon(&self._tray, icon);
         }
     }
 
@@ -600,6 +660,39 @@ mod tests {
     fn offline_blob_differs_from_idle() {
         // Sanity: the offline overlay must visibly differ from idle.
         assert_ne!(IDLE_RGBA, OFFLINE_RGBA);
+    }
+
+    #[test]
+    fn shown_frames_are_complete_and_consistent() {
+        // Whatever set this platform shows: twelve frames of the right size,
+        // frame 0 is idle (no twitch entering Syncing), offline differs.
+        assert_eq!(tray_art::ROT.len(), ROT_FRAME_COUNT);
+        for frame in tray_art::ROT {
+            assert_eq!(frame.len(), tray_art::BYTES);
+        }
+        assert_eq!(tray_art::ROT[0], tray_art::IDLE);
+        assert_ne!(tray_art::IDLE, tray_art::OFFLINE);
+        assert!(icon_from_rgba(tray_art::IDLE).is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_menu_bar_frames_are_template_images() {
+        assert_eq!(tray_art::SIZE, 36);
+        let mut blobs = vec![tray_art::IDLE, tray_art::OFFLINE];
+        blobs.extend(tray_art::ROT);
+        for blob in blobs {
+            let mut solid = 0;
+            for px in blob.as_chunks::<4>().0 {
+                if px[3] > 0 {
+                    assert_eq!(&px[..3], &[0, 0, 0], "template pixels are black plus alpha");
+                }
+                if px[3] == 255 {
+                    solid += 1;
+                }
+            }
+            assert!(solid > 50, "each frame has a solid silhouette");
+        }
     }
 
     #[test]
