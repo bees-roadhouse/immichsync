@@ -624,6 +624,19 @@ impl App {
             }
             TrayAction::CheckForUpdates => {
                 info!("Manual update check requested");
+                if self.update_ready {
+                    let version = self
+                        .pending_update
+                        .as_ref()
+                        .map(|i| format!(" v{}", i.new_version))
+                        .unwrap_or_default();
+                    self.notifications.show_toast_raw(
+                        "Update Ready",
+                        &format!(
+                            "ImmichSync{version} is already installed. Choose Restart to Update."
+                        ),
+                    );
+                }
                 self.schedule_update_check(false);
             }
             TrayAction::OpenUpdateDialog => {
@@ -1041,13 +1054,19 @@ impl App {
     ///
     /// If `with_delay` is true, waits `STARTUP_DELAY` before checking.
     fn schedule_update_check(&mut self, with_delay: bool) {
-        if !crate::platform::SELF_UPDATE_SUPPORTED {
-            info!("No self-update asset is published for this platform; skipping check");
+        // Stamp first, so a skipped periodic check waits a full interval
+        // instead of retrying (and logging) on every tick.
+        self.last_update_check = Instant::now();
+        if let Some(reason) = update_check_skip_reason(
+            crate::platform::SELF_UPDATE_SUPPORTED,
+            self.update_ready,
+            self.update_download_rx.is_some(),
+        ) {
+            info!(reason, "Skipping update check");
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
         self.update_rx = Some(rx);
-        self.last_update_check = Instant::now();
 
         let repo = self.config.advanced.update_repo.clone();
         let channel = self.config.advanced.update_channel.clone();
@@ -1121,6 +1140,8 @@ impl App {
             Some(r) => r,
             None => return,
         };
+        // Done: no longer in flight (update_check_skip_reason reads this).
+        self.update_download_rx = None;
 
         match result {
             Ok(version) => {
@@ -1473,6 +1494,28 @@ fn spawn_window_subprocess(
     });
 }
 
+/// Why an update check should not run now, or `None` to run it.
+///
+/// Once an update is applied the process still reports the old version, so
+/// a check would find the same release and apply it again; on macOS that
+/// deletes the parked bundle this process runs from (#126). A check while a
+/// download is in flight would race it.
+fn update_check_skip_reason(
+    supported: bool,
+    update_ready: bool,
+    downloading: bool,
+) -> Option<&'static str> {
+    if !supported {
+        Some("no self-update asset is published for this platform")
+    } else if update_ready {
+        Some("an update is already applied; waiting for restart")
+    } else if downloading {
+        Some("an update download is in progress")
+    } else {
+        None
+    }
+}
+
 /// Find the watched folder that contains `file_path` by walking up the
 /// directory tree and checking against the canonical folder map.
 fn resolve_folder_id(
@@ -1603,6 +1646,14 @@ mod tests {
 
     /// Inverse of the above: a real new folder added to the DB still triggers
     /// a drift signal so PR #25's Settings → Remove convergence keeps working.
+    #[test]
+    fn update_checks_stop_once_an_update_is_applied_or_downloading() {
+        assert_eq!(update_check_skip_reason(true, false, false), None);
+        assert!(update_check_skip_reason(true, true, false).is_some());
+        assert!(update_check_skip_reason(true, false, true).is_some());
+        assert!(update_check_skip_reason(false, false, false).is_some());
+    }
+
     #[test]
     fn newly_added_real_folder_registers_as_drift() {
         let tmp = tempfile::tempdir().expect("tempdir");
