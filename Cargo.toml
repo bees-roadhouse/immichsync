@@ -112,7 +112,7 @@ winrt-notification = "0.5"
 # NSApplication pump for the menu-bar app (same majors tray-icon/winit pull in)
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSDate", "NSError", "NSFileManager", "NSKeyedArchiver", "NSSet", "NSRunLoop", "NSSortDescriptor", "NSString", "NSURL", "NSUUID", "NSValue"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder", "NSRunningApplication"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "libc", "NSApplication", "NSEvent", "NSResponder", "NSRunningApplication"] }
 # Login item: SMAppService.mainApp (bundled builds)
 objc2-service-management = { version = "0.3", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
 # API key in the login Keychain (already in the tree via native-tls)

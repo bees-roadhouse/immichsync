@@ -37,13 +37,17 @@ pub fn show_settings(config: Config, result_tx: Option<Sender<Config>>) {
         })),
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([520.0, 420.0])
-            .with_title("ImmichSync Settings")
+            .with_title(WINDOW_TITLE)
             .with_icon(crate::ui::window_icon::brand_icon_data()),
         ..Default::default()
     };
 
     // Load watched folders from database for the Watch Folders tab.
     let folders = load_folders();
+    let original_post_upload: HashMap<i64, PostUpload> = folders
+        .iter()
+        .map(|f| (f.id, f.post_upload.clone()))
+        .collect();
 
     // Hydrate per-folder editable pattern text (one glob per line) from the
     // JSON-encoded DB columns.
@@ -90,6 +94,8 @@ pub fn show_settings(config: Config, result_tx: Option<Sender<Config>>) {
         folders,
         folder_to_remove: None,
         apply_existing: HashMap::new(),
+        original_post_upload,
+        pending_new: Default::default(),
         include_text,
         exclude_text,
 
@@ -200,6 +206,11 @@ struct SettingsApp {
     folder_to_remove: Option<i64>,
     /// Transient per-folder checkbox: apply trash/delete to already-uploaded files on Save.
     apply_existing: HashMap<i64, bool>,
+    /// Each folder's After Upload action when this window opened, so the
+    /// apply-to-existing box defaults on only for a switch made here (#102).
+    original_post_upload: HashMap<i64, PostUpload>,
+    /// Folders added in this window: stored disabled, enabled on Save (#102).
+    pending_new: std::collections::HashSet<i64>,
     /// Transient per-folder include-patterns text buffer (one glob per line).
     include_text: HashMap<i64, String>,
     /// Transient per-folder exclude-patterns text buffer (one glob per line).
@@ -407,7 +418,7 @@ impl SettingsApp {
                                     ui.selectable_value(
                                         &mut post_selected,
                                         "trash".to_string(),
-                                        "Move to Trash",
+                                        crate::platform::TRASH_ACTION_LABEL,
                                     );
                                     ui.selectable_value(
                                         &mut post_selected,
@@ -418,9 +429,29 @@ impl SettingsApp {
                             folder.post_upload = PostUpload::from_str(&post_selected);
                         });
 
+                        if self.pending_new.contains(&folder.id) {
+                            ui.colored_label(
+                                ui.visuals().warn_fg_color,
+                                "New folder: choose After Upload, then Save to start watching.",
+                            );
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        if folder.post_upload == PostUpload::Trash {
+                            ui.small(format!(
+                                "Uploaded files move to {}\\{} and are deleted after {} days.",
+                                folder.path,
+                                crate::upload::worker::TRASH_DIR_NAME,
+                                self.config.upload.trash_retention_days
+                            ));
+                        }
+
                         // Show checkbox to apply action to already-uploaded files.
                         if folder.post_upload != PostUpload::Keep {
-                            let apply = self.apply_existing.entry(folder.id).or_insert(false);
+                            let default = apply_existing_default(
+                                self.original_post_upload.get(&folder.id),
+                                &folder.post_upload,
+                            );
+                            let apply = self.apply_existing.entry(folder.id).or_insert(default);
                             let label = match folder.post_upload {
                                 PostUpload::Trash => "Also trash already-uploaded files",
                                 PostUpload::Delete => "Also delete already-uploaded files",
@@ -725,6 +756,16 @@ impl SettingsApp {
 
         // Save folder changes to database.
         self.save_folders();
+        // What was just saved is the new baseline: new folders are no longer
+        // pending, and an apply-to-existing that just ran won't run again
+        // on the next Save.
+        self.pending_new.clear();
+        self.apply_existing.clear();
+        self.original_post_upload = self
+            .folders
+            .iter()
+            .map(|f| (f.id, f.post_upload.clone()))
+            .collect();
 
         // Toggle autostart.
         if let Err(e) = crate::platform::set_autostart(self.autostart) {
@@ -775,10 +816,14 @@ impl SettingsApp {
         }
 
         if let Ok(db) = open_db() {
-            match db.add_folder(&path_str, None, false) {
+            match db.add_folder_pending(&path_str) {
                 Ok(id) => {
+                    self.pending_new.insert(id);
+                    self.original_post_upload.insert(id, PostUpload::Keep);
                     // Re-load from DB to get all fields populated correctly.
-                    if let Ok(Some(folder)) = db.get_folder_by_path(&path_str) {
+                    if let Ok(Some(mut folder)) = db.get_folder_by_path(&path_str) {
+                        // Stored disabled; shown (and saved) enabled.
+                        folder.enabled = true;
                         self.folders.push(folder);
                     } else {
                         // Fallback: construct manually.
@@ -817,6 +862,8 @@ impl SettingsApp {
         }
         self.folders.retain(|f| f.id != id);
         self.include_text.remove(&id);
+        self.pending_new.remove(&id);
+        self.original_post_upload.remove(&id);
         self.exclude_text.remove(&id);
         self.apply_existing.remove(&id);
     }
@@ -978,6 +1025,18 @@ fn patterns_text_from_json(raw: Option<&str>) -> String {
 
 /// Convert a one-glob-per-line text buffer into a JSON array string for DB
 /// storage. Returns `None` if the buffer is empty (so the column stores NULL).
+/// The Settings window's title; the tray finds the window by it on Windows
+/// to bring it to the front (`platform::focus_window`).
+pub const WINDOW_TITLE: &str = "ImmichSync Settings";
+
+/// Whether "Also trash/delete already-uploaded files" starts ticked: yes when
+/// the folder was switched to Trash or Delete in this window (almost always
+/// what the user means, #102), no when it already had that action, so an
+/// unrelated Save never re-runs it.
+fn apply_existing_default(original: Option<&PostUpload>, current: &PostUpload) -> bool {
+    *current != PostUpload::Keep && original != Some(current)
+}
+
 fn patterns_text_to_json(text: &str) -> Option<String> {
     let lines: Vec<String> = text
         .lines()
@@ -992,6 +1051,20 @@ fn patterns_text_to_json(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_existing_defaults_on_only_for_a_switch_made_here() {
+        use PostUpload::*;
+        assert!(apply_existing_default(Some(&Keep), &Trash));
+        assert!(apply_existing_default(Some(&Keep), &Delete));
+        assert!(apply_existing_default(Some(&Trash), &Delete));
+        assert!(
+            !apply_existing_default(Some(&Trash), &Trash),
+            "already Trash: don't re-run"
+        );
+        assert!(!apply_existing_default(Some(&Delete), &Keep));
+        assert!(apply_existing_default(None, &Trash));
+    }
 
     #[test]
     fn empty_text_yields_none_json() {
