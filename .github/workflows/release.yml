@@ -19,8 +19,11 @@ on:
     tags:
       - "v*.*.*"
 
+# Read-only by default: cargo build scripts and dependencies run in the
+# build jobs, so only `publish` gets a write token, and no checkout keeps
+# its token in .git/config.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -37,12 +40,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Tag matches Cargo.toml and is on main
         id: version
         shell: bash
         run: |
-          manifest="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          manifest="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "immichsync") | .version')"
           tag="${GITHUB_REF_NAME#v}"
           if [ "$tag" != "$manifest" ]; then
             echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest"
@@ -64,6 +68,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -87,9 +93,8 @@ jobs:
           if-no-files-found: error
 
   build-macos:
-    # Ad-hoc signed until the Developer ID exists (#93): set the
-    # MACOS_SIGN_IDENTITY secret (and import the cert) to sign for real. See
-    # packaging/macos/make-app.sh.
+    # Ad-hoc signed (make-app.sh's default). Developer ID signing and
+    # notarization are #93; nothing here signs for real yet.
     name: Build macOS app
     needs: verify
     runs-on: macos-15
@@ -97,6 +102,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -123,6 +130,8 @@ jobs:
     name: Publish GitHub Release
     needs: [verify, build-windows, build-macos]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -135,6 +144,9 @@ jobs:
           name: ImmichSync ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true
+          # v0.3.0-rc1 and the like go to the prerelease channel only, so
+          # installs on "latest" never pick them up.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             dist/immichsync.exe
             dist/ImmichSync-${{ needs.verify.outputs.version }}-macos-arm64.zip
