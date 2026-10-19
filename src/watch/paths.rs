@@ -55,8 +55,22 @@ fn resolve(p: &std::path::Path) -> Option<String> {
 fn resolve(p: &std::path::Path) -> Option<String> {
     std::path::absolute(p).ok().map(|a| {
         let s = a.to_string_lossy();
-        s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+        trim_trailing_separators(s.strip_prefix(r"\\?\").unwrap_or(&s)).to_string()
     })
+}
+
+/// `C:\Users\me\` → `C:\Users\me`, keeping a bare root (`C:\`, `\\`)
+/// intact. (`~` expands via `home.join("")`, which adds a trailing one, and
+/// Windows `absolute` keeps whatever separators it was given.)
+#[cfg_attr(not(windows), allow(dead_code))]
+fn trim_trailing_separators(s: &str) -> &str {
+    let trimmed = s.trim_end_matches(['\\', '/']);
+    if trimmed.is_empty() || trimmed.ends_with(':') {
+        // Root: give back one separator.
+        &s[..(trimmed.len() + 1).min(s.len())]
+    } else {
+        trimmed
+    }
 }
 
 fn expand_tilde(p: &str) -> PathBuf {
@@ -77,9 +91,19 @@ mod tests {
 
     #[test]
     fn tilde_expands_to_home() {
-        let home = std::fs::canonicalize(dirs::home_dir().unwrap()).unwrap();
-        assert_eq!(normalize_folder("~").unwrap(), home.to_string_lossy());
-        assert_eq!(normalize_folder("  ~  ").unwrap(), home.to_string_lossy());
+        // The home folder in the same form normalize_folder produces.
+        let want = resolve(&dirs::home_dir().unwrap()).unwrap();
+        assert!(!want.ends_with(['\\', '/']), "trailing separator: {want}");
+        assert_eq!(normalize_folder("~").unwrap(), want);
+        assert_eq!(normalize_folder("  ~  ").unwrap(), want);
+    }
+
+    #[test]
+    fn trailing_separators_are_trimmed_but_roots_kept() {
+        assert_eq!(trim_trailing_separators(r"C:\Users\me\"), r"C:\Users\me");
+        assert_eq!(trim_trailing_separators("/Users/me//"), "/Users/me");
+        assert_eq!(trim_trailing_separators(r"C:\"), r"C:\");
+        assert_eq!(trim_trailing_separators("/"), "/");
     }
 
     #[test]

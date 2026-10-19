@@ -504,16 +504,29 @@ impl Database {
     /// rows stored before #99. Rows that don't resolve (folder missing, a
     /// drive not mounted) are left as they are, and so is a row whose
     /// canonical path another row already holds. Returns how many changed.
-    pub fn canonicalize_folder_paths(&self) -> usize {
+    pub fn canonicalize_folder_paths(&self) -> FolderPathMigration {
+        let mut out = FolderPathMigration::default();
         let Ok(folders) = self.get_folders() else {
-            return 0;
+            return out;
         };
-        let mut changed = 0;
         for f in &folders {
             let Ok(canon) = crate::watch::paths::normalize_folder(&f.path) else {
                 continue;
             };
-            if canon == f.path || folders.iter().any(|o| o.id != f.id && o.path == canon) {
+            if canon == f.path {
+                continue;
+            }
+            if let Some(other) = folders.iter().find(|o| o.id != f.id && o.path == canon) {
+                // `path` is UNIQUE: two rows name the same folder. Leave both
+                // and say so, so the duplicate can be removed in Settings.
+                tracing::warn!(
+                    folder_id = f.id,
+                    path = %f.path,
+                    canonical = %canon,
+                    duplicate_of = other.id,
+                    "Watched folder is a duplicate of another row; not migrated"
+                );
+                out.collisions += 1;
                 continue;
             }
             let res = self.conn.execute(
@@ -521,10 +534,10 @@ impl Database {
                 params![canon, Utc::now().to_rfc3339(), f.id],
             );
             if res.is_ok() {
-                changed += 1;
+                out.changed += 1;
             }
         }
-        changed
+        out
     }
 
     /// Update mutable fields of a watched folder.
@@ -1040,6 +1053,16 @@ impl crate::upload::queue::QueueStore for DbStore {
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
+/// What [`Database::canonicalize_folder_paths`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FolderPathMigration {
+    /// Rows rewritten to their canonical path.
+    pub changed: usize,
+    /// Rows left alone because another row already holds their canonical
+    /// path (logged as a warning each).
+    pub collisions: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1080,14 +1103,27 @@ mod tests {
             .add_folder(&other_canon.to_string_lossy(), None, false)
             .unwrap();
 
-        assert_eq!(db.canonicalize_folder_paths(), 1);
+        let m = db.canonicalize_folder_paths();
+        assert_eq!(
+            m,
+            FolderPathMigration {
+                changed: 1,
+                collisions: 1
+            }
+        );
         let path = |id| db.get_folder(id).unwrap().unwrap().path;
         assert_eq!(path(a), canon.to_string_lossy());
         assert_eq!(path(b), "/definitely/not/here");
         assert_eq!(path(c), link2.to_string_lossy());
         assert_eq!(path(d), other_canon.to_string_lossy());
-        // Idempotent.
-        assert_eq!(db.canonicalize_folder_paths(), 0);
+        // Idempotent; the collision is reported again, not resolved.
+        assert_eq!(
+            db.canonicalize_folder_paths(),
+            FolderPathMigration {
+                changed: 0,
+                collisions: 1
+            }
+        );
     }
 
     // ── watched_folders ──────────────────────────────────────────────────────

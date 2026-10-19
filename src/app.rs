@@ -347,9 +347,13 @@ impl App {
         {
             let db = self.db.inner().lock().unwrap();
             // Rows from before #99 may hold `~`, odd case or a symlink.
-            let migrated = db.canonicalize_folder_paths();
-            if migrated > 0 {
-                info!(migrated, "Canonicalised watched-folder paths");
+            let m = db.canonicalize_folder_paths();
+            if m.changed > 0 || m.collisions > 0 {
+                info!(
+                    changed = m.changed,
+                    duplicates = m.collisions,
+                    "Canonicalised watched-folder paths"
+                );
             }
             let folders = db.get_folders()?;
 
