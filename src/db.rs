@@ -1028,7 +1028,7 @@ impl Database {
                         source, photos_local_id
                  FROM upload_queue
                  WHERE status = 'pending'
-                 ORDER BY queued_at DESC
+                 ORDER BY queued_at DESC, id DESC
                  LIMIT ?1",
             )?;
 

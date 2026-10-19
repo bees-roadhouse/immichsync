@@ -125,6 +125,13 @@ pub struct SyncOutcome {
     pub queued: usize,
 }
 
+/// The upload queue hands out the most recently queued entry first
+/// (`dequeue_pending`), so ids meant to upload in `ids` order are queued in
+/// reverse.
+fn upload_order_to_queue_order(ids: &[String]) -> Vec<String> {
+    ids.iter().rev().cloned().collect()
+}
+
 /// One sync pass; see the module comment.
 pub fn sync_pass(
     library: &dyn PhotosLibrary,
@@ -141,7 +148,8 @@ pub fn sync_pass(
                         "Photos edits and deletes ignored (originals only, no delete sync)"
                     );
                 }
-                let queued = store.enqueue_photos_new(&changes.inserted)?;
+                let queued =
+                    store.enqueue_photos_new(&upload_order_to_queue_order(&changes.inserted))?;
                 store.set_photos_change_token(&changes.token)?;
                 info!(
                     inserted = changes.inserted.len(),
@@ -165,7 +173,7 @@ pub fn sync_pass(
     // harmless: it's already queued).
     let token = library.current_token()?;
     let ids = library.all_asset_ids(newest_first)?;
-    let queued = store.enqueue_photos_new(&ids)?;
+    let queued = store.enqueue_photos_new(&upload_order_to_queue_order(&ids))?;
     store.set_photos_change_token(&token)?;
     info!(seen = ids.len(), queued, "Photos library: full sync");
     Ok(SyncOutcome {
@@ -438,21 +446,28 @@ mod tests {
     }
 
     #[test]
-    fn the_full_pass_queues_in_the_configured_order() {
-        let lib = FakeLibrary::with(&["old", "mid", "new"]);
-        let store = store();
-        sync_pass(&lib, &store, true).unwrap();
-        let order: Vec<String> = store
-            .inner()
-            .lock()
-            .unwrap()
-            .get_recent_queue_entries(10)
-            .unwrap()
-            .into_iter()
-            .rev()
-            .filter_map(|e| e.photos_local_id)
-            .collect();
-        assert_eq!(order, ["new", "mid", "old"]);
+    /// What matters is the order the worker *uploads* in, which is the
+    /// order `dequeue_pending` hands entries out (Pia's review on #137: the
+    /// queue is newest-queued first, which reversed the enumeration).
+    fn the_full_pass_uploads_in_the_configured_order() {
+        for (newest_first, want) in [
+            (true, ["new", "mid", "old"]),
+            (false, ["old", "mid", "new"]),
+        ] {
+            let lib = FakeLibrary::with(&["old", "mid", "new"]);
+            let store = store();
+            sync_pass(&lib, &store, newest_first).unwrap();
+            let order: Vec<String> = store
+                .inner()
+                .lock()
+                .unwrap()
+                .dequeue_pending(1000)
+                .unwrap()
+                .into_iter()
+                .filter_map(|e| e.photos_local_id)
+                .collect();
+            assert_eq!(order, want, "newest_first = {newest_first}");
+        }
     }
 
     #[test]

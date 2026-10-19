@@ -935,36 +935,6 @@ async fn process_library_item(
     );
     let label = format!("photos:{local_id}/{}", export.resource);
 
-    // A Live Photo's motion video goes up first; the still links to it, and
-    // is never marked done before it (#83).
-    let live_video_id = match export.paired_video.as_deref() {
-        None => None,
-        Some(video) => {
-            match upload_paired_video(
-                &local_id,
-                video,
-                &export,
-                store.as_ref(),
-                uploader.as_ref(),
-                config,
-            )
-            .await
-            {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    drop(cleanup);
-                    return fail_or_retry(
-                        &entry,
-                        store.as_ref(),
-                        config,
-                        &format!("Live Photo video: {e:#}"),
-                    )
-                    .await;
-                }
-            }
-        }
-    };
-
     let hash = match crate::upload::hasher::hash_file(&export.path) {
         Ok(h) => h,
         Err(e) => {
@@ -1000,6 +970,38 @@ async fn process_library_item(
         let _ = store.mark_completed(entry.id, None);
         return;
     }
+
+    // A Live Photo's motion video goes up first; the still links to it, and
+    // is never marked done before it (#83). Only now, once the still is known
+    // not to be in Immich already: a video uploaded for a still that's
+    // already there would sit unlinked in the timeline.
+    let live_video_id = match export.paired_video.as_deref() {
+        None => None,
+        Some(video) => {
+            match upload_paired_video(
+                &local_id,
+                video,
+                &export,
+                store.as_ref(),
+                uploader.as_ref(),
+                config,
+            )
+            .await
+            {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    drop(cleanup);
+                    return fail_or_retry(
+                        &entry,
+                        store.as_ref(),
+                        config,
+                        &format!("Live Photo video: {e:#}"),
+                    )
+                    .await;
+                }
+            }
+        }
+    };
 
     let device_asset_id = photos_device_asset_id(&local_id, export.resource);
     let result = match live_video_id.as_deref() {
@@ -1148,8 +1150,14 @@ pub(crate) async fn place_in_albums(
     uploader: &dyn AssetUploader,
 ) {
     let policy = &library.albums;
-    if policy.mirror && !albums.is_empty() {
-        let _serial = library.album_lock.lock().await;
+    let mirror = policy.mirror && !albums.is_empty();
+    if !mirror && policy.all_in.is_none() {
+        return;
+    }
+    // Both kinds can create an album on first need (the catch-all by name),
+    // so both run under the lock.
+    let _serial = library.album_lock.lock().await;
+    if mirror {
         for album in albums {
             if let Err(e) = place_in_mirror(asset_id, album, store, uploader).await {
                 warn!(album = %album.title, error = %e, "Failed to add asset to mirrored album");
@@ -2003,6 +2011,8 @@ mod tests {
         by_name: Mutex<Vec<(String, String)>>,
         gone: Mutex<std::collections::HashSet<String>>,
         create_delay: Duration,
+        /// Catch-all albums made by name (get-or-create, like the client).
+        by_name_created: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -2029,6 +2039,18 @@ mod tests {
         }
 
         async fn add_asset_to_album(&self, album: &str, asset_id: &str) -> anyhow::Result<()> {
+            // Get-or-create by name, with the same check-then-create gap the
+            // real client has.
+            let exists = self
+                .by_name_created
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|n| n == album);
+            if !exists {
+                tokio::time::sleep(self.create_delay).await;
+                self.by_name_created.lock().unwrap().push(album.to_string());
+            }
             self.by_name
                 .lock()
                 .unwrap()
@@ -2393,6 +2415,47 @@ mod tests {
         }
     }
 
+    /// If the still is already in Immich (same SHA-1, e.g. uploaded from a
+    /// watched folder), its motion video must not go up on its own: it would
+    /// sit in the timeline as an unlinked, visible video (Pia's review on
+    /// #138). Nothing is uploaded; the existing still joins its albums.
+    #[tokio::test]
+    async fn a_live_photo_whose_still_is_already_uploaded_uploads_no_video() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MockStore::default());
+        let probe = dir.path().join("probe");
+        std::fs::write(&probe, "original bytes of LIVE").unwrap();
+        let still_hash = crate::upload::hasher::hash_file(&probe).unwrap();
+        store
+            .uploaded
+            .lock()
+            .unwrap()
+            .insert(still_hash, "imm-still".to_string());
+        let uploader = Arc::new(RecordingUploader::default());
+        let exporter = live_exporter(dir.path());
+
+        let done = run_one_photos_entry(
+            &store,
+            uploader.clone(),
+            &library_config(exporter.clone()),
+            "LIVE",
+        )
+        .await;
+
+        assert_eq!(done.status, "completed");
+        assert!(
+            uploader.uploads.lock().unwrap().is_empty(),
+            "no unlinked video"
+        );
+        assert_eq!(
+            *uploader.albums.lock().unwrap(),
+            vec![("immichsync test".to_string(), "imm-still".to_string())]
+        );
+        for p in exporter.exported.lock().unwrap().iter() {
+            assert!(!p.exists(), "{} must be deleted", p.display());
+        }
+    }
+
     /// A retry after the still failed doesn't upload the video again: the
     /// still links to the video already on the server.
     #[tokio::test]
@@ -2580,6 +2643,29 @@ mod tests {
         b.await.unwrap();
         assert_eq!(server.created.lock().unwrap().len(), 1);
         assert_eq!(server.added.lock().unwrap().len(), 2);
+    }
+
+    /// The catch-all album is found-or-created by name; two workers placing
+    /// at once must not create it twice (Pia's review on #132).
+    #[tokio::test]
+    async fn concurrent_placements_create_the_catch_all_once() {
+        let store = Arc::new(MockStore::default());
+        let server = Arc::new(AlbumServer {
+            create_delay: Duration::from_millis(50),
+            ..AlbumServer::default()
+        });
+        let lib = Arc::new(source(false, Some("Everything")));
+        let run = |asset: &'static str| {
+            let (store, server, lib) = (store.clone(), server.clone(), lib.clone());
+            tokio::spawn(async move {
+                place_in_albums(asset, &[], &lib, store.as_ref(), server.as_ref()).await
+            })
+        };
+        let (a, b) = (run("imm-1"), run("imm-2"));
+        a.await.unwrap();
+        b.await.unwrap();
+        assert_eq!(server.by_name_created.lock().unwrap().len(), 1);
+        assert_eq!(server.by_name.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
