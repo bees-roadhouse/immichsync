@@ -132,6 +132,8 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 # Temp files in tests
 [dev-dependencies]
 tempfile = "3"
+# tests/macos_icon.rs exercises build/macos_icon.rs, the same art build.rs runs
+image = { version = "0.25", default-features = false, features = ["webp", "png"] }
 
 # Build-time icon pipeline:
 # - Read assets/icon-source.webp via `image`

@@ -16,14 +16,27 @@
 //                                 clockwise in 30-degree increments. NN = 00..11.
 //                                 100ms-per-frame cycle gives one full revolution per 1.2s.
 //
+// macOS targets only (issue #119; the art is in build/macos_icon.rs, shared
+// with tests/macos_icon.rs):
+//   AppIcon.iconset/          ... the shutter on Apple's macOS icon grid (824 squircle
+//                                 tile on a 1024 canvas, drop shadow, light gradient),
+//                                 every size downscaled from the 1024 master.
+//   menubar_idle.rgba,        ... raw 36x36 RGBA8 template images (black plus alpha) for
+//   menubar_offline.rgba,         the menu bar, which macOS tints for light and dark
+//   menubar_rot_<NN>.rgba         menu bars. Same 12-frame rotation as the tray.
+//
 // The .rgba files are header-less ... they're known to be 32x32x4 bytes (4096 bytes each),
 // validated at runtime by a const assertion in tray.rs. This lets us ship pre-decoded
 // pixels and skip pulling the `image` crate into the runtime binary.
 
 use std::path::PathBuf;
 
-use image::imageops::FilterType;
 use image::{GenericImageView, ImageBuffer, Rgba, RgbaImage};
+
+#[path = "build/macos_icon.rs"]
+mod macos_icon;
+
+use macos_icon::{resize_high_quality, rotate_rgba, strip_white_background};
 
 const SOURCE_PATH: &str = "assets/icon-source.webp";
 
@@ -41,6 +54,7 @@ const ROT_FRAMES: u32 = 12;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build/macos_icon.rs");
     println!("cargo:rerun-if-changed={}", SOURCE_PATH);
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
@@ -95,11 +109,29 @@ fn main() {
         write_rgba(&icons_dir.join(name), &small);
     }
 
-    // ---- macOS app-bundle iconset ----
-    // packaging/macos/make-app.sh runs `iconutil -c icns` on this directory
-    // to produce Contents/Resources/AppIcon.icns.
+    // ---- macOS app icon and menu-bar templates ----
+    // packaging/macos/make-app.sh runs `iconutil -c icns` on AppIcon.iconset
+    // to produce Contents/Resources/AppIcon.icns. The menubar_*.rgba frames
+    // are included by src/ui/tray.rs on macOS only.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        build_iconset(&src_rgba, &icons_dir.join("AppIcon.iconset"));
+        let logo = macos_icon::crop_logo(&macos_icon::key_out_background(&src.to_rgba8()));
+        let master = macos_icon::app_icon_master(&logo);
+        macos_icon::write_iconset(&master, &icons_dir.join("AppIcon.iconset"));
+
+        let idle = macos_icon::menubar_template(&logo, 0.0);
+        write_rgba(&icons_dir.join("menubar_idle.rgba"), &idle);
+        write_rgba(
+            &icons_dir.join("menubar_offline.rgba"),
+            &macos_icon::menubar_offline(&idle),
+        );
+        for i in 0..ROT_FRAMES {
+            let degrees = (i as f32) * (360.0 / ROT_FRAMES as f32);
+            let frame = macos_icon::menubar_template(&logo, degrees);
+            write_rgba(
+                &icons_dir.join(format!("menubar_rot_{:02}.rgba", i)),
+                &frame,
+            );
+        }
     }
 
     // ---- Embed the .ico as the EXE resource icon ----
@@ -129,100 +161,6 @@ fn main() {
     }
 }
 
-/// Convert near-white background pixels to transparent.
-///
-/// The source is a logo on a near-white opaque background (R,G,B ~= 240..255,
-/// A = 255). We need transparency so the icon composites correctly on any
-/// taskbar/start-menu background, light or dark. Pixels within `STRICT` of
-/// white become fully transparent; pixels between `STRICT` and `SOFT` of
-/// white get a linear alpha falloff for soft edges.
-fn strip_white_background(src: &RgbaImage) -> RgbaImage {
-    const STRICT: i32 = 235;
-    const SOFT: i32 = 250;
-
-    let mut out = src.clone();
-    for px in out.pixels_mut() {
-        let r = px.0[0] as i32;
-        let g = px.0[1] as i32;
-        let b = px.0[2] as i32;
-        let min = r.min(g).min(b);
-        if min >= SOFT {
-            px.0[3] = 0;
-        } else if min >= STRICT {
-            // Linear falloff: SOFT -> 0 alpha, STRICT -> 255 alpha.
-            let t = (SOFT - min) as f32 / (SOFT - STRICT) as f32;
-            px.0[3] = (t * 255.0).round().clamp(0.0, 255.0) as u8;
-        }
-    }
-    out
-}
-
-/// Resize to `size`x`size` using Lanczos3 (high-quality downscale).
-fn resize_high_quality(src: &RgbaImage, size: u32) -> RgbaImage {
-    image::imageops::resize(src, size, size, FilterType::Lanczos3)
-}
-
-/// Rotate an RGBA image clockwise by `degrees` around the center, keeping
-/// the output dimensions the same as the input. Pixels outside the original
-/// canvas after rotation become transparent.
-fn rotate_rgba(src: &RgbaImage, degrees: f32) -> RgbaImage {
-    let (w, h) = src.dimensions();
-    let cx = (w as f32 - 1.0) / 2.0;
-    let cy = (h as f32 - 1.0) / 2.0;
-    // Positive degrees here means clockwise in screen coordinates (y down).
-    let rad = degrees.to_radians();
-    let cos = rad.cos();
-    let sin = rad.sin();
-
-    let mut out: RgbaImage = ImageBuffer::from_pixel(w, h, Rgba([0, 0, 0, 0]));
-    for y in 0..h {
-        for x in 0..w {
-            // Inverse map: for each output pixel, find the source pixel.
-            // dst = R(theta) * src  (clockwise, y-down)
-            //   dx = cos*sx + sin*sy
-            //   dy = -sin*sx + cos*sy
-            // Invert: src = R(-theta) * dst
-            //   sx =  cos*dx - sin*dy
-            //   sy =  sin*dx + cos*dy
-            let dx = x as f32 - cx;
-            let dy = y as f32 - cy;
-            let sx = cos * dx - sin * dy + cx;
-            let sy = sin * dx + cos * dy + cy;
-            if sx < 0.0 || sy < 0.0 || sx > (w as f32 - 1.0) || sy > (h as f32 - 1.0) {
-                continue;
-            }
-            // Bilinear sample.
-            let x0 = sx.floor() as u32;
-            let y0 = sy.floor() as u32;
-            let x1 = (x0 + 1).min(w - 1);
-            let y1 = (y0 + 1).min(h - 1);
-            let fx = sx - x0 as f32;
-            let fy = sy - y0 as f32;
-            let p00 = src.get_pixel(x0, y0).0;
-            let p10 = src.get_pixel(x1, y0).0;
-            let p01 = src.get_pixel(x0, y1).0;
-            let p11 = src.get_pixel(x1, y1).0;
-            let mut chan = [0f32; 4];
-            for c in 0..4 {
-                let top = p00[c] as f32 * (1.0 - fx) + p10[c] as f32 * fx;
-                let bot = p01[c] as f32 * (1.0 - fx) + p11[c] as f32 * fx;
-                chan[c] = top * (1.0 - fy) + bot * fy;
-            }
-            out.put_pixel(
-                x,
-                y,
-                Rgba([
-                    chan[0].round() as u8,
-                    chan[1].round() as u8,
-                    chan[2].round() as u8,
-                    chan[3].round() as u8,
-                ]),
-            );
-        }
-    }
-    out
-}
-
 /// Build the multi-resolution .ico file (icon.ico in OUT_DIR/icons/).
 ///
 /// Each entry is PNG-compressed (ICO supports PNG payloads since Vista; this
@@ -239,24 +177,6 @@ fn build_ico(src: &RgbaImage, out_dir: &std::path::Path) {
     let ico_path = out_dir.join("icon.ico");
     let file = std::fs::File::create(&ico_path).expect("create icon.ico");
     dir.write(file).expect("write icon.ico");
-}
-
-/// Write the PNG set `iconutil` expects: 16..512 pt at 1x and 2x.
-fn build_iconset(src: &RgbaImage, dir: &std::path::Path) {
-    std::fs::create_dir_all(dir).expect("create AppIcon.iconset");
-    for pt in [16u32, 32, 128, 256, 512] {
-        for scale in [1u32, 2] {
-            let px = pt * scale;
-            let name = if scale == 1 {
-                format!("icon_{pt}x{pt}.png")
-            } else {
-                format!("icon_{pt}x{pt}@2x.png")
-            };
-            resize_high_quality(src, px)
-                .save(dir.join(name))
-                .expect("write iconset png");
-        }
-    }
 }
 
 /// Build the offline overlay variant.
