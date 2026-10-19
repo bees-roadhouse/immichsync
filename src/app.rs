@@ -1060,7 +1060,7 @@ impl App {
         if let Some(reason) = update_check_skip_reason(
             crate::platform::SELF_UPDATE_SUPPORTED,
             self.update_ready,
-            self.update_download_rx.is_some(),
+            self.update_download_rx.is_some() || self.update_rx.is_some(),
         ) {
             info!(reason, "Skipping update check");
             return;
@@ -1088,6 +1088,8 @@ impl App {
             Some(r) => r,
             None => return,
         };
+        // Done: no longer in flight (update_check_skip_reason reads this).
+        self.update_rx = None;
 
         match result {
             UpdateCheckResult::Available(info) => {
@@ -1498,19 +1500,20 @@ fn spawn_window_subprocess(
 ///
 /// Once an update is applied the process still reports the old version, so
 /// a check would find the same release and apply it again; on macOS that
-/// deletes the parked bundle this process runs from (#126). A check while a
-/// download is in flight would race it.
+/// deletes the parked bundle this process runs from (#126). A check while
+/// another check or a download is in flight would race it: two `Available`
+/// results start two downloads.
 fn update_check_skip_reason(
     supported: bool,
     update_ready: bool,
-    downloading: bool,
+    busy: bool,
 ) -> Option<&'static str> {
     if !supported {
         Some("no self-update asset is published for this platform")
     } else if update_ready {
         Some("an update is already applied; waiting for restart")
-    } else if downloading {
-        Some("an update download is in progress")
+    } else if busy {
+        Some("an update check or download is in progress")
     } else {
         None
     }
