@@ -5,7 +5,8 @@
 // CAN rename it); macOS swaps the whole `.app` bundle from the release zip,
 // see platform::bundle_update (#75).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,51 @@ fn select_asset<'a>(
 ) -> Option<&'a GitHubAsset> {
     let want = target.asset_name(version);
     assets.iter().find(|a| a.name.eq_ignore_ascii_case(&want))
+}
+
+/// Set once this process has a newer version on disk that it isn't running
+/// yet (applied here, or reported applied by the update dialog).
+static UPDATE_APPLIED: AtomicBool = AtomicBool::new(false);
+
+/// Record that an update is on disk and waits for a restart (#128).
+pub fn note_update_applied() {
+    UPDATE_APPLIED.store(true, Ordering::SeqCst);
+}
+
+/// The executable to spawn a window subprocess from. Normally `default`;
+/// after an update is applied but before restart, the previous image, so
+/// Settings and the logs stay the same version as the running tray (and,
+/// on ad-hoc macOS builds, the same code identity, so the Keychain doesn't
+/// prompt early). Falls back to `default` if the old image is gone.
+pub fn window_exe(default: PathBuf) -> PathBuf {
+    if !UPDATE_APPLIED.load(Ordering::SeqCst) {
+        return default;
+    }
+    match previous_image(&default) {
+        Some(old) if old.exists() => {
+            debug!(exe = %old.display(), "Update pending restart: windows run the previous image");
+            old
+        }
+        _ => {
+            info!("Update pending restart but the previous image is gone; windows run the new one");
+            default
+        }
+    }
+}
+
+/// Where the image `exe` was parked by an update: `immichsync.exe.old` on
+/// Windows; inside `.ImmichSync.app.old` on macOS.
+fn previous_image(exe: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let bundle = crate::platform::bundle_update::bundle_of(exe)?;
+        let relative = exe.strip_prefix(&bundle).ok()?;
+        Some(crate::platform::bundle_update::old_bundle_path(&bundle).join(relative))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some(exe.with_extension("exe.old"))
+    }
 }
 
 /// Delay before the first automatic update check after startup.
@@ -503,6 +549,7 @@ pub fn apply_update(zip_path: &std::path::Path, new_version: &str) -> Result<(),
     let result = crate::platform::bundle_update::apply_zip(zip_path, &bundle);
     let _ = std::fs::remove_file(zip_path);
     result?;
+    note_update_applied();
     info!(version = new_version, "Update applied");
     Ok(())
 }
@@ -544,6 +591,7 @@ pub fn apply_update(new_exe_path: &std::path::Path, new_version: &str) -> Result
         .unwrap_or_else(|| PathBuf::from("version.txt"));
     let _ = std::fs::write(&version_file, new_version);
 
+    note_update_applied();
     info!(version = new_version, "Update applied");
     Ok(())
 }
@@ -827,6 +875,60 @@ mod tests {
         assert_eq!(newer_on_disk(Some("0.2.9"), "0.3.0"), None);
         assert_eq!(newer_on_disk(Some("garbage"), "0.3.0"), None);
         assert_eq!(newer_on_disk(None, "0.3.0"), None);
+    }
+
+    #[test]
+    fn previous_image_is_the_parked_copy() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            previous_image(Path::new(
+                "/Applications/ImmichSync.app/Contents/MacOS/immichsync"
+            )),
+            Some(PathBuf::from(
+                "/Applications/.ImmichSync.app.old/Contents/MacOS/immichsync"
+            ))
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            previous_image(Path::new("/tmp/target/debug/immichsync")),
+            None
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            previous_image(Path::new(r"C:\Apps\immichsync.exe")),
+            Some(PathBuf::from(r"C:\Apps\immichsync.exe.old"))
+        );
+    }
+
+    /// One test owns the process-wide flag, so the sequence is deterministic.
+    #[test]
+    fn window_exe_switches_to_the_old_image_only_after_an_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "macos")]
+        let (exe, old) = {
+            let app = tmp.path().join("ImmichSync.app/Contents/MacOS");
+            let old = tmp.path().join(".ImmichSync.app.old/Contents/MacOS");
+            std::fs::create_dir_all(&app).unwrap();
+            std::fs::create_dir_all(&old).unwrap();
+            (app.join("immichsync"), old.join("immichsync"))
+        };
+        #[cfg(not(target_os = "macos"))]
+        let (exe, old) = (
+            tmp.path().join("immichsync.exe"),
+            tmp.path().join("immichsync.exe.old"),
+        );
+        std::fs::write(&exe, b"new").unwrap();
+
+        assert_eq!(window_exe(exe.clone()), exe, "no update: the running exe");
+        note_update_applied();
+        assert_eq!(window_exe(exe.clone()), exe, "old image missing: fall back");
+        std::fs::write(&old, b"old").unwrap();
+        assert_eq!(
+            window_exe(exe.clone()),
+            old,
+            "update pending: the old image"
+        );
+        UPDATE_APPLIED.store(false, Ordering::SeqCst);
     }
 
     #[test]
