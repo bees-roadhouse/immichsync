@@ -76,6 +76,13 @@ const SKIP_DIR_NAMES: &[&str] = &[
 /// `SKIP_DIR_NAMES`, a Photos library (fast path), or, on macOS, any package
 /// directory (app libraries, bundles). The initial scan uses this to prune
 /// its walk, and `should_include` checks every ancestor of a file with it.
+/// True when any directory above `path` is one [`is_skipped_dir`] matches.
+/// Also guards the queue worker and post-upload actions, so an entry queued
+/// before #96 can't be uploaded from, or moved out of, an app library.
+pub fn in_skipped_dir(path: &Path) -> bool {
+    path.ancestors().skip(1).any(is_skipped_dir)
+}
+
 pub fn is_skipped_dir(dir: &Path) -> bool {
     let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
         return false;
@@ -780,6 +787,16 @@ mod tests {
             let top = dir.path().join(rel.split('/').next().unwrap());
             assert!(is_skipped_dir(&top), "{rel}: top dir not skipped");
         }
+    }
+
+    #[test]
+    fn in_skipped_dir_checks_every_ancestor() {
+        use std::path::Path;
+        assert!(in_skipped_dir(Path::new("/v/.Trashes/501/a.jpg")));
+        assert!(in_skipped_dir(Path::new(
+            "/p/Photos Library.photoslibrary/originals/A/x.heic"
+        )));
+        assert!(!in_skipped_dir(Path::new("/v/DCIM/100TEST/a.jpg")));
     }
 
     #[test]

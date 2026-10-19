@@ -308,6 +308,22 @@ async fn process_item(
     // watcher will re-skip on its next pass anyway. Mark the entry failed
     // with a recognisable marker; the watcher's reconciliation loop will
     // re-enqueue it once the file is local again.
+    // Entries queued before #96 may sit inside a package (an app's library),
+    // `.Trashes` or similar. Neither upload them nor let the post-upload
+    // action move them out of there.
+    if crate::watch::filter::in_skipped_dir(&path) {
+        info!(id = entry.id, path = %entry.file_path,
+            "Queued file is inside a skipped directory (package, trash, housekeeping); not uploading");
+        if let Err(e) = store.update_status(
+            entry.id,
+            "failed",
+            Some("inside a skipped directory (app library, trash or volume housekeeping)"),
+        ) {
+            error!(id = entry.id, error = %e, "Failed to mark skipped entry");
+        }
+        return;
+    }
+
     if let Ok(meta) = std::fs::metadata(&path) {
         if crate::watch::filter::is_online_file(&meta) {
             info!(
@@ -994,6 +1010,45 @@ mod tests {
         assert_eq!(stats.completed, 1);
         assert_eq!(stats.pending, 0);
         assert!(store.is_file_uploaded(&hash).unwrap());
+    }
+
+    /// #96: an entry queued before the filter learned about packages must
+    /// not be uploaded from (or later trashed out of) an app library.
+    #[tokio::test]
+    async fn worker_skips_entries_inside_skipped_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let inside = dir.path().join(".Trashes").join("501").join("IMG_0002.JPG");
+        std::fs::create_dir_all(inside.parent().unwrap()).unwrap();
+        std::fs::write(&inside, b"deleted on the card").unwrap();
+
+        let store = Arc::new(MockStore::default());
+        store
+            .enqueue(NewQueueEntry {
+                file_path: inside.display().to_string(),
+                file_hash: None,
+                file_size: Some(19),
+                folder_id: None,
+            })
+            .unwrap();
+        let entry = store
+            .dequeue_pending(1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let config = WorkerConfig {
+            concurrency: 1,
+            max_retries: 3,
+            base_retry_delay: Duration::from_millis(1),
+            device_id: "immichsync-test".to_string(),
+        };
+
+        process_item(entry, store.clone(), Arc::new(SucceedingUploader), &config).await;
+
+        let stats = store.get_queue_stats().unwrap();
+        assert_eq!(stats.completed, 0, "must not upload");
+        assert_eq!(stats.failed, 1);
+        assert!(inside.exists(), "must not move or delete the file");
     }
 
     #[tokio::test]
