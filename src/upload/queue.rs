@@ -48,6 +48,27 @@ pub trait QueueStore: Send + Sync {
         anyhow::bail!("this store has no Photos library support")
     }
 
+    /// The stored Photos change token (#81); `None` = enumerate everything.
+    fn photos_change_token(&self) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    fn set_photos_change_token(&self, _token: &[u8]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Queue each not-yet-seen Photos asset; returns how many were queued.
+    fn enqueue_photos_new(&self, local_ids: &[String]) -> anyhow::Result<usize> {
+        let mut queued = 0;
+        for id in local_ids {
+            if !self.photos_asset_seen(id)? {
+                self.enqueue_photos(id)?;
+                queued += 1;
+            }
+        }
+        Ok(queued)
+    }
+
     /// The Immich asset id of an earlier upload with this SHA-1.
     fn uploaded_asset_id(&self, _hash: &str) -> anyhow::Result<Option<String>> {
         Ok(None)

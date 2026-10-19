@@ -833,6 +833,48 @@ impl Database {
             .optional()?)
     }
 
+    // ── Photos change token (#81) ────────────────────────────────────────────
+
+    /// The archived `PHPersistentChangeToken` the next incremental sync
+    /// starts from. `None` = never synced (or reset): enumerate everything.
+    pub fn photos_change_token(&self) -> Result<Option<Vec<u8>>, DbError> {
+        use base64::Engine as _;
+        let text: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM config WHERE key = 'photos_change_token'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(text.and_then(|t| base64::engine::general_purpose::STANDARD.decode(t).ok()))
+    }
+
+    pub fn set_photos_change_token(&self, token: &[u8]) -> Result<(), DbError> {
+        use base64::Engine as _;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES ('photos_change_token', ?1)",
+            params![base64::engine::general_purpose::STANDARD.encode(token)],
+        )?;
+        Ok(())
+    }
+
+    /// Queue every Photos asset in `local_ids` not already queued or
+    /// recorded, in one transaction (a full sync can be tens of thousands).
+    /// Returns how many were queued.
+    pub fn enqueue_photos_new(&self, local_ids: &[String]) -> Result<usize, DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut queued = 0;
+        for id in local_ids {
+            if !self.photos_asset_seen(id)? {
+                self.enqueue_photos(id)?;
+                queued += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(queued)
+    }
+
     // ── mirrored_albums ──────────────────────────────────────────────────────
 
     pub fn mirrored_album(&self, collection_id: &str) -> Result<Option<MirroredAlbum>, DbError> {
@@ -1060,7 +1102,7 @@ impl Database {
                         source, photos_local_id
                  FROM upload_queue
                  WHERE status = 'pending'
-                 ORDER BY queued_at DESC
+                 ORDER BY queued_at DESC, id DESC
                  LIMIT ?1",
             )?;
 
@@ -1317,6 +1359,22 @@ impl crate::upload::queue::QueueStore for DbStore {
                 photos_local_id: e.photos_local_id,
             })
             .collect())
+    }
+
+    fn photos_change_token(&self) -> anyhow::Result<Option<Vec<u8>>> {
+        let db = self.db.lock().unwrap();
+        Ok(db.photos_change_token()?)
+    }
+
+    fn set_photos_change_token(&self, token: &[u8]) -> anyhow::Result<()> {
+        let db = self.db.lock().unwrap();
+        db.set_photos_change_token(token)?;
+        Ok(())
+    }
+
+    fn enqueue_photos_new(&self, local_ids: &[String]) -> anyhow::Result<usize> {
+        let db = self.db.lock().unwrap();
+        Ok(db.enqueue_photos_new(local_ids)?)
     }
 
     fn uploaded_asset_id(&self, hash: &str) -> anyhow::Result<Option<String>> {
