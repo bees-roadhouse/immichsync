@@ -139,8 +139,12 @@ Planned work belongs in [GitHub issues](https://github.com/bees-roadhouse/immich
 | `/api/assets/bulk-upload-check` | POST | Check duplicates before upload |
 | `/api/albums` | POST | Create album |
 | `/api/albums/{id}/assets` | PUT | Add assets to album |
+| `/api/server/features`, `/api/server/config` | GET | Is OAuth on, and its button text (sign-in, #143) |
+| `/api/oauth/authorize`, `/api/oauth/callback` | POST | Browser sign-in via loopback `http://127.0.0.1:47321/oauth/callback` |
+| `/api/api-keys` | POST | Mint the per-device key (scopes in `api::oauth::KEY_PERMISSIONS`) |
+| `/api/auth/logout` | POST | End the sign-in session; only the key remains |
 
-Auth: `x-api-key` header on all requests.
+Auth: `x-api-key` header on all requests, except the sign-in calls, which use the session's bearer token. A 401 holds the queue (`WorkerConfig::auth_rejected`) and the tray asks to sign in again; it never spends retries.
 
 ## Duplicate Prevention
 

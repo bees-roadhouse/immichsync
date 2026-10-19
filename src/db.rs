@@ -984,6 +984,16 @@ impl Database {
     /// Set `error_msg` to `Some(msg)` when transitioning to `failed`.
     /// `completed_at` is recorded automatically when the new status is
     /// `Completed` or `Failed`.
+    /// Back to `pending` with `retry_count` untouched (a rejected API key
+    /// isn't the entry's failure, #143).
+    pub fn requeue_without_retry(&self, id: i64) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE upload_queue SET status = 'pending', error_message = NULL WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_queue_status(
         &self,
         id: i64,
@@ -1260,6 +1270,12 @@ impl crate::upload::queue::QueueStore for DbStore {
         let db = self.db.lock().unwrap();
         let qs = QueueStatus::from_str(status);
         db.update_queue_status(id, &qs, error)?;
+        Ok(())
+    }
+
+    fn requeue_without_retry(&self, id: i64) -> anyhow::Result<()> {
+        let db = self.db.lock().unwrap();
+        db.requeue_without_retry(id)?;
         Ok(())
     }
 
