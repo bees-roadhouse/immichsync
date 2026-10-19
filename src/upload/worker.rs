@@ -684,10 +684,25 @@ async fn process_item(
                 }
             }
 
-            // Post-upload action: trash or delete the source file.
+            // Post-upload action: trash or delete the source file, but only
+            // if it is still the file that was hashed and uploaded (#102):
+            // one replaced between the hash and the end of the upload (a
+            // camera reusing IMG_0001.JPG) must never be removed.
             if let Some(folder_id) = entry.folder_id {
                 if let Ok(Some(folder)) = store.get_folder(folder_id) {
-                    match folder.post_upload {
+                    let action = if folder.post_upload == crate::db::PostUpload::Keep {
+                        crate::db::PostUpload::Keep
+                    } else if file_is_still_the_upload(&path, &entry) {
+                        folder.post_upload
+                    } else {
+                        warn!(
+                            id = entry.id,
+                            path = %path.display(),
+                            "File changed since it was uploaded; leaving it in place"
+                        );
+                        crate::db::PostUpload::Keep
+                    };
+                    match action {
                         crate::db::PostUpload::Trash => {
                             if let Err(e) = trash_file(&path, &folder.path) {
                                 warn!(
@@ -1309,6 +1324,24 @@ pub(crate) fn move_no_clobber(
     Err(std::io::Error::other(
         "no free trash name after 10000 tries",
     ))
+}
+
+/// The post-upload guard: the file still has the size and SHA-1 it was
+/// queued with. The mtime shortcut is deliberately skipped (`file_mtime: 0`),
+/// because the upload's own record re-stats the file and would vouch for a
+/// replacement; this re-hash costs one read, only for Trash/Delete folders.
+/// An entry without a hash can't be verified and is kept.
+fn file_is_still_the_upload(path: &std::path::Path, entry: &QueueEntry) -> bool {
+    let (Some(hash), Some(size)) = (entry.file_hash.as_deref(), entry.file_size) else {
+        return false;
+    };
+    let rec = crate::db::UploadedRecord {
+        file_path: entry.file_path.clone(),
+        file_hash: hash.to_string(),
+        file_size: size as i64,
+        file_mtime: 0,
+    };
+    still_matches_upload(path, &rec).unwrap_or(false)
 }
 
 /// True when the file at `path` is still the one that was uploaded: same size
@@ -2374,6 +2407,48 @@ mod tests {
         assert_eq!(
             *server.added.lock().unwrap(),
             vec![("alb-1".into(), "folder-asset".into())]
+        );
+    }
+
+    fn folder_entry(path: &std::path::Path, hash: Option<String>, size: Option<u64>) -> QueueEntry {
+        QueueEntry {
+            id: 1,
+            file_path: path.to_string_lossy().into_owned(),
+            file_hash: hash,
+            file_size: size,
+            folder_id: Some(1),
+            status: "uploading".to_string(),
+            retry_count: 0,
+            error_message: None,
+            queued_at: Utc::now(),
+            completed_at: None,
+            source: crate::upload::queue::QueueSource::Folder,
+            photos_local_id: None,
+        }
+    }
+
+    /// #102: the post-upload trash/delete only acts on the exact file that
+    /// was hashed: a same-size replacement, or an unhashed entry, is kept.
+    #[test]
+    fn post_upload_action_requires_the_uploaded_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("IMG_0001.JPG");
+        std::fs::write(&f, b"first photo").unwrap();
+        let hash = crate::upload::hasher::hash_file(&f).unwrap();
+        let entry = folder_entry(&f, Some(hash), Some(11));
+        assert!(file_is_still_the_upload(&f, &entry));
+
+        std::fs::write(&f, b"other photo").unwrap(); // same size, new bytes
+        assert!(!file_is_still_the_upload(&f, &entry));
+
+        assert!(!file_is_still_the_upload(
+            &f,
+            &folder_entry(&f, None, Some(11))
+        ));
+        std::fs::remove_file(&f).unwrap();
+        assert!(
+            !file_is_still_the_upload(&f, &entry),
+            "a vanished file isn't touched"
         );
     }
 

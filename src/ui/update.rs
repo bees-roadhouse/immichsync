@@ -3,9 +3,10 @@
 // Launched as `--window update --update-info <path-to-json>`.
 // The UpdateInfo is serialized to a temp JSON file to avoid CLI escaping issues.
 //
-// Exit codes:
-//   0 = Update applied, caller should relaunch
-//   1 = User skipped or closed
+// Exit codes (the caller relaunches only on 0; #127):
+//   0 = Update applied, user chose Restart Now
+//   1 = User skipped, closed before applying, or it failed (nothing changed)
+//   2 = Update applied, restart deferred (Later, or the window closed)
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -18,6 +19,11 @@ use crate::updater::{self, UpdateInfo};
 ///
 /// Reads `UpdateInfo` from the JSON file at `info_path`, shows the dialog,
 /// and exits with code 0 if the update was applied, 1 otherwise.
+/// Exit code: update applied, restart now.
+pub const EXIT_RESTART_NOW: i32 = 0;
+/// Exit code: update applied, restart later.
+pub const EXIT_APPLIED_LATER: i32 = 2;
+
 pub fn run_update_dialog(info_path: &str) {
     let info_json = match std::fs::read_to_string(info_path) {
         Ok(s) => s,
@@ -47,10 +53,11 @@ pub fn run_update_dialog(info_path: &str) {
         ..Default::default()
     };
 
+    let progress = Arc::new(Mutex::new((0u64, 0u64)));
     let app = UpdateApp {
         info: update_info,
         state: DialogState::Prompt,
-        progress: Arc::new(Mutex::new((0u64, 0u64))),
+        progress: progress.clone(),
         error_msg: Arc::new(Mutex::new(String::new())),
         downloaded_path: None,
     };
@@ -61,8 +68,10 @@ pub fn run_update_dialog(info_path: &str) {
         Box::new(|_cc| Ok(Box::new(app))),
     );
 
-    // If eframe exits without calling process::exit, user closed the window.
-    std::process::exit(1);
+    // The window closed without a button. If the update was already applied,
+    // that's a deferred restart, not a skip.
+    let applied = *progress.lock().unwrap() == (u64::MAX, u64::MAX);
+    std::process::exit(if applied { EXIT_APPLIED_LATER } else { 1 });
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -202,11 +211,11 @@ impl UpdateApp {
         ui.horizontal(|ui| {
             if ui.button("Restart Now").clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                std::process::exit(0);
+                std::process::exit(EXIT_RESTART_NOW);
             }
             if ui.button("Later").clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                std::process::exit(0);
+                std::process::exit(EXIT_APPLIED_LATER);
             }
         });
     }

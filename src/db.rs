@@ -564,14 +564,31 @@ impl Database {
         label: Option<&str>,
         auto_added: bool,
     ) -> Result<i64, DbError> {
+        self.insert_folder(path, label, auto_added, true)
+    }
+
+    /// Add a folder that isn't watched yet: Settings enables it on Save,
+    /// once its after-upload action is chosen, so its first scan never runs
+    /// under the default `keep` before the user decided (#102).
+    pub fn add_folder_pending(&self, path: &str) -> Result<i64, DbError> {
+        self.insert_folder(path, None, false, false)
+    }
+
+    fn insert_folder(
+        &self,
+        path: &str,
+        label: Option<&str>,
+        auto_added: bool,
+        enabled: bool,
+    ) -> Result<i64, DbError> {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
             "INSERT INTO watched_folders
                 (path, label, enabled, watch_mode, poll_interval_secs,
                  album_mode, post_upload, ignore_online_files,
                  auto_added, created_at, updated_at)
-             VALUES (?1, ?2, TRUE, 'native', 30, 'none', 'keep', 1, ?3, ?4, ?4)",
-            params![path, label, auto_added, now],
+             VALUES (?1, ?2, ?5, 'native', 30, 'none', 'keep', 1, ?3, ?4, ?4)",
+            params![path, label, auto_added, now, enabled],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -1435,6 +1452,17 @@ mod tests {
     use super::*;
 
     /// Open a fresh in-memory database and run migrations.
+    #[test]
+    fn a_pending_folder_is_stored_disabled_until_saved() {
+        let db = open_test_db();
+        let id = db.add_folder_pending("/photos/new").unwrap();
+        let f = db.get_folder_by_path("/photos/new").unwrap().unwrap();
+        assert_eq!(f.id, id);
+        assert!(!f.enabled, "not watched before Save");
+        let id2 = db.add_folder("/photos/auto", None, true).unwrap();
+        assert!(db.get_folder(id2).unwrap().unwrap().enabled);
+    }
+
     fn open_test_db() -> Database {
         let conn = Connection::open_in_memory().expect("in-memory db");
 

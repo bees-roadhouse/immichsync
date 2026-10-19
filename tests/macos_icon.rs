@@ -253,3 +253,30 @@ fn menubar_offline_is_dimmed_with_a_full_strength_slash() {
     assert_eq!(alpha(&off, s / 4, s / 4), 255);
     assert_eq!(alpha(&off, 3 * s / 4, 3 * s / 4), 255);
 }
+
+/// #121: the Windows outputs (.ico entries, tray frames, window icon) are
+/// resized from the same keyed-out source, so none may keep the RGB-246
+/// background as a faint square. Every pixel outside the logo's circle is
+/// fully transparent at the tray's 32 px and the .ico's 256 px.
+#[test]
+fn windows_icons_have_no_background_square() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icon-source.webp");
+    let keyed = key_out_background(&image::open(path).unwrap().to_rgba8());
+    for size in [32u32, 256] {
+        let img = resize_high_quality(&keyed, size);
+        let c = size as f32 / 2.0;
+        let mut leftovers = 0;
+        for (x, y, p) in img.enumerate_pixels() {
+            let r = ((x as f32 + 0.5 - c).powi(2) + (y as f32 + 0.5 - c).powi(2)).sqrt();
+            // The blades reach about 0.5 of the side from the centre; past
+            // 0.53 is background only.
+            if r > size as f32 * 0.53 && p.0[3] != 0 {
+                leftovers += 1;
+            }
+        }
+        assert_eq!(
+            leftovers, 0,
+            "{size}px: {leftovers} background pixels not transparent"
+        );
+    }
+}
