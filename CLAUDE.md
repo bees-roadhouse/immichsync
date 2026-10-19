@@ -104,7 +104,7 @@ Follows the DevOps book standards: [Branching Strategy](https://kb.beesroadhouse
   Use `--admin --squash --delete-branch` instead for the documented "small touchups" OrganizationAdmin bypass (docs typos, link fixes, version-bump-only PRs). See [Branching Strategy](https://kb.beesroadhouse.com/books/developer-operations-devops/page/branching-strategy).
 - Required status checks (repo ruleset id 16845497): `Build & test` (ci.yml, Windows) and `Regenerate SBOM and STRUCTURE` (generate-artifacts.yml). `Build & test (macOS)` joins once the macOS CI job lands. Caveat until #23: after it pushes a regen commit, generate-artifacts stamps `Build & test: success` on the new HEAD without waiting for the real run, so judge a PR by the run on the commit before the regen.
 - Pushing changes under `.github/workflows/` needs the `workflow` scope on the `gh` token; without it, GitHub rejects the push.
-- Releases: `release.yml` still triggers on the retired `release` branch and on `v*` tags. Until that is retargeted, cut a release by pushing a `v*` tag on `main`.
+- Releases: bump `version` in `Cargo.toml` (the only place it lives) in a PR, merge it, then push an annotated `vX.Y.Z` tag on that `main` commit. `release.yml` refuses a tag that doesn't match Cargo.toml or isn't on `main`, builds `immichsync.exe` (Windows) and `ImmichSync-<version>-macos-arm64.zip` (macos-15, `packaging/macos/make-app.sh`, ad-hoc signed until #93), and publishes both in one GitHub Release.
 
 ### Two-Tier Labels
 

@@ -49,7 +49,7 @@ Immich has 84K+ GitHub stars and a thriving community, but no official desktop s
 
 ## Installation
 
-Releases are on [GitHub Releases](https://github.com/bees-roadhouse/immichsync/releases).
+Releases are on [GitHub Releases](https://github.com/bees-roadhouse/immichsync/releases). Each one has `immichsync.exe` for Windows and `ImmichSync-<version>-macos-arm64.zip` for macOS.
 
 ### Windows
 
@@ -65,7 +65,7 @@ Uninstall removes the binary, shortcuts, autostart entry, and the Apps & Feature
 
 ### macOS
 
-Releases carry `ImmichSync-<version>-macos-arm64.zip` from the first release cut after macOS support landed; until then, build the bundle yourself (below). Unzip it and move `ImmichSync.app` to Applications.
+Each release carries `ImmichSync-<version>-macos-arm64.zip` (Apple Silicon, macOS 13+), from v0.3.0 on. Unzip it and move `ImmichSync.app` to Applications.
 
 - **First launch:** the app is ad-hoc signed until Developer ID signing lands, so the first time, right-click → **Open** to get past Gatekeeper.
 - **Keychain:** the API key is kept in your login Keychain (`config.toml` holds only a `keychain:` marker). Because the build is ad-hoc signed, macOS asks once after each update whether ImmichSync may use its Keychain item; choose **Always Allow**. If you don't answer, the app keeps watching but can't upload until you do.
