@@ -273,6 +273,15 @@ impl WizardApp {
                 // Save config.
                 if let Err(e) = self.config.save() {
                     tracing::error!(error = %e, "Failed to save config from wizard");
+                    // Stay on this page: closing would leave the app
+                    // unconfigured with no hint why.
+                    rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Error)
+                        .set_title("ImmichSync")
+                        .set_description(format!("Setup could not be saved: {e}"))
+                        .set_buttons(rfd::MessageButtons::Ok)
+                        .show();
+                    return;
                 }
 
                 // Set or clear the autostart registry key.

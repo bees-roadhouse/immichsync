@@ -54,6 +54,12 @@ pub enum ConfigError {
     #[error("Failed to serialize config: {0}")]
     Serialize(Box<toml::ser::Error>),
 
+    /// macOS: the key could not be put in the Keychain (e.g. the user clicked
+    /// Deny). The save is refused rather than writing the key in plaintext.
+    #[cfg(target_os = "macos")]
+    #[error("Could not store the API key in the Keychain: {0}")]
+    SecretStore(String),
+
     #[error("Failed to write config file `{path}`: {source}")]
     WriteFile {
         path: PathBuf,
@@ -102,6 +108,31 @@ pub const API_KEY_ENV: &str = "IMMICHSYNC_API_KEY";
 
 fn env_api_key() -> Option<String> {
     std::env::var(API_KEY_ENV).ok().filter(|k| !k.is_empty())
+}
+
+/// Turn a plaintext API key into its stored form.
+///
+/// If sealing fails, Windows keeps its long-standing fallback (plaintext,
+/// with a warning). macOS refuses the save instead: there the failure is
+/// almost always the user denying Keychain access, and writing the key into
+/// `config.toml` behind their back is the opposite of what they chose.
+fn seal_api_key<E: std::fmt::Display>(
+    plaintext: &str,
+    seal: impl Fn(&str) -> Result<String, E>,
+) -> Result<String, ConfigError> {
+    match seal(plaintext) {
+        Ok(sealed) => {
+            debug!("API key encrypted for storage");
+            Ok(sealed)
+        }
+        #[cfg(target_os = "macos")]
+        Err(e) => Err(ConfigError::SecretStore(e.to_string())),
+        #[cfg(not(target_os = "macos"))]
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to encrypt API key; saving in plain text");
+            Ok(plaintext.to_string())
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -423,15 +454,10 @@ impl Config {
         if !config_to_save.server.api_key.is_empty()
             && !crate::platform::encryption::is_encrypted(&config_to_save.server.api_key)
         {
-            match crate::platform::encryption::encrypt_api_key(&config_to_save.server.api_key) {
-                Ok(encrypted) => {
-                    config_to_save.server.api_key = encrypted;
-                    debug!("API key encrypted for storage");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to encrypt API key; saving in plain text");
-                }
-            }
+            config_to_save.server.api_key = seal_api_key(
+                &config_to_save.server.api_key,
+                crate::platform::encryption::encrypt_api_key,
+            )?;
         }
 
         let contents = toml::to_string_pretty(&config_to_save)?;
@@ -441,8 +467,8 @@ impl Config {
             source,
         })?;
 
-        // Owner-only on Unix: until the Keychain slice (#61) the macOS build
-        // keeps the API key in this file.
+        // Owner-only on Unix. The macOS key lives in the Keychain (save() is
+        // refused if it can't be stored there), so this is hygiene only.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -612,5 +638,25 @@ url = "https://photos.example.com"
             path.file_name().and_then(|s| s.to_str()),
             Some("config.toml")
         );
+    }
+
+    #[test]
+    fn sealed_key_is_stored() {
+        let r = seal_api_key("k", |_| Ok::<_, String>("keychain:api-key".into()));
+        assert_eq!(r.unwrap(), "keychain:api-key");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_refuses_to_save_a_key_it_could_not_seal() {
+        let r = seal_api_key("secret", |_| Err::<String, _>("user denied"));
+        assert!(matches!(r, Err(ConfigError::SecretStore(ref m)) if m == "user denied"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_keeps_its_plaintext_fallback() {
+        let r = seal_api_key("secret", |_| Err::<String, _>("dpapi failed"));
+        assert_eq!(r.unwrap(), "secret");
     }
 }

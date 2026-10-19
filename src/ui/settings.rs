@@ -684,6 +684,12 @@ impl SettingsApp {
         // Save config to disk.
         if let Err(e) = self.config.save() {
             tracing::error!(error = %e, "Failed to save config");
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("ImmichSync")
+                .set_description(format!("Settings were not saved: {e}"))
+                .set_buttons(rfd::MessageButtons::Ok)
+                .show();
         } else {
             info!("Config saved");
         }
