@@ -308,6 +308,22 @@ async fn process_item(
     // watcher will re-skip on its next pass anyway. Mark the entry failed
     // with a recognisable marker; the watcher's reconciliation loop will
     // re-enqueue it once the file is local again.
+    // Entries queued before #96 may sit inside a package (an app's library),
+    // `.Trashes` or similar. Neither upload them nor let the post-upload
+    // action move them out of there.
+    if crate::watch::filter::in_skipped_dir(&path) {
+        info!(id = entry.id, path = %entry.file_path,
+            "Queued file is inside a skipped directory (package, trash, housekeeping); not uploading");
+        if let Err(e) = store.update_status(
+            entry.id,
+            "failed",
+            Some("inside a skipped directory (app library, trash or volume housekeeping)"),
+        ) {
+            error!(id = entry.id, error = %e, "Failed to mark skipped entry");
+        }
+        return;
+    }
+
     if let Ok(meta) = std::fs::metadata(&path) {
         if crate::watch::filter::is_online_file(&meta) {
             info!(
@@ -629,13 +645,30 @@ fn sha1_of_string(s: &str) -> String {
 /// The hidden directory name used for post-upload trash.
 pub const TRASH_DIR_NAME: &str = ".immichsync-trash";
 
+/// Post-upload "Move to Trash".
+///
+/// macOS: the Finder Trash (`platform::trash`), so the user can put files
+/// back from Finder (#95). Elsewhere: `.immichsync-trash/` under the
+/// watched folder, purged after `trash_retention_days`.
+pub fn trash_file(file_path: &std::path::Path, folder_root: &str) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = folder_root;
+        crate::platform::trash::move_to_trash(file_path)?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    trash_into_folder(file_path, folder_root)
+}
+
 /// Move a file into `.immichsync-trash/` under the watched folder root,
 /// preserving relative subfolder structure.
 ///
 /// E.g. if `folder_root` is `C:\Photos` and `file_path` is
 /// `C:\Photos\Vacation\img.jpg`, the file moves to
 /// `C:\Photos\.immichsync-trash\Vacation\img.jpg`.
-pub fn trash_file(file_path: &std::path::Path, folder_root: &str) -> anyhow::Result<()> {
+#[cfg(not(target_os = "macos"))]
+fn trash_into_folder(file_path: &std::path::Path, folder_root: &str) -> anyhow::Result<()> {
     let root = std::path::Path::new(folder_root);
     let trash_root = root.join(TRASH_DIR_NAME);
 
@@ -654,10 +687,12 @@ pub fn trash_file(file_path: &std::path::Path, folder_root: &str) -> anyhow::Res
         std::fs::create_dir_all(parent)?;
     }
 
-    // Try rename first (same volume), fall back to copy+delete.
-    if std::fs::rename(file_path, &dest).is_err() {
-        std::fs::copy(file_path, &dest)?;
-        std::fs::remove_file(file_path)?;
+    // Never replace an earlier trashed file with the same relative path (a
+    // camera reusing IMG_0001.JPG, #98): that copy is the user's safety net.
+    let landed = move_no_clobber(file_path, &dest)?;
+    if landed != dest {
+        debug!(from = %file_path.display(), to = %landed.display(),
+            "Trash name taken; kept both");
     }
 
     // Set the trash root directory as hidden (Windows).
@@ -679,6 +714,85 @@ pub fn trash_file(file_path: &std::path::Path, folder_root: &str) -> anyhow::Res
     }
 
     Ok(())
+}
+
+/// Move `src` to `dest`, or to `name (1).ext`, `name (2).ext`, … if `dest`
+/// is taken. Returns where the file landed.
+///
+/// `std::fs::rename` and `copy` both silently replace an existing target, so
+/// each candidate is first claimed with `create_new` (atomic: fails if the
+/// name exists) and the move then lands on our own placeholder. Rename is
+/// tried first (same volume); otherwise the bytes are copied into the
+/// placeholder and `src` removed. On failure the placeholder is cleaned up.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn move_no_clobber(
+    src: &std::path::Path,
+    dest: &std::path::Path,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::ErrorKind;
+
+    let parent = dest.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = dest
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = dest
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+
+    for n in 0..10_000u32 {
+        let candidate = if n == 0 {
+            dest.to_path_buf()
+        } else {
+            parent.join(format!("{stem} ({n}){ext}"))
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+        let moved = std::fs::rename(src, &candidate).or_else(|_| {
+            std::fs::copy(src, &candidate)?;
+            std::fs::remove_file(src)
+        });
+        return match moved {
+            Ok(()) => Ok(candidate),
+            Err(e) => {
+                let _ = std::fs::remove_file(&candidate);
+                Err(e)
+            }
+        };
+    }
+    Err(std::io::Error::other(
+        "no free trash name after 10000 tries",
+    ))
+}
+
+/// True when the file at `path` is still the one that was uploaded: same size
+/// and mtime as recorded, or (for rows without an mtime, or when only the
+/// mtime moved) the same SHA-1. Guards trash/delete of already-uploaded
+/// files, so a file edited or replaced since its upload (a camera reusing
+/// `IMG_0001.JPG`, an edit saved over an export) is never removed (#95).
+pub fn still_matches_upload(
+    path: &std::path::Path,
+    rec: &crate::db::UploadedRecord,
+) -> std::io::Result<bool> {
+    let meta = std::fs::metadata(path)?;
+    if meta.len() as i64 != rec.file_size {
+        return Ok(false);
+    }
+    if rec.file_mtime != 0 && crate::upload::queue::mtime_secs(&meta) == rec.file_mtime {
+        return Ok(true);
+    }
+    match crate::upload::hasher::hash_file(path) {
+        Ok(h) => Ok(h.eq_ignore_ascii_case(&rec.file_hash)),
+        Err(e) => Err(std::io::Error::other(e.to_string())),
+    }
 }
 
 /// Delete files in `.immichsync-trash/` directories that are older than
@@ -759,6 +873,88 @@ fn walk_and_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── move_no_clobber (#98) ────────────────────────────────────────────────
+
+    #[test]
+    fn trashing_the_same_relative_path_twice_keeps_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let trash = dir.path().join(".immichsync-trash/DCIM/IMG_0001.JPG");
+        std::fs::create_dir_all(trash.parent().unwrap()).unwrap();
+
+        let first = dir.path().join("first.jpg");
+        std::fs::write(&first, b"first card").unwrap();
+        let a = move_no_clobber(&first, &trash).unwrap();
+
+        let second = dir.path().join("second.jpg");
+        std::fs::write(&second, b"second card").unwrap();
+        let b = move_no_clobber(&second, &trash).unwrap();
+
+        let third = dir.path().join("third.jpg");
+        std::fs::write(&third, b"third card").unwrap();
+        let c = move_no_clobber(&third, &trash).unwrap();
+
+        assert_eq!(a, trash);
+        assert_eq!(b.file_name().unwrap(), "IMG_0001 (1).JPG");
+        assert_eq!(c.file_name().unwrap(), "IMG_0001 (2).JPG");
+        assert_eq!(std::fs::read(&a).unwrap(), b"first card");
+        assert_eq!(std::fs::read(&b).unwrap(), b"second card");
+        assert_eq!(std::fs::read(&c).unwrap(), b"third card");
+        assert!(!first.exists() && !second.exists() && !third.exists());
+    }
+
+    #[test]
+    fn failed_move_leaves_no_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("x.jpg");
+        let missing = dir.path().join("does-not-exist.jpg");
+        assert!(move_no_clobber(&missing, &dest).is_err());
+        assert!(!dest.exists(), "placeholder must be cleaned up");
+    }
+
+    // ── still_matches_upload (#95) ───────────────────────────────────────────
+
+    fn rec_for(path: &std::path::Path) -> crate::db::UploadedRecord {
+        let meta = std::fs::metadata(path).unwrap();
+        crate::db::UploadedRecord {
+            file_path: path.to_string_lossy().into_owned(),
+            file_hash: crate::upload::hasher::hash_file(path).unwrap(),
+            file_size: meta.len() as i64,
+            file_mtime: crate::upload::queue::mtime_secs(&meta),
+        }
+    }
+
+    #[test]
+    fn unchanged_file_still_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("IMG_0001.JPG");
+        std::fs::write(&p, vec![7u8; 4096]).unwrap();
+        let rec = rec_for(&p);
+        assert!(still_matches_upload(&p, &rec).unwrap());
+    }
+
+    #[test]
+    fn replaced_file_with_new_size_does_not_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("IMG_0001.JPG");
+        std::fs::write(&p, vec![7u8; 4096]).unwrap();
+        let rec = rec_for(&p);
+        std::fs::write(&p, vec![9u8; 5000]).unwrap(); // camera reused the name
+        assert!(!still_matches_upload(&p, &rec).unwrap());
+    }
+
+    #[test]
+    fn same_size_different_bytes_falls_back_to_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("edit.jpg");
+        std::fs::write(&p, vec![1u8; 4096]).unwrap();
+        let mut rec = rec_for(&p);
+        std::fs::write(&p, vec![2u8; 4096]).unwrap();
+        rec.file_mtime = 0; // legacy row: no mtime, so the hash decides
+        assert!(!still_matches_upload(&p, &rec).unwrap());
+        rec.file_mtime = 1; // mtime differs: also falls through to the hash
+        assert!(!still_matches_upload(&p, &rec).unwrap());
+    }
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -994,6 +1190,45 @@ mod tests {
         assert_eq!(stats.completed, 1);
         assert_eq!(stats.pending, 0);
         assert!(store.is_file_uploaded(&hash).unwrap());
+    }
+
+    /// #96: an entry queued before the filter learned about packages must
+    /// not be uploaded from (or later trashed out of) an app library.
+    #[tokio::test]
+    async fn worker_skips_entries_inside_skipped_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let inside = dir.path().join(".Trashes").join("501").join("IMG_0002.JPG");
+        std::fs::create_dir_all(inside.parent().unwrap()).unwrap();
+        std::fs::write(&inside, b"deleted on the card").unwrap();
+
+        let store = Arc::new(MockStore::default());
+        store
+            .enqueue(NewQueueEntry {
+                file_path: inside.display().to_string(),
+                file_hash: None,
+                file_size: Some(19),
+                folder_id: None,
+            })
+            .unwrap();
+        let entry = store
+            .dequeue_pending(1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let config = WorkerConfig {
+            concurrency: 1,
+            max_retries: 3,
+            base_retry_delay: Duration::from_millis(1),
+            device_id: "immichsync-test".to_string(),
+        };
+
+        process_item(entry, store.clone(), Arc::new(SucceedingUploader), &config).await;
+
+        let stats = store.get_queue_stats().unwrap();
+        assert_eq!(stats.completed, 0, "must not upload");
+        assert_eq!(stats.failed, 1);
+        assert!(inside.exists(), "must not move or delete the file");
     }
 
     #[tokio::test]

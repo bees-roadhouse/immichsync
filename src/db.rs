@@ -7,7 +7,7 @@
 //! This file is intentionally in `%LOCALAPPDATA%` ... watched folder set,
 //! upload progress, and dedup history are machine-local, not roaming.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -515,6 +515,46 @@ impl Database {
         Ok(result)
     }
 
+    /// Rewrite each folder row to its canonical path (`watch::paths`), for
+    /// rows stored before #99. Rows that don't resolve (folder missing, a
+    /// drive not mounted) are left as they are, and so is a row whose
+    /// canonical path another row already holds. Returns how many changed.
+    pub fn canonicalize_folder_paths(&self) -> FolderPathMigration {
+        let mut out = FolderPathMigration::default();
+        let Ok(folders) = self.get_folders() else {
+            return out;
+        };
+        for f in &folders {
+            let Ok(canon) = crate::watch::paths::normalize_folder(&f.path) else {
+                continue;
+            };
+            if canon == f.path {
+                continue;
+            }
+            if let Some(other) = folders.iter().find(|o| o.id != f.id && o.path == canon) {
+                // `path` is UNIQUE: two rows name the same folder. Leave both
+                // and say so, so the duplicate can be removed in Settings.
+                tracing::warn!(
+                    folder_id = f.id,
+                    path = %f.path,
+                    canonical = %canon,
+                    duplicate_of = other.id,
+                    "Watched folder is a duplicate of another row; not migrated"
+                );
+                out.collisions += 1;
+                continue;
+            }
+            let res = self.conn.execute(
+                "UPDATE watched_folders SET path = ?1, updated_at = ?2 WHERE id = ?3",
+                params![canon, Utc::now().to_rfc3339(), f.id],
+            );
+            if res.is_ok() {
+                out.changed += 1;
+            }
+        }
+        out
+    }
+
     /// Update mutable fields of a watched folder.
     #[allow(clippy::too_many_arguments)]
     pub fn update_folder(
@@ -642,40 +682,38 @@ impl Database {
         Ok(hit.is_some())
     }
 
-    /// Return file paths under `folder_path` that have been uploaded.
+    /// Upload records for files inside `folder_path` (at any depth).
     ///
-    /// Uses a prefix match on `file_path` (with trailing backslash) so only
-    /// files inside the folder are returned, not siblings with similar names.
-    ///
-    /// Handles both normal paths (`C:\Photos\...`) and Windows extended-length
-    /// paths (`\\?\C:\Photos\...`) which the file watcher may produce.
-    pub fn get_uploaded_paths_in_folder(&self, folder_path: &str) -> Result<Vec<String>, DbError> {
-        // Strip \\?\ prefix if present so we have the canonical form.
-        let canonical = folder_path.strip_prefix(r"\\?\").unwrap_or(folder_path);
-
-        // Ensure the prefix ends with a separator for exact directory matching.
-        let prefix = if canonical.ends_with('\\') || canonical.ends_with('/') {
-            canonical.to_string()
-        } else {
-            format!("{canonical}\\")
-        };
-
-        // Also match the \\?\ extended-path variant stored by the file watcher.
-        let ext_prefix = format!(r"\\?\{prefix}");
-
-        let mut stmt = self.conn.prepare(
-            "SELECT file_path FROM uploaded_files WHERE file_path LIKE ?1 OR file_path LIKE ?2",
-        )?;
-        let rows = stmt.query_map(
-            params![format!("{prefix}%"), format!("{ext_prefix}%")],
-            |row| row.get::<_, String>(0),
-        )?;
-
-        let mut paths = Vec::new();
+    /// Matching happens in Rust with `Path::starts_with` (whole components),
+    /// not with SQL `LIKE`. A LIKE prefix treated `_` and `%` in folder names
+    /// as wildcards, so `My_Pics` also matched `MyXPics`, and its hard-coded
+    /// `\\` separator matched nothing at all on macOS (#95). Both the path
+    /// as configured and its canonical form are tried, and stored paths lose
+    /// any `\\?\` extended-length prefix the watcher added.
+    pub fn get_uploaded_in_folder(
+        &self,
+        folder_path: &str,
+    ) -> Result<Vec<UploadedRecord>, DbError> {
+        let roots = folder_roots(folder_path);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_path, file_hash, file_size, file_mtime FROM uploaded_files")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(UploadedRecord {
+                file_path: row.get(0)?,
+                file_hash: row.get(1)?,
+                file_size: row.get(2)?,
+                file_mtime: row.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
         for row in rows {
-            paths.push(row?);
+            let rec = row?;
+            if is_under_any(&rec.file_path, &roots) {
+                out.push(rec);
+            }
         }
-        Ok(paths)
+        Ok(out)
     }
 
     // ── upload_queue ─────────────────────────────────────────────────────────
@@ -1028,6 +1066,51 @@ impl crate::upload::queue::QueueStore for DbStore {
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
+/// What [`Database::canonicalize_folder_paths`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FolderPathMigration {
+    /// Rows rewritten to their canonical path.
+    pub changed: usize,
+    /// Rows left alone because another row already holds their canonical
+    /// path (logged as a warning each).
+    pub collisions: usize,
+}
+
+/// One `uploaded_files` row, as needed to re-check a file before acting on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadedRecord {
+    pub file_path: String,
+    pub file_hash: String,
+    pub file_size: i64,
+    /// Seconds since the Unix epoch; `0` for rows from before schema v3.
+    pub file_mtime: i64,
+}
+
+/// Strip the Windows extended-length prefix the watcher may store.
+pub fn strip_extended_prefix(p: &str) -> &str {
+    p.strip_prefix(r"\\?\").unwrap_or(p)
+}
+
+/// The folder as configured plus its canonical form, if it differs.
+fn folder_roots(folder_path: &str) -> Vec<PathBuf> {
+    let raw = PathBuf::from(strip_extended_prefix(folder_path));
+    let mut roots = vec![raw.clone()];
+    if let Ok(canon) = std::fs::canonicalize(&raw) {
+        let canon = PathBuf::from(strip_extended_prefix(&canon.to_string_lossy()));
+        if canon != raw {
+            roots.push(canon);
+        }
+    }
+    roots
+}
+
+fn is_under_any(file_path: &str, roots: &[PathBuf]) -> bool {
+    let file = Path::new(strip_extended_prefix(file_path));
+    roots
+        .iter()
+        .any(|r| file.starts_with(r) && file != r.as_path())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1042,6 +1125,142 @@ mod tests {
         let mut db = Database { conn };
         db.run_migrations().expect("migrations");
         db
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_folder_paths_migrates_resolvable_rows_only() {
+        let real = tempfile::tempdir().unwrap();
+        let canon = std::fs::canonicalize(real.path()).unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("via-link");
+        std::os::unix::fs::symlink(&canon, &link).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let other_canon = std::fs::canonicalize(other.path()).unwrap();
+        let link2 = links.path().join("dup-link");
+        std::os::unix::fs::symlink(&other_canon, &link2).unwrap();
+
+        let db = open_test_db();
+        let a = db.add_folder(&link.to_string_lossy(), None, false).unwrap();
+        let b = db.add_folder("/definitely/not/here", None, false).unwrap();
+        // c's canonical path is already held by d: c must be left alone.
+        let c = db
+            .add_folder(&link2.to_string_lossy(), None, false)
+            .unwrap();
+        let d = db
+            .add_folder(&other_canon.to_string_lossy(), None, false)
+            .unwrap();
+
+        let m = db.canonicalize_folder_paths();
+        assert_eq!(
+            m,
+            FolderPathMigration {
+                changed: 1,
+                collisions: 1
+            }
+        );
+        let path = |id| db.get_folder(id).unwrap().unwrap().path;
+        assert_eq!(path(a), canon.to_string_lossy());
+        assert_eq!(path(b), "/definitely/not/here");
+        assert_eq!(path(c), link2.to_string_lossy());
+        assert_eq!(path(d), other_canon.to_string_lossy());
+        // Idempotent; the collision is reported again, not resolved.
+        assert_eq!(
+            db.canonicalize_folder_paths(),
+            FolderPathMigration {
+                changed: 0,
+                collisions: 1
+            }
+        );
+    }
+
+    // ── get_uploaded_in_folder (#95) ─────────────────────────────────────────
+
+    fn record(db: &Database, path: &std::path::Path) {
+        db.record_upload(&path.to_string_lossy(), "h", 1, 1, None, "d", "s")
+            .unwrap();
+    }
+
+    #[test]
+    fn uploaded_in_folder_matches_components_not_like_wildcards() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let folder = root.join("My_Pics");
+        let sibling = root.join("MyXPics"); // matches `My_Pics%` under LIKE
+        let prefix_sib = root.join("My_Pics2"); // shares a string prefix
+        for d in [&folder, &sibling, &prefix_sib] {
+            std::fs::create_dir_all(d.join("sub")).unwrap();
+        }
+        let db = open_test_db();
+        record(&db, &folder.join("a.jpg"));
+        record(&db, &folder.join("sub").join("b.jpg"));
+        record(&db, &sibling.join("c.jpg"));
+        record(&db, &prefix_sib.join("d.jpg"));
+
+        let mut got: Vec<String> = db
+            .get_uploaded_in_folder(&folder.to_string_lossy())
+            .unwrap()
+            .into_iter()
+            .map(|r| r.file_path)
+            .collect();
+        got.sort();
+        let mut want = vec![
+            folder.join("a.jpg").to_string_lossy().into_owned(),
+            folder
+                .join("sub")
+                .join("b.jpg")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn uploaded_in_folder_resolves_the_configured_path() {
+        // Stored paths are canonical; the folder may be configured through a
+        // symlink (macOS: /tmp → /private/tmp) or with trailing separators.
+        let dir = tempfile::tempdir().unwrap();
+        let canon = std::fs::canonicalize(dir.path()).unwrap();
+        let db = open_test_db();
+        record(&db, &canon.join("x.jpg"));
+        #[cfg(unix)]
+        {
+            let link_parent = tempfile::tempdir().unwrap();
+            let link = link_parent.path().join("link");
+            std::os::unix::fs::symlink(&canon, &link).unwrap();
+            assert_eq!(
+                db.get_uploaded_in_folder(&link.to_string_lossy())
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        assert_eq!(
+            db.get_uploaded_in_folder(&canon.to_string_lossy())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn extended_prefix_is_stripped() {
+        assert_eq!(strip_extended_prefix(r"\\?\C:\x\a.jpg"), r"C:\x\a.jpg");
+        assert_eq!(strip_extended_prefix("/Users/x/a.jpg"), "/Users/x/a.jpg");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extended_prefix_paths_match_their_folder() {
+        assert!(is_under_any(
+            r"\\?\C:\Photos\a.jpg",
+            &[PathBuf::from(r"C:\Photos")]
+        ));
+        assert!(!is_under_any(
+            r"\\?\C:\Photos2\a.jpg",
+            &[PathBuf::from(r"C:\Photos")]
+        ));
     }
 
     // ── watched_folders ──────────────────────────────────────────────────────

@@ -57,6 +57,50 @@ pub struct FileFilter {
     ignore_online_files: bool,
 }
 
+/// Directory names never uploaded from or descended into: our own trash,
+/// the OS trash and volume housekeeping (`.Trashes` holds what the user
+/// deleted from a card in Finder).
+const SKIP_DIR_NAMES: &[&str] = &[
+    crate::upload::worker::TRASH_DIR_NAME,
+    ".Trashes",
+    ".Trash",
+    ".Spotlight-V100",
+    ".fseventsd",
+    ".TemporaryItems",
+    ".DocumentRevisions-V100",
+    "$RECYCLE.BIN",
+    "System Volume Information",
+];
+
+/// True for a directory whose contents ImmichSync must leave alone: one of
+/// `SKIP_DIR_NAMES`, a Photos library (fast path), or, on macOS, any package
+/// directory (app libraries, bundles). The initial scan uses this to prune
+/// its walk, and `should_include` checks every ancestor of a file with it.
+/// True when any directory above `path` is one [`is_skipped_dir`] matches.
+/// Also guards the queue worker and post-upload actions, so an entry queued
+/// before #96 can't be uploaded from, or moved out of, an app library.
+pub fn in_skipped_dir(path: &Path) -> bool {
+    path.ancestors().skip(1).any(is_skipped_dir)
+}
+
+pub fn is_skipped_dir(dir: &Path) -> bool {
+    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if SKIP_DIR_NAMES.contains(&name) {
+        return true;
+    }
+    // Photos' private store; PhotoKit is the supported way in (#66).
+    if name.to_ascii_lowercase().ends_with(".photoslibrary") {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    if crate::platform::packages::is_package(dir) {
+        return true;
+    }
+    false
+}
+
 impl FileFilter {
     /// Create a new `FileFilter` with default settings.
     ///
@@ -176,12 +220,9 @@ impl FileFilter {
     /// - A custom exclude glob matches the path
     /// - Custom include globs are configured and none of them match the path
     pub fn should_include(&self, path: &Path) -> bool {
-        // Skip anything inside the trash directory.
-        if path
-            .components()
-            .any(|c| c.as_os_str() == crate::upload::worker::TRASH_DIR_NAME)
-        {
-            debug!("Excluding (inside trash directory): {:?}", path);
+        // Never look inside housekeeping folders, trash, or packages.
+        if let Some(dir) = path.ancestors().skip(1).find(|d| is_skipped_dir(d)) {
+            debug!("Excluding (inside skipped directory {:?}): {:?}", dir, path);
             return false;
         }
 
@@ -194,23 +235,11 @@ impl FileFilter {
             }
         };
 
-        // Never reach inside an Apple Photos library package: its
-        // originals/derivatives tree is Photos' private store, and watching
-        // ~/Pictures (the macOS default) would otherwise upload thumbnails.
-        // PhotoKit is the supported way in (#66).
-        if path.components().any(|c| {
-            c.as_os_str()
-                .to_str()
-                .is_some_and(|s| s.to_ascii_lowercase().ends_with(".photoslibrary"))
-        }) {
-            debug!("Excluding (inside a Photos library): {:?}", path);
-            return false;
-        }
-
-        // AppleDouble sidecars (`._IMG_0001.JPG`): macOS writes one beside
-        // every file it copies to a FAT/ExFAT card. Metadata, not a photo.
-        if file_name.starts_with("._") {
-            debug!("Excluding (AppleDouble sidecar): {:?}", path);
+        // Hidden files: AppleDouble `._IMG_0001.JPG` resource forks that
+        // macOS writes on exFAT/FAT/SMB volumes (they end in .jpg and pass the
+        // size check), screenshot temp files, and the like (#96).
+        if file_name.starts_with('.') {
+            debug!("Excluding (hidden file): {:?}", path);
             return false;
         }
 
@@ -379,7 +408,10 @@ mod tests {
     use tempfile::NamedTempFile;
 
     fn make_temp_file_with_size(ext: &str, size: usize) -> NamedTempFile {
+        // A visible name: tempfile's default `.tmp…` prefix is a hidden file,
+        // which should_include now skips (#96).
         let mut f = tempfile::Builder::new()
+            .prefix("img")
             .suffix(&format!(".{}", ext))
             .tempfile()
             .unwrap();
@@ -429,21 +461,6 @@ mod tests {
         let p = dir.path().join("Thumbs.db");
         std::fs::write(&p, vec![0u8; 2048]).unwrap();
         assert!(!filter.should_include(&p), "Thumbs.db should be excluded");
-    }
-
-    #[test]
-    fn appledouble_sidecars_are_excluded() {
-        // macOS writes `._<name>` beside every file it copies to a FAT/ExFAT
-        // card; it holds resource-fork metadata, not a photo (#89).
-        let filter = FileFilter::new();
-        let dir = tempfile::tempdir().unwrap();
-        let sidecar = dir.path().join("._IMG_0001.JPG");
-        std::fs::write(&sidecar, vec![0u8; 4096]).unwrap();
-        assert!(!filter.should_include(&sidecar));
-
-        let photo = dir.path().join("IMG_0001.JPG");
-        std::fs::write(&photo, vec![0u8; 4096]).unwrap();
-        assert!(filter.should_include(&photo));
     }
 
     #[test]
@@ -742,6 +759,79 @@ mod tests {
             super::is_dataless_flags(after.st_flags()),
             "file was materialised"
         );
+    }
+
+    // ── #96: hidden files, housekeeping dirs, packages ─────────────────────
+
+    fn write(p: &std::path::Path) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, vec![0u8; 4096]).unwrap();
+    }
+
+    #[test]
+    fn appledouble_files_are_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("DCIM/100TEST/IMG_0001.JPG");
+        let fork = dir.path().join("DCIM/100TEST/._IMG_0001.JPG");
+        write(&real);
+        write(&fork);
+        let f = FileFilter::new();
+        assert!(f.should_include(&real));
+        assert!(!f.should_include(&fork), "AppleDouble fork must be skipped");
+    }
+
+    #[test]
+    fn housekeeping_and_trash_dirs_are_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = FileFilter::new();
+        for rel in [
+            ".Trashes/501/IMG_0002.JPG",
+            ".Spotlight-V100/Store-V2/x.jpg",
+            ".fseventsd/x.jpg",
+            "$RECYCLE.BIN/S-1-5/x.jpg",
+            ".immichsync-trash/sub/x.jpg",
+        ] {
+            let p = dir.path().join(rel);
+            write(&p);
+            assert!(!f.should_include(&p), "{rel} must be skipped");
+            let top = dir.path().join(rel.split('/').next().unwrap());
+            assert!(is_skipped_dir(&top), "{rel}: top dir not skipped");
+        }
+    }
+
+    #[test]
+    fn in_skipped_dir_checks_every_ancestor() {
+        use std::path::Path;
+        assert!(in_skipped_dir(Path::new("/v/.Trashes/501/a.jpg")));
+        assert!(in_skipped_dir(Path::new(
+            "/p/Photos Library.photoslibrary/originals/A/x.heic"
+        )));
+        assert!(!in_skipped_dir(Path::new("/v/DCIM/100TEST/a.jpg")));
+    }
+
+    #[test]
+    fn photos_library_is_skipped_by_name_on_every_os() {
+        assert!(is_skipped_dir(std::path::Path::new(
+            "/x/Photos Library.photoslibrary"
+        )));
+        assert!(!is_skipped_dir(std::path::Path::new("/x/Holiday 2026")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn files_inside_any_package_are_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        let inside = dir.path().join("Old.app/Contents/Resources/shot.png");
+        let beside = dir.path().join("shot.png");
+        write(&inside);
+        write(&beside);
+        let f = FileFilter::new();
+        assert!(
+            !f.should_include(&inside),
+            "package internals must be skipped"
+        );
+        assert!(f.should_include(&beside));
+        assert!(is_skipped_dir(&dir.path().join("Old.app")));
     }
 
     // ── for_folder (#97) ─────────────────────────────────────────────────────

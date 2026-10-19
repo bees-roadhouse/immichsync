@@ -96,13 +96,18 @@ pub enum Registered {
 }
 
 /// Make sure `folder` has a watched-folder row, inserting one with
-/// `auto_added = true` if it doesn't.
+/// `auto_added = true` if it doesn't. Rows are keyed by canonical path;
+/// keying by volume id instead is #91/#92.
 pub fn register_mount(
     db: &Database,
     folder: &Path,
     label: Option<&str>,
 ) -> Result<Registered, DbError> {
-    let path = folder.display().to_string();
+    // Canonical form, like every other folder row (#107), so a card matches
+    // a hand-added row for the same folder. Falls back to the path as given
+    // only if the card vanished between the mount event and now.
+    let raw = folder.display().to_string();
+    let path = crate::watch::paths::normalize_folder(&raw).unwrap_or(raw);
     if let Some(existing) = db.get_folder_by_path(&path)? {
         return Ok(Registered::Existing(existing.id));
     }
@@ -213,6 +218,29 @@ mod tests {
         assert_eq!(folders[0].post_upload, crate::db::PostUpload::Keep);
         assert_eq!(folders[0].label.as_deref(), Some("CARD"));
         assert_eq!(folders[0].path, folder.display().to_string());
+    }
+
+    /// A card's folder is stored and looked up in canonical form (#99,
+    /// #107), so reaching the same DCIM through another spelling (here a
+    /// symlink) finds the row a user added by hand instead of adding a
+    /// second one with its own settings.
+    #[cfg(unix)]
+    #[test]
+    fn register_mount_matches_the_canonical_row_for_another_spelling() {
+        let db = Database::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dcim = dir.path().join("CARD").join("DCIM");
+        std::fs::create_dir_all(&dcim).unwrap();
+        let canonical = crate::watch::paths::normalize_folder(&dcim.display().to_string()).unwrap();
+        let id = db.add_folder(&canonical, None, false).unwrap();
+
+        let link = dir.path().join("mnt");
+        std::os::unix::fs::symlink(dir.path().join("CARD"), &link).unwrap();
+        assert_eq!(
+            register_mount(&db, &link.join("DCIM"), Some("CARD")).unwrap(),
+            Registered::Existing(id)
+        );
+        assert_eq!(db.get_folders().unwrap().len(), 1);
     }
 
     #[test]
