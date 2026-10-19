@@ -36,7 +36,7 @@ use image::{GenericImageView, ImageBuffer, Rgba, RgbaImage};
 #[path = "build/macos_icon.rs"]
 mod macos_icon;
 
-use macos_icon::{resize_high_quality, rotate_rgba, strip_white_background};
+use macos_icon::{key_out_background, resize_high_quality, rotate_rgba};
 
 const SOURCE_PATH: &str = "assets/icon-source.webp";
 
@@ -72,11 +72,12 @@ fn main() {
         );
     }
 
-    // The source has a near-white opaque background. Strip it so the icon
-    // composites correctly on dark taskbars + start menus. Anything close to
-    // pure white becomes fully transparent; partial near-whites get a soft
-    // alpha falloff for clean edges.
-    let src_rgba = strip_white_background(&src.to_rgba8());
+    // The source has a flat opaque background (RGB 246, not white). Key it
+    // out by its measured colour so the icon composites on dark taskbars and
+    // Start menus without a faint grey square (#121); the macOS art below
+    // uses the same keying.
+    let src = src.to_rgba8();
+    let src_rgba = key_out_background(&src);
 
     // ---- Generate the .ico ----
     build_ico(&src_rgba, &icons_dir);
@@ -114,7 +115,7 @@ fn main() {
     // to produce Contents/Resources/AppIcon.icns. The menubar_*.rgba frames
     // are included by src/ui/tray.rs on macOS only.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        let logo = macos_icon::crop_logo(&macos_icon::key_out_background(&src.to_rgba8()));
+        let logo = macos_icon::crop_logo(&src_rgba);
         let master = macos_icon::app_icon_master(&logo);
         macos_icon::write_iconset(&master, &icons_dir.join("AppIcon.iconset"));
 

@@ -53,6 +53,59 @@ pub const AUTOSTART_LABEL: &str = if cfg!(windows) {
     "Start at login"
 };
 
+/// Bring a window that another of our processes owns to the front: the
+/// Settings subprocess, when Settings is clicked while it's open (#102).
+/// Best effort: the OS may decline (focus-stealing rules), and that's logged.
+pub fn focus_window(pid: u32, title: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = title;
+        use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+        if pid == 0 {
+            return;
+        }
+        let activated = NSRunningApplication::runningApplicationWithProcessIdentifier(pid as i32)
+            .map(|app| app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows))
+            .unwrap_or(false);
+        if !activated {
+            tracing::debug!(pid, "Could not activate the window's process");
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        use windows::core::HSTRING;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+        };
+        // SAFETY: plain Win32 calls on a window handle we just looked up.
+        unsafe {
+            match FindWindowW(None, &HSTRING::from(title)) {
+                Ok(hwnd) if !hwnd.is_invalid() => {
+                    if IsIconic(hwnd).as_bool() {
+                        let _ = ShowWindow(hwnd, SW_RESTORE);
+                    }
+                    if !SetForegroundWindow(hwnd).as_bool() {
+                        tracing::debug!(title, "SetForegroundWindow declined");
+                    }
+                }
+                _ => tracing::debug!(title, "Window not found to focus"),
+            }
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let _ = (pid, title);
+}
+
+/// The After Upload "trash" choice, saying where files actually go: the
+/// Finder Trash on macOS (#95); elsewhere a `.immichsync-trash` folder in
+/// the watched folder, not the Recycle Bin (#102).
+pub const TRASH_ACTION_LABEL: &str = if cfg!(target_os = "macos") {
+    "Move to Trash"
+} else {
+    "Move to .immichsync-trash"
+};
+
 /// Whether the GitHub-release self-updater can replace this build. Windows
 /// swaps the `.exe`; Apple Silicon macOS swaps the `.app` bundle from the
 /// `macos-arm64` zip (#75). Intel Macs get no release asset, so no checks.
