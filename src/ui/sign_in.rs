@@ -18,7 +18,7 @@ use crate::api::oauth::{self, OAuthError};
 const PROBE_SETTLE: Duration = Duration::from_millis(700);
 
 /// Where the key ends up, in the OS's own words.
-const KEY_STORE: &str = if cfg!(target_os = "macos") {
+pub const KEY_STORE: &str = if cfg!(target_os = "macos") {
     "your login Keychain"
 } else {
     "Windows' protected storage for your account (DPAPI)"
@@ -156,10 +156,9 @@ impl SignIn {
         self.flow = Flow::Idle;
         match result {
             Ok(key) => {
-                self.status = format!(
-                    "Signed in. \"{}\" was created and goes into {KEY_STORE} when you save.",
-                    oauth::key_name()
-                );
+                // The caller saves it at once (see `persist_signed_in_key`)
+                // and replaces this with the outcome.
+                self.status = format!("Signed in. \"{}\" was created.", oauth::key_name());
                 Some(key)
             }
             Err(e) => {
@@ -183,7 +182,8 @@ impl SignIn {
             .set_description(format!(
                 "ImmichSync will open your browser to sign in to {host}.\n\n\
                  Afterwards it creates a long-lived API key named \"{}\", allowed only to \
-                 upload photos and add them to albums, and keeps it in {KEY_STORE}. The \
+                 upload photos, check them, and make and rename albums, and keeps it in \
+                 {KEY_STORE}. The \
                  browser session is then signed out.\n\n\
                  You can revoke the key any time in Immich: Account Settings → API Keys.\n\n\
                  Continue?",
@@ -209,6 +209,34 @@ impl SignIn {
             let _ = tx.send(r);
         });
         self.flow = Flow::Running { cancel, rx };
+    }
+}
+
+/// Save a just-minted key straight away, without waiting for the window's
+/// Save: otherwise closing the window would leave a working key in Immich
+/// that nothing on this computer holds (#144 review). Only the server URL
+/// and key change; `base` is the config as loaded from disk, not the
+/// window's unsaved edits. Returns the status line to show.
+pub fn persist_signed_in_key(
+    base: &mut crate::config::Config,
+    server_url: &str,
+    key: &str,
+) -> String {
+    base.server.url = server_url.trim().to_string();
+    base.server.api_key = key.to_string();
+    base.server.unreadable_key = None;
+    match base.save() {
+        Ok(()) => format!(
+            "Signed in. \"{}\" is saved in {KEY_STORE}.",
+            oauth::key_name()
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "Saving the new API key failed");
+            format!(
+                "Signed in, but the key couldn't be saved ({e}). It's in the API Key field; \
+                 Save to try again."
+            )
+        }
     }
 }
 

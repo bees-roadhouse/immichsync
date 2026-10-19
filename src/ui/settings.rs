@@ -311,6 +311,8 @@ impl SettingsApp {
 
         let ctx = ui.ctx().clone();
         if let Some(key) = self.sign_in.ui(ui, &ctx, &self.server_url) {
+            self.sign_in.status =
+                crate::ui::sign_in::persist_signed_in_key(&mut self.config, &self.server_url, &key);
             self.api_key = key;
         }
         ui.add_space(8.0);

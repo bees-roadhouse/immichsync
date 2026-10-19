@@ -12,7 +12,7 @@
 //      verifier. Immich exchanges the code with its own client secret and
 //      returns a session token.
 //   6. POST /api/api-keys with that token: a key named for this device,
-//      scoped to exactly the endpoints ImmichSync calls (KEY_PERMISSIONS).
+//      scoped to exactly the endpoints ImmichSync calls (ENDPOINTS).
 //   7. POST /api/auth/logout, whatever happened in 6, so only the key is left.
 //
 // The key is returned to the caller, which stores it like a pasted key:
@@ -40,17 +40,40 @@ fn redirect_for(port: u16) -> String {
     format!("http://127.0.0.1:{port}{CALLBACK_PATH}")
 }
 
-/// What the minted key may do: exactly the endpoints ImmichSync calls, from
-/// Immich 3.2.2's `x-immich-permission` (spike on #143). Adding an endpoint
-/// that needs another permission means adding it here, and existing keys get
-/// a 401 there until the user signs in again.
-pub const KEY_PERMISSIONS: &[&str] = &[
-    "asset.upload",      // POST /api/assets, /api/assets/bulk-upload-check
-    "album.read",        // GET /api/albums, /api/albums/{id}
-    "album.create",      // POST /api/albums
-    "albumAsset.create", // PUT /api/albums/{id}/assets
-    "server.about",      // GET /api/server/about
+/// Every endpoint ImmichSync calls with its key, and the permission
+/// Immich 3.2.2 requires for it (`x-immich-permission` in /api/spec.json).
+/// A minted key can't gain permissions later, so this is the whole list;
+/// `every_api_call_site_is_in_the_endpoint_table` fails the build's tests
+/// when a new call appears in src/api without a row here.
+pub const ENDPOINTS: &[(&str, &str, Option<&str>)] = &[
+    ("POST", "/api/assets", Some("asset.upload")),
+    (
+        "POST",
+        "/api/assets/bulk-upload-check",
+        Some("asset.upload"),
+    ),
+    ("GET", "/api/assets/{id}", Some("asset.read")), // #142 delete-time check
+    ("GET", "/api/albums", Some("album.read")),
+    ("POST", "/api/albums", Some("album.create")),
+    ("PATCH", "/api/albums/{id}", Some("album.update")), // #132 mirror rename
+    ("PUT", "/api/albums/{id}/assets", Some("albumAsset.create")),
+    ("GET", "/api/server/ping", None),
+    ("GET", "/api/server/about", Some("server.about")), // listed in CLAUDE.md
 ];
+
+/// What the minted key may do: the permissions `ENDPOINTS` needs, no more,
+/// in table order without repeats.
+pub fn key_permissions() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for (_, _, p) in ENDPOINTS {
+        if let Some(p) = p {
+            if !out.contains(p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
 
 /// How long to wait for the browser to come back before giving up.
 pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -336,7 +359,7 @@ fn create_api_key(
     let resp = http
         .post(format!("{base}/api/api-keys"))
         .bearer_auth(token)
-        .json(&serde_json::json!({ "name": name, "permissions": KEY_PERMISSIONS }))
+        .json(&serde_json::json!({ "name": name, "permissions": key_permissions() }))
         .send()?;
     if !resp.status().is_success() {
         return Err(server_error(resp));
@@ -439,10 +462,105 @@ mod tests {
     }
 
     #[test]
+    fn the_key_gets_each_needed_permission_once() {
+        assert_eq!(
+            key_permissions(),
+            [
+                "asset.upload",
+                "asset.read",
+                "album.read",
+                "album.create",
+                "album.update",
+                "albumAsset.create",
+                "server.about"
+            ]
+        );
+    }
+
+    /// Scan the API client's source for request call sites
+    /// (`.get(self.url(...`, `.post(...`, ...) and require each method and
+    /// path in `ENDPOINTS`, so a new endpoint can't ship without its
+    /// permission on the key. `{album_id}`-style placeholders compare as
+    /// `{id}`. The sign-in calls in this file use the session token, not the
+    /// key, and aren't scanned.
+    #[test]
+    fn every_api_call_site_is_in_the_endpoint_table() {
+        let sources = [
+            include_str!("albums.rs"),
+            include_str!("assets.rs"),
+            include_str!("server.rs"),
+            include_str!("mod.rs"),
+        ];
+        let normalise = |p: &str| {
+            let mut out = String::new();
+            let mut in_brace = false;
+            for c in p.chars() {
+                match c {
+                    '{' => {
+                        in_brace = true;
+                        out.push_str("{id}");
+                    }
+                    '}' => in_brace = false,
+                    _ if in_brace => {}
+                    _ => out.push(c),
+                }
+            }
+            out
+        };
+        let mut found = Vec::new();
+        for src in sources {
+            let flat: String = src.split_whitespace().collect::<Vec<_>>().join("");
+            for method in ["get", "post", "put", "patch", "delete"] {
+                let needle = format!(".{method}(self.url(");
+                let mut rest = flat.as_str();
+                while let Some(i) = rest.find(&needle) {
+                    rest = &rest[i + needle.len()..];
+                    // self.url("/api/..") or self.url(&format!("/api/.."))
+                    let Some(q) = rest.find("\"/api/") else { break };
+                    let path = &rest[q + 1..];
+                    let path = &path[..path.find('"').unwrap()];
+                    found.push((method.to_uppercase(), normalise(path)));
+                }
+            }
+            // `let url = self.url(..)` followed by `.put(url)` and the like.
+            let mut rest = flat.as_str();
+            while let Some(i) = rest.find("leturl=self.url(") {
+                rest = &rest[i..];
+                let q = rest.find("\"/api/").unwrap();
+                let path = &rest[q + 1..];
+                let path = normalise(&path[..path.find('"').unwrap()]);
+                let after = &rest[q..];
+                let method = ["get", "post", "put", "patch", "delete"]
+                    .into_iter()
+                    .filter_map(|m| {
+                        [format!(".{m}(url"), format!(".{m}(&url")]
+                            .iter()
+                            .filter_map(|n| after.find(n.as_str()))
+                            .min()
+                            .map(|at| (at, m))
+                    })
+                    .min()
+                    .map(|(_, m)| m.to_uppercase())
+                    .expect("a request on the url");
+                found.push((method, path));
+                rest = &rest[1..];
+            }
+        }
+        assert!(found.len() >= 6, "the scan found too little: {found:?}");
+        for (method, path) in &found {
+            assert!(
+                ENDPOINTS.iter().any(|(m, p, _)| m == method && p == path),
+                "{method} {path} is called but not in ENDPOINTS (give the key its permission)"
+            );
+        }
+    }
+
+    #[test]
     fn the_key_asks_only_for_what_the_app_calls() {
-        assert!(!KEY_PERMISSIONS.contains(&"all"));
-        assert!(!KEY_PERMISSIONS.iter().any(|p| p.ends_with(".delete")));
-        assert!(KEY_PERMISSIONS.contains(&"asset.upload"));
+        let perms = key_permissions();
+        assert!(!perms.contains(&"all"));
+        assert!(!perms.iter().any(|p| p.ends_with(".delete")));
+        assert!(perms.contains(&"asset.upload"));
     }
 
     fn get(port: u16, target: &str) -> String {
@@ -648,7 +766,7 @@ mod tests {
             .starts_with("ImmichSync on "));
         assert_eq!(
             key_req["permissions"].as_array().unwrap().len(),
-            KEY_PERMISSIONS.len()
+            key_permissions().len()
         );
         assert_eq!(log[3].1, "Bearer SESSION");
     }

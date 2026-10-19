@@ -101,7 +101,7 @@ The binary lands in `target/release/immichsync.exe` on Windows and `target/relea
 
 ### Signing in instead of pasting a key
 
-If your Immich server has OAuth sign-in turned on, the wizard and Settings → Connection show its sign-in button (for example **Sign in with Bee's Roadhouse**) once the server URL is filled in. ImmichSync asks first, then opens your browser for the normal sign-in, MFA included. Afterwards it creates an API key named **ImmichSync on <this computer>**, keeps it in your login Keychain (macOS) or Windows' DPAPI storage, and signs the browser session out. The key may only upload photos and add them to albums. Revoke it any time under Account Settings → API Keys in Immich. If the key stops working, the menu shows **sign in again** and uploads wait without losing anything.
+If your Immich server has OAuth sign-in turned on, the wizard and Settings → Connection show its sign-in button (for example **Sign in with Bee's Roadhouse**) once the server URL is filled in. ImmichSync asks first, then opens your browser for the normal sign-in, MFA included. Afterwards it creates an API key named **ImmichSync on <this computer>**, keeps it in your login Keychain (macOS) or Windows' DPAPI storage, and signs the browser session out. The key may only upload photos, read back what it uploaded, and create, rename and fill albums: no deleting, no sharing, no account changes. Revoke it any time under Account Settings → API Keys in Immich. If the key stops working, the menu shows **sign in again** and uploads wait without losing anything.
 
 The OAuth provider must allow `http://127.0.0.1:47321/oauth/callback` as a redirect URI; ImmichSync listens there, on this computer only, for the one moment the sign-in returns.
 
