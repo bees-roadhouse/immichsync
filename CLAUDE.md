@@ -2,7 +2,7 @@
 
 ## What This Is
 
-ImmichSync is a native Windows system tray app that watches folders and uploads photos/videos to an Immich server. Written in Rust, targeting Windows 10/11.
+ImmichSync is a native desktop app for Windows (system tray) and macOS (menu bar) that watches folders, removable media and, on macOS, the Photos library, and uploads photos/videos to an Immich server. Written in Rust, targeting Windows 10/11 and macOS 13+ on Apple Silicon (macOS added 2026-10-18, ADR 0001).
 
 ## Architecture
 
@@ -14,7 +14,7 @@ Key components:
 - **API Client** (`src/api/`) — Immich REST API via `reqwest`
 - **State DB** (`src/db.rs`) — SQLite via `rusqlite` (bundled)
 - **UI** (`src/ui/`) — system tray via `tray-icon`, settings via `egui`
-- **Platform** (`src/platform/`) — Windows-specific integrations (Win32 APIs)
+- **Platform** (`src/platform/`) — per-OS integrations behind one seam: Win32 on Windows; Keychain, SMAppService, UserNotifications, DiskArbitration and PhotoKit on macOS (see [docs/adr/0001-macos-platform-seam.md](docs/adr/0001-macos-platform-seam.md))
 
 ## Tech Stack
 
@@ -72,9 +72,9 @@ Key components:
 cargo build --release
 ```
 
-Binary output: `target/release/immichsync.exe`
+Binary output: `target/release/immichsync.exe` on Windows, `target/release/immichsync` on macOS. On macOS, build the app bundle with `packaging/macos/make-app.sh`, since Keychain, notifications, login items and Photos access need the bundle identity.
 
-This is a Windows-only project. Cross-compilation is not a goal.
+Build each platform natively; CI runs `Build & test` (Windows) and `Build & test (macOS)`. Cross-compiling is used only as a clippy check (`x86_64-pc-windows-gnu` from macOS), never to ship.
 
 ## Testing
 
