@@ -119,6 +119,11 @@ fn main() -> anyhow::Result<()> {
         return run_window_subprocess(&args[2]);
     }
 
+    // Remove the bundle a previous self-update parked aside (#75). After
+    // the window-subprocess branch, so only the tray instance does it.
+    #[cfg(target_os = "macos")]
+    updater::cleanup_old_bundle();
+
     // ── Uninstall mode ──────────────────────────────────────────────────
     // Launched by Windows Apps & Features (Uninstall click) or by `winget
     // uninstall ImmichSync`. Removes the binary + shortcuts + autostart +

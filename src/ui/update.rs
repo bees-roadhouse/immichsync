@@ -51,7 +51,7 @@ pub fn run_update_dialog(info_path: &str) {
         info: update_info,
         state: DialogState::Prompt,
         progress: Arc::new(Mutex::new((0u64, 0u64))),
-        error_msg: String::new(),
+        error_msg: Arc::new(Mutex::new(String::new())),
         downloaded_path: None,
     };
 
@@ -77,7 +77,9 @@ struct UpdateApp {
     info: UpdateInfo,
     state: DialogState,
     progress: Arc<Mutex<(u64, u64)>>,
-    error_msg: String,
+    /// Set by the download thread; shown as-is (e.g. "move ImmichSync.app
+    /// to Applications") so a refusal says why.
+    error_msg: Arc<Mutex<String>>,
     #[allow(dead_code)]
     downloaded_path: Option<PathBuf>,
 }
@@ -134,6 +136,11 @@ impl UpdateApp {
                 });
         }
 
+        if let Some(note) = crate::platform::UPDATE_NOTE {
+            ui.add_space(8.0);
+            ui.small(note);
+        }
+
         ui.add_space(12.0);
 
         ui.horizontal(|ui| {
@@ -185,6 +192,10 @@ impl UpdateApp {
             "ImmichSync v{} has been installed. Restart to use the new version.",
             self.info.new_version
         ));
+        if let Some(note) = crate::platform::UPDATE_NOTE {
+            ui.add_space(8.0);
+            ui.small(note);
+        }
 
         ui.add_space(16.0);
 
@@ -207,7 +218,8 @@ impl UpdateApp {
         });
 
         ui.add_space(12.0);
-        ui.colored_label(egui::Color32::RED, &self.error_msg);
+        let msg = self.error_msg.lock().unwrap().clone();
+        ui.colored_label(egui::Color32::RED, msg);
 
         ui.add_space(16.0);
         if ui.button("Close").clicked() {
@@ -222,6 +234,7 @@ impl UpdateApp {
         let url = self.info.download_url.clone();
         let new_version = self.info.new_version.clone();
         let progress = self.progress.clone();
+        let error_msg = self.error_msg.clone();
         let ctx = ctx.clone();
 
         // Spawn a thread for the blocking download.
@@ -246,18 +259,17 @@ impl UpdateApp {
                             ctx.request_repaint();
                         }
                         Err(e) => {
-                            // Signal error.
-                            *progress.lock().unwrap() = (u64::MAX - 1, 0);
-                            // Store error in a way the UI can read — we'll use
-                            // a sentinel and store the message via logging.
                             tracing::error!(error = %e, "Failed to apply update");
+                            *error_msg.lock().unwrap() = e.to_string();
+                            *progress.lock().unwrap() = (u64::MAX - 1, 0);
                             ctx.request_repaint();
                         }
                     }
                 }
                 Err(e) => {
-                    *progress.lock().unwrap() = (u64::MAX - 1, 0);
                     tracing::error!(error = %e, "Failed to download update");
+                    *error_msg.lock().unwrap() = e.to_string();
+                    *progress.lock().unwrap() = (u64::MAX - 1, 0);
                     ctx.request_repaint();
                 }
             }
@@ -272,9 +284,9 @@ impl UpdateApp {
             self.state = DialogState::ReadyToRestart;
         } else if downloaded == u64::MAX - 1 && total == 0 {
             self.state = DialogState::Error;
-            if self.error_msg.is_empty() {
-                self.error_msg =
-                    "Download or installation failed. Check logs for details.".to_string();
+            let mut msg = self.error_msg.lock().unwrap();
+            if msg.is_empty() {
+                *msg = "Download or installation failed. Check logs for details.".to_string();
             }
         }
     }

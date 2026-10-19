@@ -35,8 +35,8 @@ pub mod uninstall;
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{
-    autostart, encryption, event_loop, install, known_folders, notify, packages, photos, shutdown,
-    single_instance, trash,
+    autostart, bundle_update, encryption, event_loop, install, known_folders, notify, packages,
+    photos, shutdown, single_instance, trash,
 };
 
 /// Application User Model ID for toast notifications and Start Menu shortcuts.
@@ -54,9 +54,21 @@ pub const AUTOSTART_LABEL: &str = if cfg!(windows) {
 };
 
 /// Whether the GitHub-release self-updater can replace this build. Windows
-/// swaps the `.exe`; macOS has no bundle to swap until #63, so update checks
-/// are skipped there rather than offering an `.exe`.
-pub const SELF_UPDATE_SUPPORTED: bool = cfg!(windows);
+/// swaps the `.exe`; Apple Silicon macOS swaps the `.app` bundle from the
+/// `macos-arm64` zip (#75). Intel Macs get no release asset, so no checks.
+pub const SELF_UPDATE_SUPPORTED: bool = cfg!(any(
+    windows,
+    all(target_os = "macos", target_arch = "aarch64")
+));
+
+/// Shown in the update dialog. An ad-hoc-signed bundle (until #93) has a
+/// new code identity on every release, so macOS re-asks for the Keychain
+/// item once. Accepted for now (Nate, 2026-10-19).
+pub const UPDATE_NOTE: Option<&str> = if cfg!(target_os = "macos") {
+    Some("macOS may ask to allow Keychain access after updating. Choose Always Allow.")
+} else {
+    None
+};
 
 // Re-export only the symbols callers actually reach through the short
 // `platform::*` form. Symbols only ever referenced through the long

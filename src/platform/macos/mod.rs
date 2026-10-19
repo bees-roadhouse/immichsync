@@ -6,6 +6,7 @@
 // which issue replaces them.
 
 pub mod autostart;
+pub mod bundle_update;
 pub mod encryption;
 pub mod event_loop;
 pub mod install;

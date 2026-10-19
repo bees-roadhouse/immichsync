@@ -1,8 +1,9 @@
 // Remote update checker and applier.
 //
 // Checks GitHub Releases for new versions, downloads the update, and applies
-// it using a rename dance (can't overwrite/delete a running exe on Windows,
-// but CAN rename it).
+// it. Windows uses a rename dance (can't overwrite/delete a running exe, but
+// CAN rename it); macOS swaps the whole `.app` bundle from the release zip,
+// see platform::bundle_update (#75).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -14,7 +15,46 @@ use tracing::{debug, info};
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const DEFAULT_REPO: &str = "bees-roadhouse/immichsync";
-const ASSET_NAME: &str = "immichsync.exe";
+
+/// Which release asset this build updates from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// `immichsync.exe`
+    Windows,
+    /// `ImmichSync-<version>-macos-arm64.zip` from packaging/macos/make-app.sh
+    MacArm64,
+}
+
+impl Target {
+    /// The target of the running build, if releases carry an asset for it.
+    pub fn current() -> Option<Self> {
+        if cfg!(windows) {
+            Some(Target::Windows)
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            Some(Target::MacArm64)
+        } else {
+            None
+        }
+    }
+
+    /// The asset name this target expects in release `version`.
+    pub fn asset_name(self, version: &semver::Version) -> String {
+        match self {
+            Target::Windows => "immichsync.exe".to_string(),
+            Target::MacArm64 => format!("ImmichSync-{version}-macos-arm64.zip"),
+        }
+    }
+}
+
+/// Pick this target's asset out of a release, by exact name.
+fn select_asset<'a>(
+    assets: &'a [GitHubAsset],
+    target: Target,
+    version: &semver::Version,
+) -> Option<&'a GitHubAsset> {
+    let want = target.asset_name(version);
+    assets.iter().find(|a| a.name.eq_ignore_ascii_case(&want))
+}
 
 /// Delay before the first automatic update check after startup.
 pub const STARTUP_DELAY: Duration = Duration::from_secs(30);
@@ -179,8 +219,15 @@ pub enum UpdateError {
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
 
-    #[error("no matching asset '{ASSET_NAME}' in release")]
-    NoAsset,
+    #[error("no matching asset '{0}' in release")]
+    NoAsset(String),
+
+    #[error("no release asset is published for this platform")]
+    UnsupportedPlatform,
+
+    #[cfg(target_os = "macos")]
+    #[error(transparent)]
+    Bundle(#[from] crate::platform::bundle_update::BundleError),
 
     #[error("invalid version in release tag: {0}")]
     InvalidVersion(String),
@@ -297,12 +344,10 @@ async fn check_inner(repo: &str, channel: &Channel) -> Result<UpdateCheckResult,
         return Ok(UpdateCheckResult::UpToDate);
     }
 
-    // Find the exe asset.
-    let asset = release
-        .assets
-        .iter()
-        .find(|a| a.name.eq_ignore_ascii_case(ASSET_NAME))
-        .ok_or(UpdateError::NoAsset)?;
+    // Find this platform's asset.
+    let target = Target::current().ok_or(UpdateError::UnsupportedPlatform)?;
+    let asset = select_asset(&release.assets, target, &remote_ver)
+        .ok_or_else(|| UpdateError::NoAsset(target.asset_name(&remote_ver)))?;
 
     let info = UpdateInfo {
         current_version: current_str.to_string(),
@@ -325,7 +370,25 @@ async fn check_inner(repo: &str, channel: &Channel) -> Result<UpdateCheckResult,
 
 // ─── Download ────────────────────────────────────────────────────────────────
 
-/// Download the update binary to a temp file next to the current exe.
+/// Where the download goes. Windows: `immichsync.exe.new` beside the exe,
+/// so the rename stays on one volume. macOS: the zip in $TMPDIR, after
+/// checking the bundle can be replaced at all, so a read-only or
+/// translocated copy says so before downloading anything.
+fn download_dest() -> Result<PathBuf, UpdateError> {
+    #[cfg(target_os = "macos")]
+    {
+        let bundle = crate::platform::bundle_update::running_bundle()?;
+        crate::platform::bundle_update::preflight(&bundle)?;
+        Ok(std::env::temp_dir().join("ImmichSync-update.zip"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let current_exe = std::env::current_exe().map_err(UpdateError::File)?;
+        Ok(current_exe.with_extension("exe.new"))
+    }
+}
+
+/// Download the update to a temp file (see `download_dest`).
 ///
 /// `progress_fn` is called with `(bytes_downloaded, total_bytes)`.
 /// Returns the path to the downloaded file.
@@ -333,8 +396,7 @@ pub fn download_update_blocking<F>(url: &str, progress_fn: F) -> Result<PathBuf,
 where
     F: Fn(u64, u64),
 {
-    let current_exe = std::env::current_exe().map_err(UpdateError::File)?;
-    let dest = current_exe.with_extension("exe.new");
+    let dest = download_dest()?;
 
     let client = reqwest::blocking::Client::builder()
         .user_agent(format!("ImmichSync/{}", env!("CARGO_PKG_VERSION")))
@@ -375,10 +437,23 @@ where
 
 // ─── Apply ───────────────────────────────────────────────────────────────────
 
+/// Apply the update on macOS: unpack the zip beside the running bundle,
+/// verify it, and swap it in (platform::bundle_update::apply_zip).
+#[cfg(target_os = "macos")]
+pub fn apply_update(zip_path: &std::path::Path, new_version: &str) -> Result<(), UpdateError> {
+    let bundle = crate::platform::bundle_update::running_bundle()?;
+    let result = crate::platform::bundle_update::apply_zip(zip_path, &bundle);
+    let _ = std::fs::remove_file(zip_path);
+    result?;
+    info!(version = new_version, "Update applied");
+    Ok(())
+}
+
 /// Apply the update using a rename dance:
 /// 1. Rename current exe → .exe.old (works while running)
 /// 2. Rename downloaded exe → current exe name
 /// 3. Write version.txt with new version
+#[cfg(not(target_os = "macos"))]
 pub fn apply_update(new_exe_path: &std::path::Path, new_version: &str) -> Result<(), UpdateError> {
     let current_exe = std::env::current_exe().map_err(UpdateError::File)?;
     let old_exe = current_exe.with_extension("exe.old");
@@ -437,6 +512,15 @@ pub fn cleanup_old_exe() {
     }
 }
 
+/// Delete the parked `.ImmichSync.app.old` (and any half-unpacked staging
+/// dir) from a previous update. The new instance calls this at startup.
+#[cfg(target_os = "macos")]
+pub fn cleanup_old_bundle() {
+    if let Ok(bundle) = crate::platform::bundle_update::running_bundle() {
+        crate::platform::bundle_update::cleanup(&bundle);
+    }
+}
+
 // ─── Background download + apply ─────────────────────────────────────────────
 
 /// Download and apply an update without any UI.
@@ -454,8 +538,14 @@ pub fn download_and_apply(info: &UpdateInfo) -> Result<(), UpdateError> {
 
 // ─── Relaunch ────────────────────────────────────────────────────────────────
 
-/// Relaunch the current exe (after update) and exit this process.
+/// Relaunch the current exe (after update) and exit this process. On macOS
+/// the bundle relaunches through `open` once this process is gone.
 pub fn relaunch_self() -> ! {
+    #[cfg(target_os = "macos")]
+    if let Ok(bundle) = crate::platform::bundle_update::running_bundle() {
+        crate::platform::bundle_update::relaunch(&bundle);
+    }
+
     let exe = std::env::current_exe().expect("current_exe");
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -545,6 +635,57 @@ mod tests {
             )
         );
         assert_eq!(channel_api_url(repo, &Channel::None), None);
+    }
+
+    fn asset(name: &str) -> GitHubAsset {
+        GitHubAsset {
+            name: name.to_string(),
+            browser_download_url: format!("https://example.invalid/{name}"),
+            size: 1,
+        }
+    }
+
+    #[test]
+    fn select_asset_picks_each_platforms_own_file() {
+        let v = semver::Version::parse("0.3.0").unwrap();
+        let assets = [
+            asset("immichsync.exe"),
+            asset("ImmichSync-0.3.0-macos-arm64.zip"),
+        ];
+        assert_eq!(
+            select_asset(&assets, Target::Windows, &v).unwrap().name,
+            "immichsync.exe"
+        );
+        assert_eq!(
+            select_asset(&assets, Target::MacArm64, &v).unwrap().name,
+            "ImmichSync-0.3.0-macos-arm64.zip"
+        );
+    }
+
+    #[test]
+    fn macos_never_takes_the_exe_or_another_versions_zip() {
+        let v = semver::Version::parse("0.3.0").unwrap();
+        let exe_only = [asset("immichsync.exe")];
+        assert!(select_asset(&exe_only, Target::MacArm64, &v).is_none());
+        let stale = [
+            asset("immichsync.exe"),
+            asset("ImmichSync-0.2.9-macos-arm64.zip"),
+        ];
+        assert!(select_asset(&stale, Target::MacArm64, &v).is_none());
+        let mac_only = [asset("ImmichSync-0.3.0-macos-arm64.zip")];
+        assert!(select_asset(&mac_only, Target::Windows, &v).is_none());
+    }
+
+    #[test]
+    fn current_target_matches_the_build() {
+        #[cfg(windows)]
+        assert_eq!(Target::current(), Some(Target::Windows));
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(Target::current(), Some(Target::MacArm64));
+        assert_eq!(
+            Target::current().is_some(),
+            crate::platform::SELF_UPDATE_SUPPORTED
+        );
     }
 
     #[test]

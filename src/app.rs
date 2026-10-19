@@ -954,7 +954,7 @@ impl App {
     /// If `with_delay` is true, waits `STARTUP_DELAY` before checking.
     fn schedule_update_check(&mut self, with_delay: bool) {
         if !crate::platform::SELF_UPDATE_SUPPORTED {
-            info!("Self-update is not supported on this platform yet (#63); skipping check");
+            info!("No self-update asset is published for this platform; skipping check");
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1046,7 +1046,12 @@ impl App {
 
                 self.notifications.show_toast_raw(
                     "Update Ready",
-                    &format!("ImmichSync v{version} is ready — restart to apply."),
+                    &match crate::platform::UPDATE_NOTE {
+                        Some(note) => {
+                            format!("ImmichSync v{version} is ready — restart to apply. {note}")
+                        }
+                        None => format!("ImmichSync v{version} is ready — restart to apply."),
+                    },
                 );
             }
             Err(e) => {
