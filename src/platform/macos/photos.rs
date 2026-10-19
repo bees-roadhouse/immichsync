@@ -17,13 +17,18 @@ use anyhow::{anyhow, Context as _};
 use block2::RcBlock;
 use chrono::{DateTime, TimeZone, Utc};
 use objc2::rc::Retained;
-use objc2::Message;
-use objc2_foundation::{NSArray, NSBundle, NSDate, NSError, NSSortDescriptor, NSString, NSURL};
+use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
+use objc2::{AllocAnyThread, ClassType, DefinedClass, Message};
+use objc2_foundation::{
+    NSArray, NSBundle, NSData, NSDate, NSError, NSKeyedArchiver, NSKeyedUnarchiver, NSSet,
+    NSSortDescriptor, NSString, NSURL,
+};
 use objc2_photos::{
     PHAccessLevel, PHAsset, PHAssetCollection, PHAssetCollectionSubtype, PHAssetCollectionType,
     PHAssetMediaType, PHAssetResource, PHAssetResourceManager, PHAssetResourceRequestOptions,
-    PHAssetResourceType, PHAssetSourceType, PHAuthorizationStatus, PHCollection, PHCollectionList,
-    PHFetchOptions, PHPhotoLibrary, PHPhotosError,
+    PHAssetResourceType, PHAssetSourceType, PHAuthorizationStatus, PHChange, PHCollection,
+    PHCollectionList, PHFetchOptions, PHObjectType, PHPersistentChange, PHPersistentChangeToken,
+    PHPhotoLibrary, PHPhotoLibraryChangeObserver, PHPhotosError,
 };
 use tracing::{debug, info};
 
@@ -102,43 +107,163 @@ pub fn request_access() -> anyhow::Result<Access> {
 
 /// Fetch options for what ImmichSync syncs: the user's own library, images
 /// and videos, no hidden items, burst picks only, newest first.
-fn sync_fetch_options() -> Retained<PHFetchOptions> {
+fn sync_fetch_options(newest_first: bool) -> Retained<PHFetchOptions> {
     unsafe {
         let options = PHFetchOptions::new();
         options.setIncludeHiddenAssets(false);
         options.setIncludeAllBurstAssets(false);
         options.setIncludeAssetSourceTypes(PHAssetSourceType::TypeUserLibrary);
-        let newest_first = NSSortDescriptor::sortDescriptorWithKey_ascending(
+        let order = NSSortDescriptor::sortDescriptorWithKey_ascending(
             Some(&NSString::from_str("creationDate")),
-            false,
+            !newest_first,
         );
-        options.setSortDescriptors(Some(&NSArray::from_retained_slice(&[newest_first])));
+        options.setSortDescriptors(Some(&NSArray::from_retained_slice(&[order])));
         options
     }
 }
 
-/// `localIdentifier`s of the newest `limit` images and videos. Empty, with
-/// no prompt, unless access is already granted.
-pub fn newest_asset_ids(limit: usize) -> Vec<String> {
-    if !access().can_read() {
-        debug!("Photos library not readable; not fetching");
-        return Vec::new();
-    }
+/// The images and videos in a fetch result, as `localIdentifier`s.
+fn syncable_ids(result: &objc2_photos::PHFetchResult<PHAsset>) -> Vec<String> {
     let mut ids = Vec::new();
-    unsafe {
-        let result = PHAsset::fetchAssetsWithOptions(Some(&sync_fetch_options()));
-        for i in 0..result.count() {
-            if ids.len() >= limit {
-                break;
-            }
-            let asset = result.objectAtIndex(i);
-            let kind = asset.mediaType();
-            if kind == PHAssetMediaType::Image || kind == PHAssetMediaType::Video {
-                ids.push(asset.localIdentifier().to_string());
-            }
+    for i in 0..unsafe { result.count() } {
+        let asset = unsafe { result.objectAtIndex(i) };
+        let kind = unsafe { asset.mediaType() };
+        if kind == PHAssetMediaType::Image || kind == PHAssetMediaType::Video {
+            ids.push(unsafe { asset.localIdentifier() }.to_string());
         }
     }
     ids
+}
+
+/// The library through PhotoKit, for `watch::photos::sync_pass` (#81).
+/// Every method refuses unless access is already granted, so a sync pass can
+/// never raise the permission prompt.
+pub struct PhotoKitLibrary;
+
+fn require_access() -> anyhow::Result<()> {
+    if access().can_read() {
+        Ok(())
+    } else {
+        Err(anyhow!("Photos library access is not granted"))
+    }
+}
+
+fn archive(token: &PHPersistentChangeToken) -> anyhow::Result<Vec<u8>> {
+    let data = unsafe {
+        NSKeyedArchiver::archivedDataWithRootObject_requiringSecureCoding_error(token, true)
+    }
+    .map_err(|e| anyhow!("archive change token: {}", e.localizedDescription()))?;
+    Ok(data.to_vec())
+}
+
+fn unarchive(bytes: &[u8]) -> Option<Retained<PHPersistentChangeToken>> {
+    let data = NSData::with_bytes(bytes);
+    let obj = unsafe {
+        NSKeyedUnarchiver::unarchivedObjectOfClass_fromData_error(
+            PHPersistentChangeToken::class(),
+            &data,
+        )
+    }
+    .ok()?;
+    obj.downcast::<PHPersistentChangeToken>().ok()
+}
+
+fn nsset_strings(set: &NSSet<NSString>) -> Vec<String> {
+    set.iter().map(|s| s.to_string()).collect()
+}
+
+impl crate::watch::photos::PhotosLibrary for PhotoKitLibrary {
+    fn current_token(&self) -> anyhow::Result<Vec<u8>> {
+        require_access()?;
+        let token = unsafe { PHPhotoLibrary::sharedPhotoLibrary().currentChangeToken() };
+        archive(&token)
+    }
+
+    fn all_asset_ids(&self, newest_first: bool) -> anyhow::Result<Vec<String>> {
+        require_access()?;
+        let result =
+            unsafe { PHAsset::fetchAssetsWithOptions(Some(&sync_fetch_options(newest_first))) };
+        Ok(syncable_ids(&result))
+    }
+
+    fn changes_since(
+        &self,
+        token: &[u8],
+    ) -> Result<crate::watch::photos::LibraryChanges, crate::watch::photos::ChangesError> {
+        use crate::watch::photos::{ChangesError, LibraryChanges};
+        require_access()?;
+        // A token we can't read back is as good as expired: enumerate.
+        let Some(since) = unarchive(token) else {
+            return Err(ChangesError::Expired);
+        };
+        let fetched = unsafe {
+            PHPhotoLibrary::sharedPhotoLibrary().fetchPersistentChangesSinceToken_error(&since)
+        };
+        let result = match fetched {
+            Ok(r) => r,
+            Err(e)
+                if e.code() == PHPhotosError::PersistentChangeTokenExpired.0
+                    || e.code() == PHPhotosError::PersistentChangeDetailsUnavailable.0 =>
+            {
+                return Err(ChangesError::Expired)
+            }
+            Err(e) => {
+                return Err(ChangesError::Other(anyhow!(
+                    "fetch persistent changes: {}",
+                    e.localizedDescription()
+                )))
+            }
+        };
+
+        let collected = std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), None));
+        let block = RcBlock::new(|change: std::ptr::NonNull<PHPersistentChange>, _stop| {
+            let change = unsafe { change.as_ref() };
+            let mut c = collected.borrow_mut();
+            if let Ok(d) = unsafe { change.changeDetailsForObjectType_error(PHObjectType::Asset) } {
+                let (ins, upd, del) = unsafe {
+                    (
+                        d.insertedLocalIdentifiers(),
+                        d.updatedLocalIdentifiers(),
+                        d.deletedLocalIdentifiers(),
+                    )
+                };
+                c.0.extend(nsset_strings(&ins));
+                c.1.extend(nsset_strings(&upd));
+                c.2.extend(nsset_strings(&del));
+            }
+            c.3 = Some(unsafe { change.changeToken() });
+        });
+        unsafe { result.enumerateChangesWithBlock(&block) };
+        drop(block);
+        let (inserted, updated, deleted, last) = collected.into_inner();
+
+        // Inserts go through the same filter as a full pass (user library,
+        // no hidden, burst picks, images and videos); an insert deleted since
+        // isn't returned at all.
+        let inserted = if inserted.is_empty() {
+            Vec::new()
+        } else {
+            let ids: Vec<Retained<NSString>> =
+                inserted.iter().map(|s| NSString::from_str(s)).collect();
+            let result = unsafe {
+                PHAsset::fetchAssetsWithLocalIdentifiers_options(
+                    &NSArray::from_retained_slice(&ids),
+                    Some(&sync_fetch_options(true)),
+                )
+            };
+            syncable_ids(&result)
+        };
+        let token = match last {
+            Some(t) => archive(&t)?,
+            None => token.to_vec(),
+        };
+        Ok(LibraryChanges {
+            inserted,
+            updated,
+            deleted,
+            token,
+        })
+    }
 }
 
 /// Whether a Photos album subtype is mirrored to Immich: only albums the
@@ -198,6 +323,62 @@ fn user_albums(asset: &PHAsset) -> Vec<LibraryAlbum> {
         });
     }
     albums
+}
+
+// ── Change observer (#81) ──────────────────────────────────────────────────
+
+struct ObserverIvars {
+    tx: std::sync::Mutex<mpsc::Sender<()>>,
+}
+
+objc2::define_class!(
+    // PhotoKit delivers change notifications on a background queue; the
+    // only state touched there is the mutex-guarded sender.
+    #[unsafe(super(NSObject))]
+    #[name = "ImmichSyncPhotosChangeObserver"]
+    #[ivars = ObserverIvars]
+    struct ChangeObserver;
+
+    unsafe impl NSObjectProtocol for ChangeObserver {}
+
+    unsafe impl PHPhotoLibraryChangeObserver for ChangeObserver {
+        #[unsafe(method(photoLibraryDidChange:))]
+        fn photo_library_did_change(&self, _change: &PHChange) {
+            if let Ok(tx) = self.ivars().tx.lock() {
+                let _ = tx.send(());
+            }
+        }
+    }
+);
+
+/// A registered change observer; unregistered on drop. Keep it on the
+/// thread that made it.
+pub struct ChangeWatch(Retained<ChangeObserver>);
+
+impl Drop for ChangeWatch {
+    fn drop(&mut self) {
+        unsafe {
+            PHPhotoLibrary::sharedPhotoLibrary()
+                .unregisterChangeObserver(ProtocolObject::from_ref(&*self.0));
+        }
+    }
+}
+
+/// Send `()` on `tx` whenever the library changes. `None` (and nothing
+/// registered) unless access is already granted, so it never prompts.
+pub fn watch_changes(tx: mpsc::Sender<()>) -> Option<ChangeWatch> {
+    if !access().can_read() {
+        return None;
+    }
+    let this = ChangeObserver::alloc().set_ivars(ObserverIvars {
+        tx: std::sync::Mutex::new(tx),
+    });
+    let observer: Retained<ChangeObserver> = unsafe { objc2::msg_send![super(this), init] };
+    unsafe {
+        PHPhotoLibrary::sharedPhotoLibrary()
+            .registerChangeObserver(ProtocolObject::from_ref(&*observer));
+    }
+    Some(ChangeWatch(observer))
 }
 
 /// How long one export may take before it is treated as failed. Local
@@ -293,7 +474,7 @@ impl LibraryExporter for PhotoKitExporter {
 
         let ids = NSArray::from_retained_slice(&[NSString::from_str(local_id)]);
         let asset = unsafe {
-            PHAsset::fetchAssetsWithLocalIdentifiers_options(&ids, Some(&sync_fetch_options()))
+            PHAsset::fetchAssetsWithLocalIdentifiers_options(&ids, Some(&sync_fetch_options(true)))
                 .firstObject()
         }
         .ok_or(LibraryExportError::Gone)?;
@@ -383,6 +564,18 @@ mod tests {
         }
         assert_eq!(sweep(&root), 2);
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    /// The stored token survives the archive → bytes → unarchive trip, and
+    /// junk bytes read back as "no token" (which the sync treats as
+    /// expired: enumerate). No library access involved.
+    #[test]
+    fn change_tokens_archive_and_unarchive() {
+        let token = unsafe { PHPersistentChangeToken::new() };
+        let bytes = archive(&token).unwrap();
+        assert!(!bytes.is_empty());
+        assert!(unarchive(&bytes).is_some());
+        assert!(unarchive(b"not an archive").is_none());
     }
 
     #[test]

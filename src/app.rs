@@ -84,6 +84,9 @@ pub struct App {
     /// `None` when the monitor failed to start; device auto-watch is then off.
     volume_monitor: Option<crate::platform::volumes::VolumeMonitor>,
     volume_rx: Option<std::sync::mpsc::Receiver<crate::platform::volumes::VolumeEvent>>,
+    /// Running switch of the Photos source thread, once started (#81).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    photos_enabled: Option<Arc<AtomicBool>>,
 }
 
 /// Tracks whether each type of UI window is currently open, preventing
@@ -147,6 +150,7 @@ impl App {
             server_offline: false,
             volume_monitor: None,
             volume_rx: None,
+            photos_enabled: None,
         }
     }
 
@@ -256,7 +260,7 @@ impl App {
 
         // Photos library: queue the newest assets if it's on and access was
         // already granted. Never prompts; the prompt belongs to Settings.
-        self.queue_photos_library();
+        self.start_photos_source();
 
         // Schedule the first automatic update check after a startup delay.
         if crate::platform::SELF_UPDATE_SUPPORTED && self.config.advanced.check_for_updates {
@@ -584,7 +588,12 @@ impl App {
         // Apply the new config.
         self.config = new_config;
         if photos_turned_on {
-            self.queue_photos_library();
+            self.start_photos_source();
+        }
+        if !self.config.photos.enabled {
+            if let Some(flag) = &self.photos_enabled {
+                flag.store(false, Ordering::SeqCst);
+            }
         }
         self.notifications = crate::ui::notifications::Notifications::new(&self.config);
 
@@ -631,30 +640,55 @@ impl App {
         }
     }
 
-    /// Queue the newest Photos library assets on a background thread (the
-    /// PhotoKit fetch blocks). A no-op unless the library is enabled, the
-    /// pipeline exists, and access is already granted, so it never raises
-    /// the permission prompt. Tracer: capped at `TRACER_CAP` (#80).
-    fn queue_photos_library(&self) {
+    /// Start the Photos library source (#81) once: a background thread that
+    /// syncs at start and on every library change (`watch::photos`). Later
+    /// calls only switch it back on. A no-op unless the library is enabled,
+    /// the pipeline exists and access is already granted, so it never
+    /// raises the permission prompt.
+    fn start_photos_source(&mut self) {
         #[cfg(target_os = "macos")]
         {
             use crate::platform::photos;
+            use std::sync::atomic::Ordering;
             if !self.config.photos.enabled || self.pipeline.is_none() {
+                return;
+            }
+            if let Some(flag) = &self.photos_enabled {
+                flag.store(true, Ordering::SeqCst);
                 return;
             }
             let access = photos::access();
             if !access.can_read() {
                 info!(
                     ?access,
-                    "Photos library enabled but not readable; nothing queued"
+                    "Photos library enabled but not readable; not syncing"
                 );
                 return;
             }
             let store: Arc<dyn QueueStore> = self.db.clone();
-            std::thread::spawn(move || {
-                let ids = photos::newest_asset_ids(crate::watch::photos::TRACER_CAP);
-                crate::watch::photos::enqueue_new(store.as_ref(), &ids);
-            });
+            let newest_first = self.config.upload.order != "oldest_first";
+            let enabled = Arc::new(AtomicBool::new(true));
+            self.photos_enabled = Some(enabled.clone());
+            let spawned = std::thread::Builder::new()
+                .name("photos-source".into())
+                .spawn(move || {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    // Held for the thread's life; without it the source does
+                    // its start pass and stops.
+                    let _watch = photos::watch_changes(tx);
+                    crate::watch::photos::run_source(
+                        &photos::PhotoKitLibrary,
+                        store.as_ref(),
+                        newest_first,
+                        rx,
+                        &enabled,
+                        crate::watch::photos::CHANGE_DEBOUNCE,
+                    );
+                });
+            if let Err(e) = spawned {
+                warn!(error = %e, "Failed to start the Photos source");
+                self.photos_enabled = None;
+            }
         }
     }
 

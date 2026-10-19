@@ -1277,8 +1277,8 @@ impl PhotosTabState {
         self.show_albums(ui, server_url, api_key);
         ui.add_space(4.0);
         ui.small(
-            "This first version uploads the 3 newest items whose originals are on this Mac; \
-             items stored only in iCloud are skipped for now. Album choices apply after a restart.",
+            "Syncs the whole library first, then new photos as you add them. \
+             Items stored only in iCloud are skipped for now. Album choices apply after a restart.",
         );
     }
 }
