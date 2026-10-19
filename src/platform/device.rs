@@ -178,7 +178,9 @@ fn run(tx: mpsc::Sender<VolumeEvent>, ready: mpsc::Sender<anyhow::Result<SendHwn
 
     unsafe {
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).into() {
+        // GetMessageW returns -1 on error; `> 0` stops there instead of
+        // spinning on it as `.into()` (non-zero = true) would.
+        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

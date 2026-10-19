@@ -208,6 +208,9 @@ mod tests {
         assert_eq!(folders.len(), 1);
         assert!(folders[0].auto_added);
         assert!(folders[0].enabled);
+        // A card is never trashed or cleared by default: the one property
+        // here whose regression destroys files on a camera card.
+        assert_eq!(folders[0].post_upload, crate::db::PostUpload::Keep);
         assert_eq!(folders[0].label.as_deref(), Some("CARD"));
         assert_eq!(folders[0].path, folder.display().to_string());
     }

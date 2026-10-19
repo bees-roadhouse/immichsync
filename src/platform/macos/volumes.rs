@@ -62,8 +62,14 @@ struct CallbackState {
 struct RunLoopHandle(CFRetained<CFRunLoop>);
 unsafe impl Send for RunLoopHandle {}
 
+/// How long one run-loop pass waits before re-checking the stop flag.
+/// `CFRunLoopStop` before the thread enters the loop is a no-op, so the
+/// flag is what guarantees `stop()` never hangs.
+const RUN_SLICE_SECS: f64 = 0.5;
+
 /// Watches for volume mounts and unmounts; see the module comment.
 pub struct VolumeMonitor {
+    stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
     run_loop: Option<RunLoopHandle>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -73,10 +79,12 @@ impl VolumeMonitor {
     /// first, then one per mount or unmount until [`stop`](Self::stop).
     pub fn start(tx: mpsc::Sender<VolumeEvent>) -> anyhow::Result<Self> {
         let (ready_tx, ready_rx) = mpsc::channel::<anyhow::Result<RunLoopHandle>>();
+        let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flag = stopping.clone();
 
         let thread = std::thread::Builder::new()
             .name("volume-monitor".into())
-            .spawn(move || run(tx, ready_tx))
+            .spawn(move || run(tx, ready_tx, stop_flag))
             .context("spawn volume-monitor thread")?;
 
         let run_loop = ready_rx
@@ -85,6 +93,7 @@ impl VolumeMonitor {
 
         info!("Volume monitor started (DiskArbitration)");
         Ok(Self {
+            stopping,
             run_loop: Some(run_loop),
             thread: Some(thread),
         })
@@ -92,6 +101,8 @@ impl VolumeMonitor {
 
     /// Stop the run loop and wait for the thread to exit.
     pub fn stop(&mut self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(rl) = self.run_loop.take() {
             rl.0.stop();
         }
@@ -108,7 +119,11 @@ impl Drop for VolumeMonitor {
     }
 }
 
-fn run(tx: mpsc::Sender<VolumeEvent>, ready: mpsc::Sender<anyhow::Result<RunLoopHandle>>) {
+fn run(
+    tx: mpsc::Sender<VolumeEvent>,
+    ready: mpsc::Sender<anyhow::Result<RunLoopHandle>>,
+    stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     let Some(session) = (unsafe { DASession::new(None) }) else {
         let _ = ready.send(Err(anyhow::anyhow!("DASessionCreate returned NULL")));
         return;
@@ -145,7 +160,11 @@ fn run(tx: mpsc::Sender<VolumeEvent>, ready: mpsc::Sender<anyhow::Result<RunLoop
 
     let _ = ready.send(Ok(RunLoopHandle(run_loop.clone())));
     debug!("Volume monitor run loop entered");
-    CFRunLoop::run();
+    // Short slices rather than CFRunLoop::run(): a stop() that lands before
+    // the loop is entered is still seen on the next pass.
+    while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
+        CFRunLoop::run_in_mode(Some(mode), RUN_SLICE_SECS, false);
+    }
 
     unsafe {
         session.unschedule_from_run_loop(&run_loop, mode);
@@ -323,6 +342,16 @@ mod tests {
             .unwrap()
             .success();
         assert!(ok, "hdiutil create failed");
+
+        // Stopping right after start must not hang (the run loop may not
+        // have been entered yet).
+        let (tx0, _rx0) = mpsc::channel();
+        let t0 = std::time::Instant::now();
+        VolumeMonitor::start(tx0).unwrap().stop();
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "stop() right after start hung"
+        );
 
         let (tx, rx) = mpsc::channel();
         let mut monitor = VolumeMonitor::start(tx).unwrap();

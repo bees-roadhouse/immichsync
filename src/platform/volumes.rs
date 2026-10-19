@@ -5,9 +5,10 @@
 // unmount after that. It knows nothing about DCIM folders or config; the
 // decision lives in `watch::device`.
 //
-// - Windows: a message-only window receiving `WM_DEVICECHANGE`
-//   (`platform/device.rs`, revived from before #42), plus a drive-letter
-//   sweep at start (`platform/drives.rs`).
+// - Windows: a hidden top-level window receiving `WM_DEVICECHANGE`
+//   (`platform/device.rs`, revived from before #42; top-level because
+//   volume arrivals are broadcast and message-only windows never get
+//   broadcasts), plus a drive-letter sweep at start (`platform/drives.rs`).
 // - macOS: DiskArbitration appeared / description-changed / disappeared
 //   callbacks on a CFRunLoop thread (`platform/macos/volumes.rs`).
 
