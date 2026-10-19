@@ -101,7 +101,6 @@ impl ImmichClient {
     /// Returns `ApiError::Auth` for a 401, `ApiError::BadRequest` for a 400,
     /// `ApiError::ServerError` for 5xx responses, and `ApiError::Network` for
     /// transport failures.
-    #[instrument(skip(self), fields(path = %file_path.as_ref().display()))]
     pub async fn upload_asset(
         &self,
         file_path: impl AsRef<Path> + std::fmt::Debug,
@@ -109,6 +108,29 @@ impl ImmichClient {
         device_id: &str,
         created_at: DateTime<Utc>,
         modified_at: DateTime<Utc>,
+    ) -> Result<UploadResult, ApiError> {
+        self.upload_asset_linked(
+            file_path,
+            device_asset_id,
+            device_id,
+            created_at,
+            modified_at,
+            None,
+        )
+        .await
+    }
+
+    /// [`upload_asset`](Self::upload_asset), optionally linking a Live
+    /// Photo still to its uploaded motion video (`livePhotoVideoId`, #83).
+    #[instrument(skip(self), fields(path = %file_path.as_ref().display()))]
+    pub async fn upload_asset_linked(
+        &self,
+        file_path: impl AsRef<Path> + std::fmt::Debug,
+        device_asset_id: &str,
+        device_id: &str,
+        created_at: DateTime<Utc>,
+        modified_at: DateTime<Utc>,
+        live_photo_video_id: Option<&str>,
     ) -> Result<UploadResult, ApiError> {
         let path = file_path.as_ref();
 
@@ -163,13 +185,17 @@ impl ImmichClient {
             .mime_str(mime)
             .map_err(|e| ApiError::Unexpected(format!("invalid MIME type: {e}")))?;
 
-        let form = Form::new()
-            .part("assetData", file_part)
-            .text("deviceAssetId", device_asset_id.to_string())
-            .text("deviceId", device_id.to_string())
-            .text("fileCreatedAt", created_at.to_rfc3339())
-            .text("fileModifiedAt", modified_at.to_rfc3339())
-            .text("isFavorite", "false");
+        let form = upload_fields(
+            device_asset_id,
+            device_id,
+            created_at,
+            modified_at,
+            live_photo_video_id,
+        )
+        .into_iter()
+        .fold(Form::new().part("assetData", file_part), |f, (k, v)| {
+            f.text(k, v)
+        });
 
         debug!("uploading asset");
 
@@ -248,6 +274,27 @@ impl ImmichClient {
 // AssetUploader trait implementation
 // ---------------------------------------------------------------------------
 
+/// The text fields of an asset upload, in order.
+fn upload_fields(
+    device_asset_id: &str,
+    device_id: &str,
+    created_at: DateTime<Utc>,
+    modified_at: DateTime<Utc>,
+    live_photo_video_id: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut fields = vec![
+        ("deviceAssetId", device_asset_id.to_string()),
+        ("deviceId", device_id.to_string()),
+        ("fileCreatedAt", created_at.to_rfc3339()),
+        ("fileModifiedAt", modified_at.to_rfc3339()),
+        ("isFavorite", "false".to_string()),
+    ];
+    if let Some(id) = live_photo_video_id {
+        fields.push(("livePhotoVideoId", id.to_string()));
+    }
+    fields
+}
+
 #[async_trait::async_trait]
 impl crate::upload::worker::AssetUploader for ImmichClient {
     async fn upload_asset(
@@ -268,6 +315,31 @@ impl crate::upload::worker::AssetUploader for ImmichClient {
             )
             .await?;
 
+        Ok(crate::upload::worker::UploadResult {
+            asset_id: result.asset_id,
+            is_duplicate: result.is_duplicate,
+        })
+    }
+
+    async fn upload_live_still(
+        &self,
+        file_path: &Path,
+        device_asset_id: &str,
+        device_id: &str,
+        created_at: DateTime<Utc>,
+        modified_at: DateTime<Utc>,
+        live_photo_video_id: &str,
+    ) -> anyhow::Result<crate::upload::worker::UploadResult> {
+        let result = self
+            .upload_asset_linked(
+                file_path,
+                device_asset_id,
+                device_id,
+                created_at,
+                modified_at,
+                Some(live_photo_video_id),
+            )
+            .await?;
         Ok(crate::upload::worker::UploadResult {
             asset_id: result.asset_id,
             is_duplicate: result.is_duplicate,
@@ -386,5 +458,19 @@ fn mime_from_extension(path: &Path) -> &'static str {
         "3gp" => "video/3gpp",
         "mts" | "m2ts" => "video/mp2t",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_live_still_carries_its_video_id_and_a_plain_upload_does_not() {
+        let t = Utc::now();
+        let plain = upload_fields("d", "dev", t, t, None);
+        assert!(plain.iter().all(|(k, _)| *k != "livePhotoVideoId"));
+        let linked = upload_fields("d", "dev", t, t, Some("imm-video"));
+        assert!(linked.contains(&("livePhotoVideoId", "imm-video".to_string())));
     }
 }

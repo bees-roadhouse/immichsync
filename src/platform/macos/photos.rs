@@ -482,70 +482,103 @@ impl LibraryExporter for PhotoKitExporter {
             LibraryExportError::Other(anyhow!("asset has no original photo or video resource"))
         })?;
 
-        let name = safe_file_name(&unsafe { resource.originalFilename() }.to_string());
         let dir: PathBuf = export_root().join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create {}", dir.display()))
             .map_err(LibraryExportError::Other)?;
-        let path = dir.join(&name);
-
-        let options = unsafe { PHAssetResourceRequestOptions::new() };
-        // Local originals only in this slice; iCloud downloads are slice 3.
-        unsafe { options.setNetworkAccessAllowed(false) };
-
-        let (tx, rx) = mpsc::channel::<Option<(isize, String)>>();
-        let done = RcBlock::new(move |err: *mut NSError| {
-            let outcome =
-                unsafe { err.as_ref() }.map(|e| (e.code(), e.localizedDescription().to_string()));
-            let _ = tx.send(outcome);
-        });
-        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
-        unsafe {
-            PHAssetResourceManager::defaultManager()
-                .writeDataForAssetResource_toFile_options_completionHandler(
-                    &resource,
-                    &url,
-                    Some(&options),
-                    &done,
-                );
-        }
-
-        let outcome = rx.recv_timeout(EXPORT_TIMEOUT);
         let cleanup = |dir: &PathBuf| {
             let _ = std::fs::remove_dir_all(dir);
         };
-        match outcome {
-            Ok(None) => {
-                debug!(%local_id, path = %path.display(), "Photos original exported");
-                Ok(LibraryExport {
-                    path,
-                    resource: kind,
-                    created_at: to_utc(unsafe { asset.creationDate() }),
-                    modified_at: to_utc(unsafe { asset.modificationDate() }),
-                    albums: user_albums(&asset),
-                })
-            }
-            Ok(Some((code, _))) if code == PHPhotosError::NetworkAccessRequired.0 => {
-                cleanup(&dir);
-                Err(LibraryExportError::CloudOnly)
-            }
-            Ok(Some((code, msg))) => {
-                cleanup(&dir);
-                Err(LibraryExportError::Other(anyhow!(
-                    "export failed ({code}): {msg}"
-                )))
-            }
-            Err(_) => {
-                // PhotoKit's write may still be in flight; removing the
-                // directory makes it fail harmlessly rather than land.
-                cleanup(&dir);
-                Err(LibraryExportError::Other(anyhow!(
-                    "export timed out after {}s",
-                    EXPORT_TIMEOUT.as_secs()
-                )))
-            }
+
+        let name = safe_file_name(&unsafe { resource.originalFilename() }.to_string());
+        let path = dir.join(&name);
+        if let Err(e) = write_resource(&resource, &path) {
+            cleanup(&dir);
+            return Err(e);
         }
+
+        // A Live Photo's motion part: its original `.pairedVideo`, never the
+        // edited `.fullSizePairedVideo` (#83). Both parts or neither.
+        let paired_video = match paired_video_resource(&asset) {
+            None => None,
+            Some(video) => {
+                let mut vname = safe_file_name(&unsafe { video.originalFilename() }.to_string());
+                if vname == name {
+                    vname = format!("motion-{vname}");
+                }
+                let vpath = dir.join(vname);
+                if let Err(e) = write_resource(&video, &vpath) {
+                    cleanup(&dir);
+                    return Err(e);
+                }
+                Some(vpath)
+            }
+        };
+
+        debug!(%local_id, path = %path.display(), live = paired_video.is_some(), "Photos original exported");
+        Ok(LibraryExport {
+            path,
+            resource: kind,
+            created_at: to_utc(unsafe { asset.creationDate() }),
+            modified_at: to_utc(unsafe { asset.modificationDate() }),
+            albums: user_albums(&asset),
+            paired_video,
+        })
     }
+}
+
+/// Write one resource's bytes to `path`, local copies only.
+fn write_resource(
+    resource: &PHAssetResource,
+    path: &std::path::Path,
+) -> Result<(), LibraryExportError> {
+    let options = unsafe { PHAssetResourceRequestOptions::new() };
+    // Local originals only for now; iCloud downloads are #82.
+    unsafe { options.setNetworkAccessAllowed(false) };
+
+    let (tx, rx) = mpsc::channel::<Option<(isize, String)>>();
+    let done = RcBlock::new(move |err: *mut NSError| {
+        let outcome =
+            unsafe { err.as_ref() }.map(|e| (e.code(), e.localizedDescription().to_string()));
+        let _ = tx.send(outcome);
+    });
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+    unsafe {
+        PHAssetResourceManager::defaultManager()
+            .writeDataForAssetResource_toFile_options_completionHandler(
+                resource,
+                &url,
+                Some(&options),
+                &done,
+            );
+    }
+
+    match rx.recv_timeout(EXPORT_TIMEOUT) {
+        Ok(None) => Ok(()),
+        Ok(Some((code, _))) if code == PHPhotosError::NetworkAccessRequired.0 => {
+            Err(LibraryExportError::CloudOnly)
+        }
+        Ok(Some((code, msg))) => Err(LibraryExportError::Other(anyhow!(
+            "export failed ({code}): {msg}"
+        ))),
+        // PhotoKit's write may still be in flight; the caller removes the
+        // directory, which makes it fail harmlessly rather than land.
+        Err(_) => Err(LibraryExportError::Other(anyhow!(
+            "export timed out after {}s",
+            EXPORT_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+/// A Live Photo still's original motion video, if it has one.
+fn paired_video_resource(asset: &PHAsset) -> Option<Retained<PHAssetResource>> {
+    if unsafe { asset.mediaType() } != PHAssetMediaType::Image {
+        return None;
+    }
+    let resources = unsafe { PHAssetResource::assetResourcesForAsset(asset) };
+    resources
+        .iter()
+        .find(|r| unsafe { r.r#type() } == PHAssetResourceType::PairedVideo)
 }
 
 #[cfg(test)]
