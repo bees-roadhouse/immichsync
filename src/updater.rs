@@ -191,6 +191,10 @@ struct GitHubAsset {
     name: String,
     browser_download_url: String,
     size: u64,
+    /// `sha256:<hex>`, computed by GitHub at upload. Missing on assets
+    /// uploaded before GitHub added it (mid-2025).
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 /// Information about an available update.
@@ -201,6 +205,10 @@ pub struct UpdateInfo {
     pub download_url: String,
     pub size: u64,
     pub changelog: String,
+    /// The asset's `sha256:<hex>` from the Releases API, checked after the
+    /// download (#129). `default` so an older info file still parses.
+    #[serde(default)]
+    pub digest: Option<String>,
 }
 
 /// Result of checking for an update.
@@ -224,6 +232,9 @@ pub enum UpdateError {
 
     #[error("no release asset is published for this platform")]
     UnsupportedPlatform,
+
+    #[error("the download doesn't match the release's checksum (expected {expected}, got {actual}); nothing was installed")]
+    DigestMismatch { expected: String, actual: String },
 
     #[cfg(target_os = "macos")]
     #[error(transparent)]
@@ -355,6 +366,7 @@ async fn check_inner(repo: &str, channel: &Channel) -> Result<UpdateCheckResult,
         download_url: asset.browser_download_url.clone(),
         size: asset.size,
         changelog: release.body.unwrap_or_default(),
+        digest: asset.digest.clone(),
     };
 
     info!(
@@ -388,14 +400,53 @@ fn download_dest() -> Result<PathBuf, UpdateError> {
     }
 }
 
-/// Download the update to a temp file (see `download_dest`).
+/// Compare the download's SHA-256 with the release asset's digest.
+///
+/// A missing digest (an asset uploaded before GitHub computed them) or one
+/// in another algorithm is logged and allowed: the download still came over
+/// HTTPS from GitHub, which is all an update relied on before #129. Our own
+/// releases from v0.3.0 on all carry `sha256:`.
+fn check_digest(expected: Option<&str>, actual_sha256_hex: &str) -> Result<(), UpdateError> {
+    let Some(expected) = expected else {
+        tracing::warn!("Release asset has no digest; skipping the checksum check");
+        return Ok(());
+    };
+    let Some(hex) = expected.strip_prefix("sha256:") else {
+        tracing::warn!(
+            digest = expected,
+            "Unrecognised digest algorithm; skipping the checksum check"
+        );
+        return Ok(());
+    };
+    if hex.eq_ignore_ascii_case(actual_sha256_hex) {
+        debug!("Update checksum matches the release");
+        Ok(())
+    } else {
+        Err(UpdateError::DigestMismatch {
+            expected: expected.to_string(),
+            actual: format!("sha256:{actual_sha256_hex}"),
+        })
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Download the update to a temp file (see `download_dest`), hashing it on
+/// the way and refusing it (file deleted) if it doesn't match `digest`.
 ///
 /// `progress_fn` is called with `(bytes_downloaded, total_bytes)`.
 /// Returns the path to the downloaded file.
-pub fn download_update_blocking<F>(url: &str, progress_fn: F) -> Result<PathBuf, UpdateError>
+pub fn download_update_blocking<F>(
+    url: &str,
+    digest: Option<&str>,
+    progress_fn: F,
+) -> Result<PathBuf, UpdateError>
 where
     F: Fn(u64, u64),
 {
+    use sha2::Digest;
     let dest = download_dest()?;
 
     let client = reqwest::blocking::Client::builder()
@@ -416,6 +467,7 @@ where
     let mut file = std::fs::File::create(&dest).map_err(UpdateError::File)?;
     let mut downloaded: u64 = 0;
     let mut buf = vec![0u8; 64 * 1024];
+    let mut sha = sha2::Sha256::new();
 
     use std::io::{Read, Write};
     loop {
@@ -424,12 +476,18 @@ where
             break;
         }
         file.write_all(&buf[..n]).map_err(UpdateError::File)?;
+        sha.update(&buf[..n]);
         downloaded += n as u64;
         progress_fn(downloaded, total);
     }
 
     file.flush().map_err(UpdateError::File)?;
     drop(file);
+
+    if let Err(e) = check_digest(digest, &hex(&sha.finalize())) {
+        let _ = std::fs::remove_file(&dest);
+        return Err(e);
+    }
 
     info!(path = %dest.display(), bytes = downloaded, "Update downloaded");
     Ok(dest)
@@ -530,7 +588,7 @@ pub fn cleanup_old_bundle() {
 /// or an error if anything failed.
 pub fn download_and_apply(info: &UpdateInfo) -> Result<(), UpdateError> {
     info!(version = %info.new_version, "Background: downloading update");
-    let path = download_update_blocking(&info.download_url, |_, _| {})?;
+    let path = download_update_blocking(&info.download_url, info.digest.as_deref(), |_, _| {})?;
     apply_update(&path, &info.new_version)?;
     info!(version = %info.new_version, "Background: update applied");
     Ok(())
@@ -642,6 +700,7 @@ mod tests {
             name: name.to_string(),
             browser_download_url: format!("https://example.invalid/{name}"),
             size: 1,
+            digest: None,
         }
     }
 
@@ -686,6 +745,42 @@ mod tests {
             Target::current().is_some(),
             crate::platform::SELF_UPDATE_SUPPORTED
         );
+    }
+
+    #[test]
+    fn digest_check_accepts_a_match_and_refuses_a_mismatch() {
+        // sha256("abc")
+        let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(check_digest(Some(&format!("sha256:{abc}")), abc).is_ok());
+        assert!(check_digest(Some(&format!("sha256:{}", abc.to_uppercase())), abc).is_ok());
+        let err = check_digest(Some(&format!("sha256:{abc}")), &"0".repeat(64)).unwrap_err();
+        assert!(matches!(err, UpdateError::DigestMismatch { .. }), "{err}");
+    }
+
+    #[test]
+    fn digest_check_allows_a_missing_or_unknown_digest() {
+        assert!(check_digest(None, "00").is_ok());
+        assert!(check_digest(Some("sha512:ffff"), "00").is_ok());
+    }
+
+    #[test]
+    fn hex_and_sha256_agree_with_a_known_vector() {
+        use sha2::Digest;
+        assert_eq!(
+            hex(&sha2::Sha256::digest(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn release_assets_carry_their_digest_through() {
+        let json = r#"{"name":"immichsync.exe","browser_download_url":"u","size":1,
+            "digest":"sha256:89204113393b596ec7d3dbc6c0b72d176b792f05ecca5cffc03a2025dbcc0ee2"}"#;
+        let a: GitHubAsset = serde_json::from_str(json).unwrap();
+        assert!(a.digest.unwrap().starts_with("sha256:8920"));
+        let old: GitHubAsset =
+            serde_json::from_str(r#"{"name":"x","browser_download_url":"u","size":1}"#).unwrap();
+        assert_eq!(old.digest, None);
     }
 
     #[test]
