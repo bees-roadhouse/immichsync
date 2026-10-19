@@ -1264,8 +1264,12 @@ impl PhotosTabState {
             );
             ui.checkbox(
                 &mut d.ack_no_shared_library,
-                "I don't use an iCloud Shared Library (ImmichSync can't tell who added a shared photo, \
-                 and deleting one deletes it for everyone)",
+                "I don't use an iCloud Shared Library",
+            );
+            ui.small(
+                "ImmichSync can't tell who added a photo to a Shared Library, and deleting a shared \
+                 photo deletes it for everyone in it. If you use a Shared Library, leave delete from \
+                 Photos off. Nothing is deleted until this box is ticked.",
             );
             ui.horizontal(|ui| {
                 ui.label("Only photos older than");

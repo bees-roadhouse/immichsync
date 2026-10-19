@@ -97,7 +97,7 @@ PhotoKit ──(enumerate / change token)──► PhotosSource ──(export or
 ### Safeguards, all in code
 1. **Off by default.** It runs only with `[photos.delete] enabled = true` **and** two acknowledgements:
    - `ack_icloud`: with iCloud Photos on, a delete removes the photo from every device.
-   - `ack_no_shared_library`: PhotoKit has no public API to tell who contributed an iCloud Shared Library item, and deleting one deletes it for every participant. So the user states that they don't use one. This is how safeguard 4's "never delete items contributed by others" holds. If Apple exposes contributor information, replace the acknowledgement with a check.
+   - `ack_no_shared_library`: PhotoKit has no public API to tell who contributed an iCloud Shared Library item, and deleting one deletes it for every participant. So the user states that they don't use one. This is how safeguard 4's "never delete items contributed by others" holds. **Nate's decision, 2026-10-19 (via Pia): "Require acknowledgement".** Deletion stays impossible until this is ticked, and the setting tells anyone who does use a Shared Library to leave delete off. The other option, blocking the feature until Apple exposes contributor information, was not chosen. If Apple does expose it, replace the acknowledgement with a check.
 2. **Verified at delete time, not just at upload.** Every resource of the asset is asked of the server again: the still, plus the paired video for a Live Photo. The resource must exist, must not be in Immich's trash, and its checksum must equal the SHA-1 we recorded. A missing or mismatched copy means the photo is kept.
 3. **Age:** only photos older than `min_age_days`, default 30, by creation date.
 4. **Exclusions:**
