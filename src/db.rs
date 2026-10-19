@@ -261,6 +261,12 @@ pub struct QueueStats {
 
 // ─── Database ────────────────────────────────────────────────────────────────
 
+/// `WHERE` clause for Photos entries deferred as iCloud-only (#82). The
+/// worker writes `deferred: …` as the error for exactly these.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const DEFERRED_PHOTOS: &str =
+    "source = 'photos' AND status = 'failed' AND error_message LIKE 'deferred:%'";
+
 /// v5's table, shared with v6's guard (see `migrate_v6`).
 const MIRRORED_ALBUMS_DDL: &str = "CREATE TABLE IF NOT EXISTS mirrored_albums (
     photos_collection_id TEXT PRIMARY KEY,
@@ -1067,6 +1073,29 @@ impl Database {
         Ok(seen)
     }
 
+    /// Photos entries deferred because their original is only in iCloud.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn deferred_photos_count(&self) -> Result<i64, DbError> {
+        Ok(self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM upload_queue WHERE {DEFERRED_PHOTOS}"),
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Return deferred Photos entries to `pending`, so they're tried again
+    /// (they may be local now, or the policy may now be `download`).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn requeue_deferred_photos(&self) -> Result<usize, DbError> {
+        Ok(self.conn.execute(
+            &format!(
+                "UPDATE upload_queue SET status = 'pending', error_message = NULL, completed_at = NULL
+                 WHERE {DEFERRED_PHOTOS}"
+            ),
+            [],
+        )?)
+    }
+
     /// Record what one resource of a Photos asset became on the server.
     pub fn record_photos_asset(
         &self,
@@ -1359,6 +1388,11 @@ impl crate::upload::queue::QueueStore for DbStore {
                 photos_local_id: e.photos_local_id,
             })
             .collect())
+    }
+
+    fn requeue_deferred_photos(&self) -> anyhow::Result<usize> {
+        let db = self.db.lock().unwrap();
+        Ok(db.requeue_deferred_photos()?)
     }
 
     fn photos_change_token(&self) -> anyhow::Result<Option<Vec<u8>>> {
@@ -1863,6 +1897,36 @@ mod tests {
     }
 
     // ── upload_queue ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn deferred_photos_are_counted_and_requeued_and_nothing_else_is() {
+        let db = open_test_db();
+        let deferred = db.enqueue_photos("CLOUD").unwrap();
+        db.update_queue_status(
+            deferred,
+            &QueueStatus::Failed,
+            Some("deferred: the original is only in iCloud"),
+        )
+        .unwrap();
+        let broken = db.enqueue_photos("BROKEN").unwrap();
+        db.update_queue_status(broken, &QueueStatus::Failed, Some("export failed: x"))
+            .unwrap();
+        let folder = db.enqueue("/p/a.jpg", None, None, None).unwrap();
+        db.update_queue_status(
+            folder,
+            &QueueStatus::Failed,
+            Some("deferred: not a photos row"),
+        )
+        .unwrap();
+
+        assert_eq!(db.deferred_photos_count().unwrap(), 1);
+        assert_eq!(db.requeue_deferred_photos().unwrap(), 1);
+        assert_eq!(db.deferred_photos_count().unwrap(), 0);
+        let pending = db.dequeue_pending(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].photos_local_id.as_deref(), Some("CLOUD"));
+        assert_eq!(pending[0].error_message, None);
+    }
 
     #[test]
     fn mirrored_albums_are_recorded_renamed_and_forgotten_by_collection_id() {

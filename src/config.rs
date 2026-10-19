@@ -295,6 +295,45 @@ pub struct PhotosConfig {
     /// Also put every library upload into this one Immich album, an existing
     /// one or a new name. Empty = off.
     pub all_in_album: String,
+
+    /// What to do with originals stored only in iCloud (Optimize Mac
+    /// Storage): download them, one at a time (the default, Nate
+    /// 2026-10-18), or skip them as *deferred* until they're local (#82).
+    pub icloud_originals: ICloudOriginals,
+}
+
+/// `[photos] icloud_originals`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum ICloudOriginals {
+    #[default]
+    Download,
+    Skip,
+}
+
+impl From<String> for ICloudOriginals {
+    /// Unknown values mean the default (`download`), so a typo can't stop
+    /// the config from loading.
+    fn from(s: String) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "skip" => ICloudOriginals::Skip,
+            "download" => ICloudOriginals::Download,
+            other => {
+                tracing::warn!(value = %other, "Unknown photos.icloud_originals; using \"download\"");
+                ICloudOriginals::Download
+            }
+        }
+    }
+}
+
+impl From<ICloudOriginals> for String {
+    fn from(v: ICloudOriginals) -> Self {
+        match v {
+            ICloudOriginals::Download => "download",
+            ICloudOriginals::Skip => "skip",
+        }
+        .to_string()
+    }
 }
 
 impl Default for PhotosConfig {
@@ -303,6 +342,7 @@ impl Default for PhotosConfig {
             enabled: false,
             sync_albums: true,
             all_in_album: String::new(),
+            icloud_originals: ICloudOriginals::Download,
         }
     }
 }
@@ -314,6 +354,7 @@ struct PhotosConfigFile {
     enabled: bool,
     sync_albums: bool,
     all_in_album: String,
+    icloud_originals: ICloudOriginals,
     /// The tracer's single fixed album (#111). Read to migrate, never written.
     album_name: Option<String>,
 }
@@ -325,6 +366,7 @@ impl Default for PhotosConfigFile {
             enabled: d.enabled,
             sync_albums: d.sync_albums,
             all_in_album: d.all_in_album,
+            icloud_originals: d.icloud_originals,
             album_name: None,
         }
     }
@@ -345,6 +387,7 @@ impl From<PhotosConfigFile> for PhotosConfig {
             enabled: f.enabled,
             sync_albums: f.sync_albums,
             all_in_album,
+            icloud_originals: f.icloud_originals,
         }
     }
 }
@@ -794,6 +837,20 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.photos.all_in_album, "Mine");
         assert!(!cfg.photos.sync_albums);
+    }
+
+    #[test]
+    fn icloud_originals_defaults_to_download_parses_skip_and_survives_typos() {
+        assert_eq!(
+            Config::default().photos.icloud_originals,
+            ICloudOriginals::Download
+        );
+        let skip: Config = toml::from_str("[photos]\nicloud_originals = \"skip\"\n").unwrap();
+        assert_eq!(skip.photos.icloud_originals, ICloudOriginals::Skip);
+        let typo: Config = toml::from_str("[photos]\nicloud_originals = \"skp\"\n").unwrap();
+        assert_eq!(typo.photos.icloud_originals, ICloudOriginals::Download);
+        let written = toml::to_string_pretty(&skip).unwrap();
+        assert!(written.contains("icloud_originals = \"skip\""), "{written}");
     }
 
     #[test]

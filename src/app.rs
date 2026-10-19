@@ -392,10 +392,17 @@ impl App {
                     mirror: photos.sync_albums,
                     all_in: Some(photos.all_in_album.trim().to_string()).filter(|a| !a.is_empty()),
                 };
-                pipeline = pipeline.with_library(crate::upload::worker::LibrarySource::new(
-                    Arc::new(crate::platform::photos::PhotoKitExporter),
-                    albums,
-                ));
+                pipeline = pipeline.with_library(
+                    crate::upload::worker::LibrarySource::new(
+                        Arc::new(crate::platform::photos::PhotoKitExporter),
+                        albums,
+                    )
+                    .with_icloud(photos.icloud_originals)
+                    .with_disk_guard(crate::upload::worker::DiskGuard {
+                        free_bytes: Arc::new(crate::platform::photos::temp_free_bytes),
+                        ..Default::default()
+                    }),
+                );
             }
 
             // Pipeline spawns tokio tasks — enter the runtime context.
@@ -834,6 +841,13 @@ impl App {
                     // Held for the thread's life; without it the source does
                     // its start pass and stops.
                     let _watch = photos::watch_changes(tx);
+                    // iCloud-deferred entries get another try each start:
+                    // they may be local now, or the policy may be download.
+                    match store.requeue_deferred_photos() {
+                        Ok(0) => {}
+                        Ok(n) => info!(n, "Requeued iCloud-deferred Photos entries"),
+                        Err(e) => warn!(error = %e, "Failed to requeue deferred Photos entries"),
+                    }
                     crate::watch::photos::run_source(
                         &photos::PhotoKitLibrary,
                         store.as_ref(),

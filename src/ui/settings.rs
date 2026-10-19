@@ -718,6 +718,11 @@ impl SettingsApp {
         #[cfg(target_os = "macos")]
         {
             self.config.photos.enabled = self.photos.enabled;
+            self.config.photos.icloud_originals = if self.photos.download_icloud {
+                crate::config::ICloudOriginals::Download
+            } else {
+                crate::config::ICloudOriginals::Skip
+            };
             let (sync_albums, all_in) = self.photos.albums.to_config();
             self.config.photos.sync_albums = sync_albums;
             self.config.photos.all_in_album = all_in;
@@ -1187,6 +1192,10 @@ impl AlbumChoice {
 #[cfg(target_os = "macos")]
 struct PhotosTabState {
     enabled: bool,
+    /// Download iCloud-only originals (`icloud_originals = "download"`).
+    download_icloud: bool,
+    /// Entries deferred as iCloud-only, read when the window opens.
+    deferred: i64,
     albums: AlbumChoice,
     /// Album names on the server, for the catch-all dropdown.
     server_albums: Vec<String>,
@@ -1205,6 +1214,10 @@ impl PhotosTabState {
         Self {
             // A config that says "on" without access shows as off until fixed.
             enabled: cfg.enabled && access.can_read(),
+            download_icloud: cfg.icloud_originals == crate::config::ICloudOriginals::Download,
+            deferred: open_db()
+                .and_then(|db| db.deferred_photos_count())
+                .unwrap_or(0),
             albums: AlbumChoice::from_config(cfg),
             server_albums: Vec::new(),
             albums_rx: None,
@@ -1371,11 +1384,33 @@ impl PhotosTabState {
 
         ui.add_space(8.0);
         ui.separator();
+        ui.checkbox(
+            &mut self.download_icloud,
+            "Download originals that are only in iCloud",
+        );
+        ui.small(
+            "With Optimize Mac Storage most originals live in iCloud. They are downloaded one at a \
+             time and deleted once uploaded; the first sync downloads about the size of your library. \
+             Exports pause while less than 2 GB is free.",
+        );
+        if self.deferred > 0 {
+            ui.label(format!(
+                "{} originals are only in iCloud and waiting{}.",
+                self.deferred,
+                if self.download_icloud {
+                    " (they'll be downloaded after a restart)"
+                } else {
+                    ""
+                }
+            ));
+        }
+
+        ui.separator();
         self.show_albums(ui, server_url, api_key);
         ui.add_space(4.0);
         ui.small(
             "Syncs the whole library first, then new photos as you add them. \
-             Items stored only in iCloud are skipped for now. Album choices apply after a restart.",
+             These choices apply after a restart.",
         );
     }
 }
