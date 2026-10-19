@@ -7,6 +7,7 @@ pub mod first_run;
 pub mod install;
 pub mod notifications;
 pub mod settings;
+pub mod sign_in;
 pub mod trash_log;
 pub mod tray;
 pub mod update;
