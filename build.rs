@@ -95,6 +95,13 @@ fn main() {
         write_rgba(&icons_dir.join(name), &small);
     }
 
+    // ---- macOS app-bundle iconset ----
+    // packaging/macos/make-app.sh runs `iconutil -c icns` on this directory
+    // to produce Contents/Resources/AppIcon.icns.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        build_iconset(&src_rgba, &icons_dir.join("AppIcon.iconset"));
+    }
+
     // ---- Embed the .ico as the EXE resource icon ----
     // winresource only takes effect on Windows targets. On a Linux dev
     // sandbox doing `cargo check` it's a no-op, which is what we want.
@@ -232,6 +239,24 @@ fn build_ico(src: &RgbaImage, out_dir: &std::path::Path) {
     let ico_path = out_dir.join("icon.ico");
     let file = std::fs::File::create(&ico_path).expect("create icon.ico");
     dir.write(file).expect("write icon.ico");
+}
+
+/// Write the PNG set `iconutil` expects: 16..512 pt at 1x and 2x.
+fn build_iconset(src: &RgbaImage, dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).expect("create AppIcon.iconset");
+    for pt in [16u32, 32, 128, 256, 512] {
+        for scale in [1u32, 2] {
+            let px = pt * scale;
+            let name = if scale == 1 {
+                format!("icon_{pt}x{pt}.png")
+            } else {
+                format!("icon_{pt}x{pt}@2x.png")
+            };
+            resize_high_quality(src, px)
+                .save(dir.join(name))
+                .expect("write iconset png");
+        }
+    }
 }
 
 /// Build the offline overlay variant.
