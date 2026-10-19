@@ -1,5 +1,6 @@
-// Desktop notifications: Windows toasts via winrt-notification. On macOS
-// they are logged until UserNotifications lands with the app bundle (#62).
+// Desktop notifications: Windows toasts via winrt-notification; macOS
+// Notification Center via platform::notify (bundled builds only; a bare dev
+// binary logs instead).
 
 use tracing::debug;
 #[cfg(windows)]
@@ -16,6 +17,12 @@ pub struct Notifications {
 impl Notifications {
     /// Create a new notification manager from the current config.
     pub fn new(config: &Config) -> Self {
+        // Ask up front so the first real notification isn't lost to the
+        // permission prompt. Once per process; no-op without a bundle.
+        #[cfg(target_os = "macos")]
+        if config.ui.show_notifications {
+            crate::platform::notify::request_permission();
+        }
         Self {
             enabled: config.ui.show_notifications,
             notify_on_complete: config.ui.notification_on_complete,
@@ -67,11 +74,7 @@ impl Notifications {
             warn!(error = %e, "Failed to show toast notification");
         }
 
-        #[cfg(not(windows))]
-        tracing::info!(
-            title,
-            body,
-            "Notification (not shown: macOS notifications are #62)"
-        );
+        #[cfg(target_os = "macos")]
+        crate::platform::notify::show(title, body);
     }
 }
