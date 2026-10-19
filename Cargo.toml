@@ -121,7 +121,7 @@ objc2-user-notifications = { version = "0.3", default-features = false, features
 block2 = "0.6"
 # Photos library source (docs/adr/0002-photokit-library-source.md): read-only
 # use of PhotoKit. No PHAssetChangeRequest anywhere; review greps for it.
-objc2-photos = { version = "0.3", default-features = false, features = ["std", "block2", "PHAsset", "PHAssetResource", "PHAssetResourceManager", "PHError", "PHFetchOptions", "PHFetchResult", "PHObject", "PHPhotoLibrary", "PhotosTypes"] }
+objc2-photos = { version = "0.3", default-features = false, features = ["std", "block2", "PHAsset", "PHAssetResource", "PHAssetResourceManager", "PHCollection", "PHError", "PHFetchOptions", "PHFetchResult", "PHObject", "PHPhotoLibrary", "PhotosTypes"] }
 # flock (single instance), signal (graceful SIGTERM/SIGINT)
 libc = "0.2"
 # Volume mount/unmount events (platform::volumes): DiskArbitration callbacks

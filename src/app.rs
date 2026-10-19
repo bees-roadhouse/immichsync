@@ -202,12 +202,15 @@ impl App {
             {
                 // Before any worker can export: clear what a crash left.
                 crate::platform::photos::sweep_stale_exports();
-                let album = Some(self.config.photos.album_name.trim().to_string())
-                    .filter(|a| !a.is_empty());
-                pipeline = pipeline.with_library(crate::upload::worker::LibrarySource {
-                    exporter: Arc::new(crate::platform::photos::PhotoKitExporter),
-                    album,
-                });
+                let photos = &self.config.photos;
+                let albums = crate::upload::worker::AlbumPolicy {
+                    mirror: photos.sync_albums,
+                    all_in: Some(photos.all_in_album.trim().to_string()).filter(|a| !a.is_empty()),
+                };
+                pipeline = pipeline.with_library(crate::upload::worker::LibrarySource::new(
+                    Arc::new(crate::platform::photos::PhotoKitExporter),
+                    albums,
+                ));
             }
 
             // Pipeline spawns tokio tasks — enter the runtime context.

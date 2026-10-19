@@ -289,6 +289,39 @@ impl crate::upload::worker::AssetUploader for ImmichClient {
         Ok(())
     }
 
+    async fn create_mirror_album(&self, name: &str) -> anyhow::Result<String> {
+        Ok(self.create_album(name).await?.id)
+    }
+
+    async fn add_to_album_by_id(
+        &self,
+        album_id: &str,
+        asset_id: &str,
+    ) -> Result<(), crate::upload::worker::AlbumCallError> {
+        use crate::upload::worker::AlbumCallError;
+        match self
+            .add_assets_to_album(album_id, vec![asset_id.to_string()])
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if super::albums::album_is_gone(&e) => Err(AlbumCallError::Gone),
+            Err(e) => Err(AlbumCallError::Other(e.into())),
+        }
+    }
+
+    async fn rename_mirror_album(
+        &self,
+        album_id: &str,
+        name: &str,
+    ) -> Result<(), crate::upload::worker::AlbumCallError> {
+        use crate::upload::worker::AlbumCallError;
+        match self.rename_album(album_id, name).await {
+            Ok(()) => Ok(()),
+            Err(e) if super::albums::album_is_gone(&e) => Err(AlbumCallError::Gone),
+            Err(e) => Err(AlbumCallError::Other(e.into())),
+        }
+    }
+
     async fn check_duplicates(
         &self,
         items: Vec<crate::upload::worker::BulkCheckItem>,

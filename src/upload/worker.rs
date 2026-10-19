@@ -96,6 +96,30 @@ pub trait AssetUploader: Send + Sync {
     async fn add_asset_to_album(&self, _album_name: &str, _asset_id: &str) -> anyhow::Result<()> {
         Ok(()) // Default no-op for mock implementations
     }
+
+    /// Create a new album, never reusing one by name; returns its id. The
+    /// Photos mirror uses this so it can't adopt an album a person made.
+    async fn create_mirror_album(&self, _name: &str) -> anyhow::Result<String> {
+        anyhow::bail!("album creation is not supported by this uploader")
+    }
+
+    /// Add one asset to an album by id.
+    async fn add_to_album_by_id(
+        &self,
+        _album_id: &str,
+        _asset_id: &str,
+    ) -> Result<(), AlbumCallError> {
+        Ok(())
+    }
+
+    /// Rename an album by id.
+    async fn rename_mirror_album(
+        &self,
+        _album_id: &str,
+        _name: &str,
+    ) -> Result<(), AlbumCallError> {
+        Ok(())
+    }
 }
 
 // ─── Worker configuration ────────────────────────────────────────────────────
@@ -133,6 +157,19 @@ pub struct LibraryExport {
     pub resource: &'static str,
     pub created_at: DateTime<Utc>,
     pub modified_at: DateTime<Utc>,
+    /// The Photos user albums this asset is in (smart and shared albums are
+    /// never listed). Mirrored to Immich when album sync is on (#115).
+    pub albums: Vec<LibraryAlbum>,
+}
+
+/// One Photos user album an exported asset belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryAlbum {
+    /// `PHAssetCollection.localIdentifier`: stable across renames, so the
+    /// Immich album follows a rename instead of being duplicated.
+    pub local_id: String,
+    /// The Immich name, folders flattened (`watch::photos::album_title`).
+    pub title: String,
 }
 
 /// Why an export produced no file. Built by the macOS exporter only.
@@ -159,16 +196,49 @@ pub trait LibraryExporter: Send + Sync {
 /// What the worker needs to upload `source = photos` entries.
 pub struct LibrarySource {
     pub exporter: Arc<dyn LibraryExporter>,
-    /// Fixed album for library uploads (album mapping is a later slice).
-    pub album: Option<String>,
+    /// Which Immich albums a library upload goes into (#115).
+    pub albums: AlbumPolicy,
+    /// Serialises album placement, so two workers placing photos from the
+    /// same new Photos album create one Immich album, not two.
+    pub album_lock: tokio::sync::Mutex<()>,
+}
+
+impl LibrarySource {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn new(exporter: Arc<dyn LibraryExporter>, albums: AlbumPolicy) -> Self {
+        Self {
+            exporter,
+            albums,
+            album_lock: tokio::sync::Mutex::new(()),
+        }
+    }
 }
 
 impl std::fmt::Debug for LibrarySource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LibrarySource")
-            .field("album", &self.album)
+            .field("albums", &self.albums)
             .finish_non_exhaustive()
     }
+}
+
+/// Album placement for library uploads, from `[photos]` (#115).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AlbumPolicy {
+    /// Mirror the asset's Photos user albums as Immich albums.
+    pub mirror: bool,
+    /// Also add every upload to this album (found or created by name).
+    pub all_in: Option<String>,
+}
+
+/// Why an album call by id failed.
+#[derive(Debug, thiserror::Error)]
+pub enum AlbumCallError {
+    /// The album no longer exists on the server, or this key can't see it.
+    #[error("the album is gone")]
+    Gone,
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
 
 /// `deviceAssetId` for a library resource: stable across exports, so a
@@ -770,7 +840,25 @@ async fn process_library_item(
     // watched folder (or an earlier export) is not uploaded again.
     if store.is_file_uploaded(&hash).unwrap_or(false) {
         info!(id = entry.id, %local_id, "Photos original already uploaded (same SHA-1); skipping");
-        let _ = store.record_photos_asset(&local_id, export.resource, &hash, "", None);
+        // Still put the existing asset into this photo's albums.
+        let existing = store.uploaded_asset_id(&hash).ok().flatten();
+        if let Some(asset_id) = existing.as_deref() {
+            place_in_albums(
+                asset_id,
+                &export.albums,
+                &library,
+                store.as_ref(),
+                uploader.as_ref(),
+            )
+            .await;
+        }
+        let _ = store.record_photos_asset(
+            &local_id,
+            export.resource,
+            &hash,
+            existing.as_deref().unwrap_or(""),
+            None,
+        );
         let _ = store.mark_completed(entry.id, None);
         return;
     }
@@ -807,11 +895,14 @@ async fn process_library_item(
             ) {
                 warn!(id = entry.id, error = %e, "Failed to record Photos asset");
             }
-            if let Some(album) = library.album.as_deref() {
-                if let Err(e) = uploader.add_asset_to_album(album, &up.asset_id).await {
-                    warn!(id = entry.id, %album, error = %e, "Failed to add asset to album");
-                }
-            }
+            place_in_albums(
+                &up.asset_id,
+                &export.albums,
+                &library,
+                store.as_ref(),
+                uploader.as_ref(),
+            )
+            .await;
             if let Err(e) = store.mark_completed(entry.id, Some(&up.asset_id)) {
                 error!(id = entry.id, error = %e, "Failed to mark entry completed");
             }
@@ -821,6 +912,91 @@ async fn process_library_item(
             fail_or_retry(&entry, store.as_ref(), config, &e.to_string()).await
         }
     }
+}
+
+/// Put an uploaded library asset into its Immich albums per `library.albums`:
+/// each Photos user album's mirror (created on first need, renamed when the
+/// Photos album was, recreated if deleted on the server), then the optional
+/// catch-all. Failures are logged; the upload itself already succeeded.
+pub(crate) async fn place_in_albums(
+    asset_id: &str,
+    albums: &[LibraryAlbum],
+    library: &LibrarySource,
+    store: &dyn QueueStore,
+    uploader: &dyn AssetUploader,
+) {
+    let policy = &library.albums;
+    if policy.mirror && !albums.is_empty() {
+        let _serial = library.album_lock.lock().await;
+        for album in albums {
+            if let Err(e) = place_in_mirror(asset_id, album, store, uploader).await {
+                warn!(album = %album.title, error = %e, "Failed to add asset to mirrored album");
+            }
+        }
+    }
+    if let Some(name) = policy.all_in.as_deref() {
+        if let Err(e) = uploader.add_asset_to_album(name, asset_id).await {
+            warn!(album = %name, error = %e, "Failed to add asset to the catch-all album");
+        }
+    }
+}
+
+/// Add `asset_id` to the Immich album mirroring `album`, creating it on first
+/// need and recreating it once if it was deleted on the server.
+async fn place_in_mirror(
+    asset_id: &str,
+    album: &LibraryAlbum,
+    store: &dyn QueueStore,
+    uploader: &dyn AssetUploader,
+) -> anyhow::Result<()> {
+    let mut target = match store.mirrored_album(&album.local_id)? {
+        Some(m) if m.name != album.title => {
+            match uploader
+                .rename_mirror_album(&m.immich_album_id, &album.title)
+                .await
+            {
+                Ok(()) => {
+                    info!(from = %m.name, to = %album.title, "Mirrored album renamed");
+                    store.record_mirrored_album(
+                        &album.local_id,
+                        &m.immich_album_id,
+                        &album.title,
+                    )?;
+                    Some(m.immich_album_id)
+                }
+                Err(AlbumCallError::Gone) => None,
+                Err(AlbumCallError::Other(e)) => {
+                    // Keep using it under the old name; retried next time.
+                    warn!(album = %m.name, error = %e, "Failed to rename mirrored album");
+                    Some(m.immich_album_id)
+                }
+            }
+        }
+        Some(m) => Some(m.immich_album_id),
+        None => None,
+    };
+
+    for attempt in 0..2 {
+        let album_id = match target.take() {
+            Some(id) => id,
+            None => {
+                let id = uploader.create_mirror_album(&album.title).await?;
+                info!(album = %album.title, album_id = %id, "Created Immich album for a Photos album");
+                store.record_mirrored_album(&album.local_id, &id, &album.title)?;
+                id
+            }
+        };
+        match uploader.add_to_album_by_id(&album_id, asset_id).await {
+            Ok(()) => return Ok(()),
+            Err(AlbumCallError::Gone) if attempt == 0 => {
+                info!(album = %album.title, "Mirrored album was deleted on the server; recreating");
+                store.forget_mirrored_album(&album.local_id)?;
+            }
+            Err(AlbumCallError::Gone) => anyhow::bail!("the recreated album is gone too"),
+            Err(AlbumCallError::Other(e)) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -1208,9 +1384,42 @@ mod tests {
         uploaded: Mutex<HashMap<String, String>>,
         next_id: Mutex<i64>,
         photos_assets: Mutex<Vec<(String, String, String)>>,
+        mirrored: Mutex<HashMap<String, crate::db::MirroredAlbum>>,
     }
 
     impl QueueStore for MockStore {
+        fn uploaded_asset_id(&self, hash: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.uploaded.lock().unwrap().get(hash).cloned())
+        }
+
+        fn mirrored_album(
+            &self,
+            collection_id: &str,
+        ) -> anyhow::Result<Option<crate::db::MirroredAlbum>> {
+            Ok(self.mirrored.lock().unwrap().get(collection_id).cloned())
+        }
+
+        fn record_mirrored_album(
+            &self,
+            collection_id: &str,
+            immich_album_id: &str,
+            name: &str,
+        ) -> anyhow::Result<()> {
+            self.mirrored.lock().unwrap().insert(
+                collection_id.to_string(),
+                crate::db::MirroredAlbum {
+                    immich_album_id: immich_album_id.to_string(),
+                    name: name.to_string(),
+                },
+            );
+            Ok(())
+        }
+
+        fn forget_mirrored_album(&self, collection_id: &str) -> anyhow::Result<()> {
+            self.mirrored.lock().unwrap().remove(collection_id);
+            Ok(())
+        }
+
         fn enqueue_photos(&self, local_id: &str) -> anyhow::Result<i64> {
             let mut id_guard = self.next_id.lock().unwrap();
             *id_guard += 1;
@@ -1460,6 +1669,7 @@ mod tests {
         dir: std::path::PathBuf,
         outcome: fn() -> Option<LibraryExportError>,
         exported: Mutex<Vec<std::path::PathBuf>>,
+        albums: fn() -> Vec<LibraryAlbum>,
     }
 
     impl LibraryExporter for FakeExporter {
@@ -1477,6 +1687,7 @@ mod tests {
                 resource: "photo",
                 created_at: Utc::now(),
                 modified_at: Utc::now(),
+                albums: (self.albums)(),
             })
         }
     }
@@ -1487,10 +1698,13 @@ mod tests {
             max_retries: 3,
             base_retry_delay: Duration::from_millis(1),
             device_id: "immichsync-test".to_string(),
-            library: Some(Arc::new(LibrarySource {
+            library: Some(Arc::new(LibrarySource::new(
                 exporter,
-                album: Some("immichsync test".to_string()),
-            })),
+                AlbumPolicy {
+                    mirror: false,
+                    all_in: Some("immichsync test".to_string()),
+                },
+            ))),
         }
     }
 
@@ -1507,7 +1721,303 @@ mod tests {
         entries.iter().find(|e| e.id == id).unwrap().clone()
     }
 
+    /// A fake Immich album API: records creates, adds and renames; albums
+    /// in `gone` answer as deleted; `create_delay` widens the race window.
+    #[derive(Default)]
+    struct AlbumServer {
+        created: Mutex<Vec<String>>,
+        added: Mutex<Vec<(String, String)>>,
+        renamed: Mutex<Vec<(String, String)>>,
+        by_name: Mutex<Vec<(String, String)>>,
+        gone: Mutex<std::collections::HashSet<String>>,
+        create_delay: Duration,
+    }
+
+    #[async_trait]
+    impl AssetUploader for AlbumServer {
+        async fn upload_asset(
+            &self,
+            _file_path: &Path,
+            _device_asset_id: &str,
+            _device_id: &str,
+            _created_at: DateTime<Utc>,
+            _modified_at: DateTime<Utc>,
+        ) -> anyhow::Result<UploadResult> {
+            Ok(UploadResult {
+                asset_id: "imm-1".to_string(),
+                is_duplicate: false,
+            })
+        }
+
+        async fn check_duplicates(
+            &self,
+            _items: Vec<BulkCheckItem>,
+        ) -> anyhow::Result<Vec<BulkCheckResult>> {
+            Ok(Vec::new())
+        }
+
+        async fn add_asset_to_album(&self, album: &str, asset_id: &str) -> anyhow::Result<()> {
+            self.by_name
+                .lock()
+                .unwrap()
+                .push((album.to_string(), asset_id.to_string()));
+            Ok(())
+        }
+
+        async fn create_mirror_album(&self, name: &str) -> anyhow::Result<String> {
+            tokio::time::sleep(self.create_delay).await;
+            let mut created = self.created.lock().unwrap();
+            created.push(name.to_string());
+            Ok(format!("alb-{}", created.len()))
+        }
+
+        async fn add_to_album_by_id(
+            &self,
+            album_id: &str,
+            asset_id: &str,
+        ) -> Result<(), AlbumCallError> {
+            if self.gone.lock().unwrap().contains(album_id) {
+                return Err(AlbumCallError::Gone);
+            }
+            self.added
+                .lock()
+                .unwrap()
+                .push((album_id.to_string(), asset_id.to_string()));
+            Ok(())
+        }
+
+        async fn rename_mirror_album(
+            &self,
+            album_id: &str,
+            name: &str,
+        ) -> Result<(), AlbumCallError> {
+            if self.gone.lock().unwrap().contains(album_id) {
+                return Err(AlbumCallError::Gone);
+            }
+            self.renamed
+                .lock()
+                .unwrap()
+                .push((album_id.to_string(), name.to_string()));
+            Ok(())
+        }
+    }
+
+    struct NoExport;
+    impl LibraryExporter for NoExport {
+        fn export_original(&self, _: &str) -> Result<LibraryExport, LibraryExportError> {
+            Err(LibraryExportError::Gone)
+        }
+    }
+
+    fn source(mirror: bool, all_in: Option<&str>) -> LibrarySource {
+        LibrarySource::new(
+            Arc::new(NoExport),
+            AlbumPolicy {
+                mirror,
+                all_in: all_in.map(str::to_string),
+            },
+        )
+    }
+
+    fn album(id: &str, title: &str) -> LibraryAlbum {
+        LibraryAlbum {
+            local_id: id.to_string(),
+            title: title.to_string(),
+        }
+    }
+
     // ── Tests ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_photo_in_two_albums_lands_in_both_mirrors_created_once() {
+        let store = MockStore::default();
+        let server = AlbumServer::default();
+        let lib = source(true, None);
+        let two = [album("C1", "Hawaii"), album("C2", "Trips / Beach")];
+
+        place_in_albums("imm-1", &two, &lib, &store, &server).await;
+        // A second photo in one of the same albums reuses its mirror.
+        place_in_albums("imm-2", &two[..1], &lib, &store, &server).await;
+
+        assert_eq!(
+            *server.created.lock().unwrap(),
+            vec!["Hawaii", "Trips / Beach"]
+        );
+        assert_eq!(
+            *server.added.lock().unwrap(),
+            vec![
+                ("alb-1".into(), "imm-1".into()),
+                ("alb-2".into(), "imm-1".into()),
+                ("alb-1".into(), "imm-2".into()),
+            ]
+        );
+        assert!(
+            server.by_name.lock().unwrap().is_empty(),
+            "no catch-all configured"
+        );
+        assert_eq!(
+            store.mirrored.lock().unwrap()["C2"].immich_album_id,
+            "alb-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_renamed_photos_album_renames_its_mirror_instead_of_making_another() {
+        let store = MockStore::default();
+        store
+            .record_mirrored_album("C1", "alb-9", "Hawaii")
+            .unwrap();
+        let server = AlbumServer::default();
+
+        place_in_albums(
+            "imm-1",
+            &[album("C1", "Hawaii 2026")],
+            &source(true, None),
+            &store,
+            &server,
+        )
+        .await;
+
+        assert!(server.created.lock().unwrap().is_empty());
+        assert_eq!(
+            *server.renamed.lock().unwrap(),
+            vec![("alb-9".into(), "Hawaii 2026".into())]
+        );
+        assert_eq!(
+            *server.added.lock().unwrap(),
+            vec![("alb-9".into(), "imm-1".into())]
+        );
+        assert_eq!(store.mirrored.lock().unwrap()["C1"].name, "Hawaii 2026");
+    }
+
+    #[tokio::test]
+    async fn a_mirror_deleted_on_the_server_is_recreated() {
+        let store = MockStore::default();
+        store
+            .record_mirrored_album("C1", "alb-old", "Hawaii")
+            .unwrap();
+        let server = AlbumServer::default();
+        server.gone.lock().unwrap().insert("alb-old".into());
+
+        place_in_albums(
+            "imm-1",
+            &[album("C1", "Hawaii")],
+            &source(true, None),
+            &store,
+            &server,
+        )
+        .await;
+
+        assert_eq!(*server.created.lock().unwrap(), vec!["Hawaii"]);
+        assert_eq!(
+            *server.added.lock().unwrap(),
+            vec![("alb-1".into(), "imm-1".into())]
+        );
+        assert_eq!(
+            store.mirrored.lock().unwrap()["C1"].immich_album_id,
+            "alb-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_catch_all_combines_with_mirroring_and_none_means_no_album_calls() {
+        let store = MockStore::default();
+        let server = AlbumServer::default();
+        place_in_albums(
+            "imm-1",
+            &[album("C1", "Hawaii")],
+            &source(true, Some("Everything")),
+            &store,
+            &server,
+        )
+        .await;
+        assert_eq!(server.added.lock().unwrap().len(), 1);
+        assert_eq!(
+            *server.by_name.lock().unwrap(),
+            vec![("Everything".into(), "imm-1".into())]
+        );
+
+        let quiet = AlbumServer::default();
+        place_in_albums(
+            "imm-1",
+            &[album("C1", "Hawaii")],
+            &source(false, None),
+            &MockStore::default(),
+            &quiet,
+        )
+        .await;
+        assert!(quiet.created.lock().unwrap().is_empty());
+        assert!(quiet.added.lock().unwrap().is_empty());
+        assert!(quiet.by_name.lock().unwrap().is_empty());
+    }
+
+    /// Two workers placing photos from the same new Photos album at once
+    /// must create one Immich album, not two.
+    #[tokio::test]
+    async fn concurrent_placements_create_a_new_album_once() {
+        let store = Arc::new(MockStore::default());
+        let server = Arc::new(AlbumServer {
+            create_delay: Duration::from_millis(50),
+            ..AlbumServer::default()
+        });
+        let lib = Arc::new(source(true, None));
+        let run = |asset: &'static str| {
+            let (store, server, lib) = (store.clone(), server.clone(), lib.clone());
+            tokio::spawn(async move {
+                place_in_albums(
+                    asset,
+                    &[album("C1", "Hawaii")],
+                    &lib,
+                    store.as_ref(),
+                    server.as_ref(),
+                )
+                .await
+            })
+        };
+        let (a, b) = (run("imm-1"), run("imm-2"));
+        a.await.unwrap();
+        b.await.unwrap();
+        assert_eq!(server.created.lock().unwrap().len(), 1);
+        assert_eq!(server.added.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_hash_duplicate_still_joins_its_albums_with_the_existing_asset() {
+        let dir = tempfile::tempdir().unwrap();
+        let exporter = Arc::new(FakeExporter {
+            dir: dir.path().to_path_buf(),
+            outcome: || None,
+            exported: Mutex::new(Vec::new()),
+            albums: || vec![album("C1", "Hawaii")],
+        });
+        // Same bytes as the export, already uploaded from a watched folder.
+        let store = Arc::new(MockStore::default());
+        let probe = dir.path().join("probe");
+        std::fs::write(&probe, "original bytes of DUP2").unwrap();
+        let hash = crate::upload::hasher::hash_file(&probe).unwrap();
+        store
+            .uploaded
+            .lock()
+            .unwrap()
+            .insert(hash, "folder-asset".to_string());
+        let server = Arc::new(AlbumServer::default());
+        let mut config = library_config(exporter.clone());
+        config.library = Some(Arc::new(LibrarySource::new(
+            exporter,
+            AlbumPolicy {
+                mirror: true,
+                all_in: None,
+            },
+        )));
+
+        let done = run_one_photos_entry(&store, server.clone(), &config, "DUP2").await;
+
+        assert_eq!(done.status, "completed");
+        assert_eq!(
+            *server.added.lock().unwrap(),
+            vec![("alb-1".into(), "folder-asset".into())]
+        );
+    }
 
     #[test]
     fn photos_device_asset_id_is_stable_per_resource() {
@@ -1528,6 +2038,7 @@ mod tests {
             dir: dir.path().to_path_buf(),
             outcome: || None,
             exported: Mutex::new(Vec::new()),
+            albums: Vec::new,
         });
         let store = Arc::new(MockStore::default());
         let uploader = Arc::new(RecordingUploader::default());
@@ -1571,6 +2082,7 @@ mod tests {
             dir: dir.path().to_path_buf(),
             outcome: || None,
             exported: Mutex::new(Vec::new()),
+            albums: Vec::new,
         });
         let store = Arc::new(MockStore::default());
         // Same bytes the fake exporter writes, already uploaded from a folder.
@@ -1600,6 +2112,7 @@ mod tests {
             dir: dir.path().to_path_buf(),
             outcome: || None,
             exported: Mutex::new(Vec::new()),
+            albums: Vec::new,
         });
         let store = Arc::new(MockStore::default());
         let mut config = library_config(exporter.clone());
@@ -1629,6 +2142,7 @@ mod tests {
             dir: dir.path().to_path_buf(),
             outcome: || Some(LibraryExportError::CloudOnly),
             exported: Mutex::new(Vec::new()),
+            albums: Vec::new,
         });
         let store = Arc::new(MockStore::default());
         let uploader = Arc::new(RecordingUploader::default());

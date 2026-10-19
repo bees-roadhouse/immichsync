@@ -13,6 +13,25 @@ use tracing::{debug, info, warn};
 
 use crate::upload::queue::QueueStore;
 
+/// Immich album name for a Photos album: Immich has no nesting, so an album
+/// inside folders is flattened to `Folder / Sub / Album` (outermost first).
+/// Blank parts are dropped; an untitled album is "Untitled album".
+pub fn album_title(folders_outermost_first: &[String], title: &str) -> String {
+    let title = title.trim();
+    let title = if title.is_empty() {
+        "Untitled album"
+    } else {
+        title
+    };
+    folders_outermost_first
+        .iter()
+        .map(|f| f.trim())
+        .filter(|f| !f.is_empty())
+        .chain(std::iter::once(title))
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
 /// The tracer's temporary cap: how many of the newest assets are queued.
 /// Removed in slice 2.
 pub const TRACER_CAP: usize = 3;
@@ -45,6 +64,20 @@ pub fn enqueue_new(store: &dyn QueueStore, newest_first: &[String]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn album_titles_flatten_folders_outermost_first() {
+        assert_eq!(album_title(&[], "Hawaii 2026"), "Hawaii 2026");
+        assert_eq!(
+            album_title(&["Trips".into(), "2026".into()], "Hawaii"),
+            "Trips / 2026 / Hawaii"
+        );
+        assert_eq!(
+            album_title(&[" ".into(), "Trips".into()], " Hawaii "),
+            "Trips / Hawaii"
+        );
+        assert_eq!(album_title(&[], "  "), "Untitled album");
+    }
     use crate::db::{Database, DbStore};
 
     #[test]

@@ -261,6 +261,19 @@ pub struct QueueStats {
 
 // ─── Database ────────────────────────────────────────────────────────────────
 
+/// The schema version a fully migrated database is at.
+pub const SCHEMA_VERSION: u32 = 5;
+
+/// An Immich album ImmichSync created to mirror a Photos album (#115).
+/// Only albums recorded here are ever renamed or added to by the mirror;
+/// albums a person made in Immich are never adopted or touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirroredAlbum {
+    pub immich_album_id: String,
+    /// The name last given to it, to notice a rename in Photos.
+    pub name: String,
+}
+
 /// One schema migration step (see [`Database::run_migrations`]).
 type Migration = fn(&Database) -> Result<(), DbError>;
 
@@ -337,11 +350,12 @@ impl Database {
         let current_version = self.get_schema_version()?;
         debug!(current_version, "Running schema migrations");
 
-        let steps: [(u32, Migration); 4] = [
+        let steps: [(u32, Migration); SCHEMA_VERSION as usize] = [
             (1, Self::migrate_v1),
             (2, Self::migrate_v2),
             (3, Self::migrate_v3),
             (4, Self::migrate_v4),
+            (5, Self::migrate_v5),
         ];
         for (version, migrate) in steps {
             if current_version < version {
@@ -492,6 +506,25 @@ impl Database {
             )
             .map_err(|e| DbError::Migration {
                 version: 4,
+                source: e,
+            })
+    }
+
+    /// Album mirroring (#115): which Immich album ImmichSync made for each
+    /// Photos album, keyed by the collection's `localIdentifier` so a rename
+    /// in Photos renames the same Immich album.
+    fn migrate_v5(&self) -> Result<(), DbError> {
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS mirrored_albums (
+                    photos_collection_id TEXT PRIMARY KEY,
+                    immich_album_id      TEXT NOT NULL,
+                    name                 TEXT NOT NULL,
+                    created_at           TEXT NOT NULL
+                 );",
+            )
+            .map_err(|e| DbError::Migration {
+                version: 5,
                 source: e,
             })
     }
@@ -681,6 +714,66 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    /// The Immich asset id of an upload with this SHA-1, if any.
+    pub fn uploaded_asset_id(&self, hash: &str) -> Result<Option<String>, DbError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT immich_asset_id FROM uploaded_files
+                 WHERE file_hash = ?1 AND immich_asset_id IS NOT NULL AND immich_asset_id != ''
+                 LIMIT 1",
+                params![hash],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    // ── mirrored_albums ──────────────────────────────────────────────────────
+
+    pub fn mirrored_album(&self, collection_id: &str) -> Result<Option<MirroredAlbum>, DbError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT immich_album_id, name FROM mirrored_albums WHERE photos_collection_id = ?1",
+                params![collection_id],
+                |r| {
+                    Ok(MirroredAlbum {
+                        immich_album_id: r.get(0)?,
+                        name: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Insert or update the Immich album mirroring a Photos album.
+    pub fn record_mirrored_album(
+        &self,
+        collection_id: &str,
+        immich_album_id: &str,
+        name: &str,
+    ) -> Result<(), DbError> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO mirrored_albums (photos_collection_id, immich_album_id, name, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (photos_collection_id) DO UPDATE SET
+                immich_album_id = excluded.immich_album_id,
+                name = excluded.name",
+            params![collection_id, immich_album_id, name, now],
+        )?;
+        Ok(())
+    }
+
+    /// Drop a mapping whose Immich album is gone (deleted on the server).
+    pub fn forget_mirrored_album(&self, collection_id: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "DELETE FROM mirrored_albums WHERE photos_collection_id = ?1",
+            params![collection_id],
+        )?;
+        Ok(())
     }
 
     /// Record a successfully uploaded file.
@@ -1111,6 +1204,33 @@ impl crate::upload::queue::QueueStore for DbStore {
                 photos_local_id: e.photos_local_id,
             })
             .collect())
+    }
+
+    fn uploaded_asset_id(&self, hash: &str) -> anyhow::Result<Option<String>> {
+        let db = self.db.lock().unwrap();
+        Ok(db.uploaded_asset_id(hash)?)
+    }
+
+    fn mirrored_album(&self, collection_id: &str) -> anyhow::Result<Option<MirroredAlbum>> {
+        let db = self.db.lock().unwrap();
+        Ok(db.mirrored_album(collection_id)?)
+    }
+
+    fn record_mirrored_album(
+        &self,
+        collection_id: &str,
+        immich_album_id: &str,
+        name: &str,
+    ) -> anyhow::Result<()> {
+        let db = self.db.lock().unwrap();
+        db.record_mirrored_album(collection_id, immich_album_id, name)?;
+        Ok(())
+    }
+
+    fn forget_mirrored_album(&self, collection_id: &str) -> anyhow::Result<()> {
+        let db = self.db.lock().unwrap();
+        db.forget_mirrored_album(collection_id)?;
+        Ok(())
     }
 
     fn enqueue_photos(&self, local_id: &str) -> anyhow::Result<i64> {
@@ -1557,9 +1677,48 @@ mod tests {
     // ── upload_queue ─────────────────────────────────────────────────────────
 
     #[test]
+    fn mirrored_albums_are_recorded_renamed_and_forgotten_by_collection_id() {
+        let db = open_test_db();
+        assert_eq!(db.mirrored_album("COLL-1").unwrap(), None);
+
+        db.record_mirrored_album("COLL-1", "imm-a", "Hawaii")
+            .unwrap();
+        assert_eq!(
+            db.mirrored_album("COLL-1").unwrap(),
+            Some(MirroredAlbum {
+                immich_album_id: "imm-a".into(),
+                name: "Hawaii".into()
+            })
+        );
+
+        // A rename keeps the same Immich album.
+        db.record_mirrored_album("COLL-1", "imm-a", "Hawaii 2026")
+            .unwrap();
+        assert_eq!(
+            db.mirrored_album("COLL-1").unwrap().unwrap().name,
+            "Hawaii 2026"
+        );
+
+        db.forget_mirrored_album("COLL-1").unwrap();
+        assert_eq!(db.mirrored_album("COLL-1").unwrap(), None);
+    }
+
+    #[test]
+    fn uploaded_asset_id_finds_the_immich_id_for_a_hash() {
+        let db = open_test_db();
+        assert_eq!(db.uploaded_asset_id("h1").unwrap(), None);
+        db.record_upload("/p/a.jpg", "h1", 1, 0, Some("imm-1"), "dev-1", "")
+            .unwrap();
+        assert_eq!(
+            db.uploaded_asset_id("h1").unwrap().as_deref(),
+            Some("imm-1")
+        );
+    }
+
+    #[test]
     fn v4_photos_entries_round_trip_and_folder_entries_default() {
         let db = open_test_db();
-        assert_eq!(db.get_schema_version().unwrap(), 4);
+        assert_eq!(db.get_schema_version().unwrap(), SCHEMA_VERSION);
 
         db.enqueue("/photos/a.jpg", Some("h"), Some(1), None)
             .unwrap();
@@ -1634,7 +1793,7 @@ mod tests {
             .execute_batch("ALTER TABLE upload_queue DROP COLUMN photos_local_id;")
             .unwrap();
         db.run_migrations().unwrap();
-        assert_eq!(db.get_schema_version().unwrap(), 4);
+        assert_eq!(db.get_schema_version().unwrap(), SCHEMA_VERSION);
         assert!(has_column(&db, "upload_queue", "source"));
     }
 
@@ -1651,7 +1810,7 @@ mod tests {
 
         db.run_migrations().unwrap();
 
-        assert_eq!(db.get_schema_version().unwrap(), 4);
+        assert_eq!(db.get_schema_version().unwrap(), SCHEMA_VERSION);
         let e = db.dequeue_pending(10).unwrap().pop().unwrap();
         assert_eq!(e.file_path, "/old/a.jpg");
         assert_eq!(e.source, QueueSource::Folder);
