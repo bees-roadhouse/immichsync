@@ -28,7 +28,7 @@ Immich has 84K+ GitHub stars and a thriving community, but no official desktop s
 | Removable media (DCIM cards) | `WM_DEVICECHANGE` | DiskArbitration |
 | "Trash after upload" | `.immichsync-trash` folder, kept for the retention period | Finder Trash (recoverable) |
 | Photos library | — | PhotoKit, opt-in and read-only |
-| Self-update | Yes | Not yet ([#57](https://github.com/bees-roadhouse/immichsync/issues/57)) |
+| Self-update | Renames the `.exe` aside | Swaps the `.app` bundle from the release zip (Apple Silicon) |
 | Signing | — | Ad-hoc for now; Developer ID and notarization are [#93](https://github.com/bees-roadhouse/immichsync/issues/93) |
 
 ## Features
@@ -69,6 +69,7 @@ Releases carry `ImmichSync-<version>-macos-arm64.zip` from the first release cut
 
 - **First launch:** the app is ad-hoc signed until Developer ID signing lands, so the first time, right-click → **Open** to get past Gatekeeper.
 - **Keychain:** the API key is kept in your login Keychain (`config.toml` holds only a `keychain:` marker). Because the build is ad-hoc signed, macOS asks once after each update whether ImmichSync may use its Keychain item; choose **Always Allow**. If you don't answer, the app keeps watching but can't upload until you do.
+- **Updates:** **Check for updates** in the menu bar downloads the release zip, checks its signature, swaps it in for the running `ImmichSync.app` and relaunches. The app has to live in a folder you can write, such as Applications; run straight from Downloads or a disk image, it says so instead of updating.
 - **Notifications** go to Notification Center; macOS asks once.
 - **Start at login** in Settings registers ImmichSync under System Settings → General → Login Items.
 - **Photos library:** off by default. Turning it on in Settings raises the macOS Photos permission prompt. Library uploads currently go into one album (default "Photos library"); mirroring your Photos albums is [#115](https://github.com/bees-roadhouse/immichsync/issues/115).
