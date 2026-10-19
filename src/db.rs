@@ -243,6 +243,21 @@ pub struct Database {
 }
 
 impl Database {
+    /// A fresh in-memory database with migrations run, for tests in other
+    /// modules.
+    #[cfg(test)]
+    pub(crate) fn open_in_memory() -> Result<Self, DbError> {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|source| DbError::Pragma {
+                pragma: "foreign_keys",
+                source,
+            })?;
+        let mut db = Self { conn };
+        db.run_migrations()?;
+        Ok(db)
+    }
+
     /// Open (or create) the state database, enable WAL mode, and run any
     /// pending schema migrations.
     pub fn open() -> Result<Self, DbError> {

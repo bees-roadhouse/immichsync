@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::api::ImmichClient;
 use crate::config::Config;
@@ -80,6 +80,10 @@ pub struct App {
     /// Latched offline state. The tray icon and tooltip key off this when
     /// no upload is in flight.
     server_offline: bool,
+    /// Mount/unmount events for removable media (`platform::volumes`).
+    /// `None` when the monitor failed to start; device auto-watch is then off.
+    volume_monitor: Option<crate::platform::volumes::VolumeMonitor>,
+    volume_rx: Option<std::sync::mpsc::Receiver<crate::platform::volumes::VolumeEvent>>,
 }
 
 /// Tracks whether each type of UI window is currently open, preventing
@@ -141,6 +145,8 @@ impl App {
             last_ping_at: Instant::now(),
             ping_rx: None,
             server_offline: false,
+            volume_monitor: None,
+            volume_rx: None,
         }
     }
 
@@ -215,6 +221,19 @@ impl App {
 
         // Set up the watch engine and bridge task.
         self.start_watch_engine()?;
+
+        // Removable media: mounts become watched folders (#89). A failure
+        // here only disables device auto-watch.
+        let (volume_tx, volume_rx) = std::sync::mpsc::channel();
+        match crate::platform::volumes::VolumeMonitor::start(volume_tx) {
+            Ok(m) => {
+                self.volume_monitor = Some(m);
+                self.volume_rx = Some(volume_rx);
+            }
+            Err(e) => {
+                warn!(error = %e, "Volume monitor failed to start; removable media won't be auto-watched")
+            }
+        }
 
         // Schedule the first automatic update check after a startup delay.
         if crate::platform::SELF_UPDATE_SUPPORTED && self.config.advanced.check_for_updates {
@@ -304,6 +323,7 @@ impl App {
             // a folder removed via Settings would still be watched (and its files
             // uploaded). Cheap when there's no drift; restarts the engine when
             // there is.
+            self.poll_volume_events();
             self.reconcile_watch_folders();
 
             // Periodic log-retention check (hourly). Caps logs/ at 1 GiB by
@@ -736,6 +756,12 @@ impl App {
         if self.last_folder_reconcile.elapsed() < FOLDER_RECONCILE_INTERVAL {
             return;
         }
+        self.converge_watch_folders();
+    }
+
+    /// One reconcile pass: restart the engine if its watched set differs
+    /// from the DB's enabled folders whose paths exist.
+    fn converge_watch_folders(&mut self) {
         self.last_folder_reconcile = Instant::now();
 
         let folders = {
@@ -777,6 +803,66 @@ impl App {
         if let Err(e) = self.start_watch_engine() {
             warn!(error = %e, "Folder reconcile: restart_watch_engine failed");
         }
+    }
+
+    /// Turn volume mounts into watched folders and converge the engine at
+    /// once rather than on the next reconcile tick.
+    ///
+    /// A mount whose decision is `Watch` gets an `auto_added` row (once; a
+    /// known card keeps its row and its settings). Starting and stopping the
+    /// watcher is the reconcile's job: it watches enabled rows whose path
+    /// exists, so the card's folder starts when it mounts and stops when it
+    /// goes. Unmounts therefore only force that reconcile.
+    fn poll_volume_events(&mut self) {
+        use crate::platform::volumes::{has_dcim, VolumeEvent};
+        use crate::watch::device::{decide_mount, register_mount, MountDecision, Registered};
+
+        let Some(rx) = self.volume_rx.as_ref() else {
+            return;
+        };
+        let events: Vec<VolumeEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        if events.is_empty() {
+            return;
+        }
+
+        for event in events {
+            match event {
+                VolumeEvent::Mounted {
+                    root,
+                    label,
+                    id,
+                    removable,
+                } => {
+                    let dcim = has_dcim(&root);
+                    match decide_mount(&self.config.devices, &root, dcim, removable) {
+                        MountDecision::Skip(reason) => {
+                            debug!(root = %root.display(), %id, has_dcim = dcim, removable, reason, "Volume mounted, not watching");
+                        }
+                        MountDecision::Watch(folder) => {
+                            let db = self.db.inner().lock().unwrap();
+                            match register_mount(&db, &folder, label.as_deref()) {
+                                Ok(Registered::Added(fid)) => {
+                                    info!(folder = %folder.display(), %id, folder_id = fid, "Volume mounted, auto-added watch folder")
+                                }
+                                Ok(Registered::Existing(fid)) => {
+                                    info!(folder = %folder.display(), %id, folder_id = fid, "Volume mounted, known folder")
+                                }
+                                Err(e) => {
+                                    warn!(folder = %folder.display(), error = %e, "Volume mounted, failed to add watch folder")
+                                }
+                            }
+                        }
+                    }
+                }
+                VolumeEvent::Unmounted { root } => {
+                    info!(root = %root.display(), "Volume unmounted");
+                }
+            }
+        }
+
+        // Converge now: a new row starts watching (with its initial scan),
+        // a vanished path stops.
+        self.converge_watch_folders();
     }
 
     /// Prune the logs directory against the retention cap, if enough time
@@ -986,6 +1072,10 @@ impl App {
     /// ownership of `state.db` without fighting a still-flushing writer.
     fn shutdown(&mut self) {
         info!("Shutting down (graceful)");
+
+        if let Some(mut monitor) = self.volume_monitor.take() {
+            monitor.stop();
+        }
 
         if let Some(ref mut engine) = self.watch_engine {
             engine.stop_all();

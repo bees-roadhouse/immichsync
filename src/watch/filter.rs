@@ -197,6 +197,13 @@ impl FileFilter {
             return false;
         }
 
+        // AppleDouble sidecars (`._IMG_0001.JPG`): macOS writes one beside
+        // every file it copies to a FAT/ExFAT card. Metadata, not a photo.
+        if file_name.starts_with("._") {
+            debug!("Excluding (AppleDouble sidecar): {:?}", path);
+            return false;
+        }
+
         // Exact-name exclusion list
         if self.excluded_names.contains(file_name) {
             debug!("Excluding by name: {:?}", path);
@@ -412,6 +419,21 @@ mod tests {
         let p = dir.path().join("Thumbs.db");
         std::fs::write(&p, vec![0u8; 2048]).unwrap();
         assert!(!filter.should_include(&p), "Thumbs.db should be excluded");
+    }
+
+    #[test]
+    fn appledouble_sidecars_are_excluded() {
+        // macOS writes `._<name>` beside every file it copies to a FAT/ExFAT
+        // card; it holds resource-fork metadata, not a photo (#89).
+        let filter = FileFilter::new();
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("._IMG_0001.JPG");
+        std::fs::write(&sidecar, vec![0u8; 4096]).unwrap();
+        assert!(!filter.should_include(&sidecar));
+
+        let photo = dir.path().join("IMG_0001.JPG");
+        std::fs::write(&photo, vec![0u8; 4096]).unwrap();
+        assert!(filter.should_include(&photo));
     }
 
     #[test]

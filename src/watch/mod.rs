@@ -1,5 +1,6 @@
 // Watch engine orchestrator
 
+pub mod device;
 pub mod filter;
 pub mod folder;
 pub mod network;

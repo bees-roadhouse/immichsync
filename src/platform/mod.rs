@@ -6,9 +6,14 @@
 // docs/adr/0001-macos-platform-seam.md for the Windows → macOS map.
 
 pub mod logs;
+pub mod volumes;
 
 #[cfg(windows)]
 pub mod autostart;
+#[cfg(windows)]
+mod device;
+#[cfg(windows)]
+mod drives;
 #[cfg(windows)]
 pub mod encryption;
 #[cfg(windows)]

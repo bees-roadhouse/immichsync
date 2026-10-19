@@ -12,3 +12,4 @@ pub mod install;
 pub mod known_folders;
 pub mod shutdown;
 pub mod single_instance;
+pub mod volumes;
