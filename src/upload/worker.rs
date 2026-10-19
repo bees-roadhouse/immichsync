@@ -860,36 +860,6 @@ async fn process_library_item(
     );
     let label = format!("photos:{local_id}/{}", export.resource);
 
-    // A Live Photo's motion video goes up first; the still links to it, and
-    // is never marked done before it (#83).
-    let live_video_id = match export.paired_video.as_deref() {
-        None => None,
-        Some(video) => {
-            match upload_paired_video(
-                &local_id,
-                video,
-                &export,
-                store.as_ref(),
-                uploader.as_ref(),
-                config,
-            )
-            .await
-            {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    drop(cleanup);
-                    return fail_or_retry(
-                        &entry,
-                        store.as_ref(),
-                        config,
-                        &format!("Live Photo video: {e:#}"),
-                    )
-                    .await;
-                }
-            }
-        }
-    };
-
     let hash = match crate::upload::hasher::hash_file(&export.path) {
         Ok(h) => h,
         Err(e) => {
@@ -925,6 +895,38 @@ async fn process_library_item(
         let _ = store.mark_completed(entry.id, None);
         return;
     }
+
+    // A Live Photo's motion video goes up first; the still links to it, and
+    // is never marked done before it (#83). Only now, once the still is known
+    // not to be in Immich already: a video uploaded for a still that's
+    // already there would sit unlinked in the timeline.
+    let live_video_id = match export.paired_video.as_deref() {
+        None => None,
+        Some(video) => {
+            match upload_paired_video(
+                &local_id,
+                video,
+                &export,
+                store.as_ref(),
+                uploader.as_ref(),
+                config,
+            )
+            .await
+            {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    drop(cleanup);
+                    return fail_or_retry(
+                        &entry,
+                        store.as_ref(),
+                        config,
+                        &format!("Live Photo video: {e:#}"),
+                    )
+                    .await;
+                }
+            }
+        }
+    };
 
     let device_asset_id = photos_device_asset_id(&local_id, export.resource);
     let result = match live_video_id.as_deref() {
@@ -2077,6 +2079,47 @@ mod tests {
         assert!(
             uploader.uploads.lock().unwrap().is_empty(),
             "no still without its video"
+        );
+        for p in exporter.exported.lock().unwrap().iter() {
+            assert!(!p.exists(), "{} must be deleted", p.display());
+        }
+    }
+
+    /// If the still is already in Immich (same SHA-1, e.g. uploaded from a
+    /// watched folder), its motion video must not go up on its own: it would
+    /// sit in the timeline as an unlinked, visible video (Pia's review on
+    /// #138). Nothing is uploaded; the existing still joins its albums.
+    #[tokio::test]
+    async fn a_live_photo_whose_still_is_already_uploaded_uploads_no_video() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MockStore::default());
+        let probe = dir.path().join("probe");
+        std::fs::write(&probe, "original bytes of LIVE").unwrap();
+        let still_hash = crate::upload::hasher::hash_file(&probe).unwrap();
+        store
+            .uploaded
+            .lock()
+            .unwrap()
+            .insert(still_hash, "imm-still".to_string());
+        let uploader = Arc::new(RecordingUploader::default());
+        let exporter = live_exporter(dir.path());
+
+        let done = run_one_photos_entry(
+            &store,
+            uploader.clone(),
+            &library_config(exporter.clone()),
+            "LIVE",
+        )
+        .await;
+
+        assert_eq!(done.status, "completed");
+        assert!(
+            uploader.uploads.lock().unwrap().is_empty(),
+            "no unlinked video"
+        );
+        assert_eq!(
+            *uploader.albums.lock().unwrap(),
+            vec![("immichsync test".to_string(), "imm-still".to_string())]
         );
         for p in exporter.exported.lock().unwrap().iter() {
             assert!(!p.exists(), "{} must be deleted", p.display());
