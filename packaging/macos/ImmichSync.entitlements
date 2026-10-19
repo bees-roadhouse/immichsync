@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Hardened-runtime entitlements for Developer ID builds (make-app.sh).
+     Photos library: required under the hardened runtime for PhotoKit to
+     be allowed at all (ADR 0002). Ad-hoc local builds don't use this. -->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.personal-information.photos-library</key>
+	<true/>
+</dict>
+</plist>

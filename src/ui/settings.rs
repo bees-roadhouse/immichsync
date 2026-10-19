@@ -82,6 +82,10 @@ pub fn show_settings(config: Config, result_tx: Option<Sender<Config>>) {
         update_tag_pin: ChannelMode::extract_tag(&config.advanced.update_channel),
         update_channel_error: String::new(),
 
+        // Photos library tab (macOS)
+        #[cfg(target_os = "macos")]
+        photos: PhotosTabState::new(&config.photos),
+
         // Watch Folders tab
         folders,
         folder_to_remove: None,
@@ -110,6 +114,8 @@ pub fn show_settings(config: Config, result_tx: Option<Sender<Config>>) {
 enum Tab {
     Connection,
     WatchFolders,
+    #[cfg(target_os = "macos")]
+    Photos,
     Upload,
     Advanced,
 }
@@ -186,6 +192,9 @@ struct SettingsApp {
     update_tag_pin: String,
     update_channel_error: String,
 
+    #[cfg(target_os = "macos")]
+    photos: PhotosTabState,
+
     // Watch Folders tab
     folders: Vec<WatchedFolder>,
     folder_to_remove: Option<i64>,
@@ -209,6 +218,8 @@ impl eframe::App for SettingsApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.active_tab, Tab::Connection, "Connection");
                 ui.selectable_value(&mut self.active_tab, Tab::WatchFolders, "Watch Folders");
+                #[cfg(target_os = "macos")]
+                ui.selectable_value(&mut self.active_tab, Tab::Photos, "Photos Library");
                 ui.selectable_value(&mut self.active_tab, Tab::Upload, "Upload");
                 ui.selectable_value(&mut self.active_tab, Tab::Advanced, "Advanced");
             });
@@ -232,6 +243,8 @@ impl eframe::App for SettingsApp {
         egui::CentralPanel::default().show(ctx, |ui| match self.active_tab {
             Tab::Connection => self.show_connection_tab(ui),
             Tab::WatchFolders => self.show_watch_folders_tab(ui),
+            #[cfg(target_os = "macos")]
+            Tab::Photos => self.photos.show(ui),
             Tab::Upload => self.show_upload_tab(ui),
             Tab::Advanced => self.show_advanced_tab(ui),
         });
@@ -647,6 +660,12 @@ impl SettingsApp {
         self.config.server.api_key = self.api_key.clone();
         self.config.server.device_id = self.device_name.clone();
 
+        #[cfg(target_os = "macos")]
+        {
+            self.config.photos.enabled = self.photos.enabled;
+            self.config.photos.album_name = self.photos.album.trim().to_string();
+        }
+
         self.config.upload.concurrency = self.concurrency;
         self.config.upload.order = self.upload_order.clone();
         self.config.upload.max_retries = self.max_retries;
@@ -981,5 +1000,195 @@ mod tests {
         assert_eq!(patterns_text_from_json(None), "");
         // Malformed JSON yields empty text rather than panicking.
         assert_eq!(patterns_text_from_json(Some("not json")), "");
+    }
+}
+
+// ── Photos library tab (macOS; ADR 0002) ────────────────────────────────────
+
+/// What ticking **Sync my Photos library** does, given the current access.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhotosToggle {
+    /// Access is already granted: just turn it on.
+    Enable,
+    /// macOS hasn't asked yet: raise the prompt (this click is the user's
+    /// own action, which is the only time we ever prompt).
+    Request,
+    /// Can't be turned on; the reason is shown under the toggle.
+    Refuse(&'static str),
+}
+
+#[cfg(target_os = "macos")]
+fn photos_toggle(access: crate::platform::photos::Access, can_prompt: bool) -> PhotosToggle {
+    use crate::platform::photos::Access;
+    match access {
+        Access::Authorized | Access::Limited => PhotosToggle::Enable,
+        Access::NotDetermined if can_prompt => PhotosToggle::Request,
+        Access::NotDetermined => PhotosToggle::Refuse(
+            "The Photos library needs ImmichSync.app; this binary can't ask for access.",
+        ),
+        Access::Denied => PhotosToggle::Refuse(
+            "ImmichSync isn't allowed to read Photos. Allow it in System Settings, then tick this again.",
+        ),
+        Access::Restricted => {
+            PhotosToggle::Refuse("Photos access is restricted on this Mac (parental controls or MDM).")
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct PhotosTabState {
+    enabled: bool,
+    album: String,
+    access: crate::platform::photos::Access,
+    /// The answer to a prompt raised by the toggle, while it's showing.
+    pending: Option<std::sync::mpsc::Receiver<anyhow::Result<crate::platform::photos::Access>>>,
+    message: String,
+}
+
+#[cfg(target_os = "macos")]
+impl PhotosTabState {
+    fn new(cfg: &crate::config::PhotosConfig) -> Self {
+        let access = crate::platform::photos::access();
+        Self {
+            // A config that says "on" without access shows as off until fixed.
+            enabled: cfg.enabled && access.can_read(),
+            album: cfg.album_name.clone(),
+            access,
+            pending: None,
+            message: String::new(),
+        }
+    }
+
+    fn show(&mut self, ui: &mut egui::Ui) {
+        use crate::platform::photos::{self, Access};
+
+        if let Some(rx) = &self.pending {
+            if let Ok(answer) = rx.try_recv() {
+                self.pending = None;
+                match answer {
+                    Ok(access) => {
+                        self.access = access;
+                        self.enabled = access.can_read();
+                        if !self.enabled {
+                            if let PhotosToggle::Refuse(why) = photos_toggle(access, false) {
+                                self.message = why.to_string();
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.enabled = false;
+                        self.message = e.to_string();
+                    }
+                }
+            } else {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(200));
+            }
+        }
+
+        ui.heading("Photos Library");
+        ui.add_space(8.0);
+        ui.label(
+            "Back up your Apple Photos library to Immich: originals only, never edits. \
+             Hidden items and shared-library items are left out. \
+             ImmichSync reads the library; it never changes or deletes photos.",
+        );
+        ui.add_space(8.0);
+
+        let mut wanted = self.enabled;
+        let waiting = self.pending.is_some();
+        ui.add_enabled_ui(!waiting, |ui| {
+            ui.checkbox(&mut wanted, "Sync my Photos library");
+        });
+        if wanted != self.enabled {
+            self.message.clear();
+            if !wanted {
+                self.enabled = false;
+            } else {
+                match photos_toggle(self.access, photos::can_prompt()) {
+                    PhotosToggle::Enable => self.enabled = true,
+                    PhotosToggle::Request => {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(photos::request_access());
+                        });
+                        self.pending = Some(rx);
+                    }
+                    PhotosToggle::Refuse(why) => self.message = why.to_string(),
+                }
+            }
+        }
+
+        ui.add_space(4.0);
+        if waiting {
+            ui.label("Waiting for your answer to the macOS prompt…");
+        }
+        match self.access {
+            Access::Authorized => {
+                ui.label("Access: the whole library.");
+            }
+            Access::Limited => {
+                ui.label("Access: only the items you selected.");
+            }
+            Access::Denied | Access::Restricted => {
+                if ui.button("Open Privacy Settings").clicked() {
+                    let _ = open::that(
+                        "x-apple.systempreferences:com.apple.preference.security?Privacy_Photos",
+                    );
+                }
+            }
+            Access::NotDetermined => {}
+        }
+        if !self.message.is_empty() {
+            ui.colored_label(egui::Color32::from_rgb(200, 120, 0), &self.message);
+        }
+
+        ui.add_space(8.0);
+        egui::Grid::new("photos_grid")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Album:");
+                ui.text_edit_singleline(&mut self.album);
+                ui.end_row();
+            });
+        ui.add_space(4.0);
+        ui.small(
+            "This first version uploads the 3 newest items whose originals are on this Mac; \
+             items stored only in iCloud are skipped for now. Album changes apply after a restart.",
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod photos_tests {
+    use super::*;
+    use crate::platform::photos::Access;
+
+    #[test]
+    fn the_toggle_prompts_only_when_undetermined_and_promptable() {
+        assert_eq!(
+            photos_toggle(Access::NotDetermined, true),
+            PhotosToggle::Request
+        );
+        assert!(matches!(
+            photos_toggle(Access::NotDetermined, false),
+            PhotosToggle::Refuse(_)
+        ));
+        assert_eq!(
+            photos_toggle(Access::Authorized, true),
+            PhotosToggle::Enable
+        );
+        assert_eq!(photos_toggle(Access::Limited, false), PhotosToggle::Enable);
+        // Denied never re-prompts (macOS wouldn't show it again anyway).
+        assert!(matches!(
+            photos_toggle(Access::Denied, true),
+            PhotosToggle::Refuse(_)
+        ));
+        assert!(matches!(
+            photos_toggle(Access::Restricted, true),
+            PhotosToggle::Refuse(_)
+        ));
     }
 }
