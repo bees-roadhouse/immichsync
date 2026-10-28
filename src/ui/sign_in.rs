@@ -246,9 +246,9 @@ mod tests {
 
     #[test]
     fn only_real_urls_are_probed() {
-        assert!(looks_like_url("https://pics.beesroadhouse.com"));
-        assert!(looks_like_url("http://10.2.4.5:2283"));
-        assert!(!looks_like_url("pics.beesroadhouse.com"));
+        assert!(looks_like_url("https://photos.example.com"));
+        assert!(looks_like_url("http://192.0.2.5:2283"));
+        assert!(!looks_like_url("photos.example.com"));
         assert!(!looks_like_url("https://"));
         assert!(!looks_like_url(""));
     }
